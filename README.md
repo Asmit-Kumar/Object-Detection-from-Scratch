@@ -1,43 +1,22 @@
-# Object Detection from Scratch using TensorFlow
+# Object Detection & Digit Recognition from Scratch (PyTorch)
 
-A complete end-to-end object detection pipeline built from scratch — from synthetic dataset generation to bounding box prediction and digit classification — using TensorFlow and classical computer vision techniques. This branch (`pipeline`) integrates **CNN bbox detection, classical fallback, and digit classification** into a single unified pipeline.
+An end-to-end computer vision pipeline built entirely from scratch in **PyTorch**. The repository features a modular, two-stage architecture:
+1. **Bounding Box Regression Model**: Detects the location of a digit within an image.
+2. **Digit Classification Model**: Classifies the tightly-cropped region into digits (0-9).
 
-## 📋 Table of Contents
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [What's New in Pipeline](#whats-new-in-pipeline)
-4. [File Structure](#file-structure)
-5. [Getting Started](#getting-started)
-6. [Usage](#usage)
-7. [Results](#results)
-8. [Branches](#branches)
-9. [Contributing](#contributing)
-10. [Author](#author)
+This project was built focusing on performance optimization, hyperparameter tuning, and moving away from generic abstractions towards native deep learning operations.
 
----
+## Architecture
 
-## 🔍 Overview
+## Architecture Flow
 
-This project implements an object detection system trained on synthetic data derived from MNIST digits. The full pipeline:
-
-1. **Localizes** the digit by predicting a bounding box (CNN regression + classical fallback)
-2. **Classifies** the detected digit (0–9)
-
-The CNN handles most predictions, and a connected-component fallback catches edge cases where the CNN fails — making the system robust in production-like scenarios.
-
----
-
-## 🏗️ Architecture
-
-The `DigitDetectionPipeline` runs in three stages:
-
-```
+```text
 Input Image (128×128)
         │
         ▼
 ┌──────────────────┐
-│  Bbox Detection   │
-│  (CNN Regression) │──── Predict [x_min, y_min, x_max, y_max]
+│  Bbox Detection  │
+│  (PyTorch CNN)   │──── Predict [x_min, y_min, x_max, y_max]
 └────────┬─────────┘
          │
          │ Invalid bbox?
@@ -49,194 +28,73 @@ Input Image (128×128)
          │
          ▼
 ┌──────────────────┐
-│   Crop & Resize   │──── Extract digit region → resize to 28×28
+│   Crop & Resize  │──── PyTorch F.interpolate → 28×28 tensor
 └────────┬─────────┘
          │
          ▼
 ┌──────────────────┐
-│ Digit Classifier  │──── CNN classifier → digit (0-9) + confidence
+│ Digit Classifier │──── PyTorch classifier → digit (0-9) + confidence
 └──────────────────┘
 ```
 
-**Key design decisions:**
-- **Fallback strategy**: If the CNN bbox prediction is invalid (NaN, negative area, out of bounds, or >90% of image), the system automatically falls back to classical connected-component analysis
-- **Batch prediction**: `predict_batch()` efficiently processes multiple images with batched model calls instead of per-image inference
-- **Experiment logging**: Built-in JSON logging tracks predictions, bbox sources (CNN vs classical), and confidence scores
+Both models have been highly optimized to run exceptionally fast while maintaining peak accuracy.
 
----
+### Bounding Box Regressor (`~700k parameters`)
+- 4-Block Convolutional stem with Batch Normalization and MaxPooling.
+- A $1 \times 1$ Convolutional bottleneck to severely compress spatial feature maps.
+- A fully connected head regressing normalized `[x_min, y_min, x_max, y_max]` coordinates.
 
-## 🆕 What's New in Pipeline
+### Digit Classifier (`~130k parameters` Ultra-Light)
+- 3-Block Convolutional stem.
+- Deep spatial compression reducing images to $3 \times 3$ feature maps before flattening.
+- A compact `Linear(576, 128)` dense layer, ensuring lightning-fast CPU/GPU inference while achieving $>99\%$ accuracy.
 
-- **`digit_detector.py`** — `DigitDetectionPipeline` class combining:
-  - CNN bbox regression with automatic validation
-  - Classical fallback (connected components) when CNN fails
-  - Digit classification after cropping
-  - Single-image `predict()` and efficient `predict_batch()` methods
-  - JSON experiment logging
-- **`eval_fallbacks.py`** — `Evaluator` class for analyzing CNN vs classical fallback performance:
-  - Compare IoU accuracy between both methods  
-  - Track how often each method is used
+## Pipeline Integration
 
----
+The core integration logic lives in `digit_detector.py`. 
+It implements `DigitDetectionPipeline`, which handles:
+- **Batched GPU Tensors**: Takes `(N, C, H, W)` tensors directly, running bounding box detection across the entire batch natively on the GPU.
+- **Dynamic Cropping**: Automatically extracts sub-tensors using PyTorch's `F.interpolate` based on predicted bounding boxes.
+- **Classical Fallback**: Uses `scipy.ndimage.label` (Connected Components) to intelligently fallback if the CNN fails to output valid coordinates or confidence drops.
 
-## 📂 File Structure
-
-```
-root/
-├── GenerateDataset.py              # Synthetic dataset generator (MNIST → 128×128 canvas)
-│
-├── ObjectDetect.ipynb              # Base model training & evaluation
-├── ObjectDetect_Performance.ipynb  # Performance-tuned model (v3)
-│
-├── digit_detector.py               # DigitDetectionPipeline: full detect + classify pipeline
-├── bbox_detector.py                # BboxDetector: classical connected-component detector
-├── evaluate_bbox.py                # Bbox evaluation metrics (IoU, MAE, MSE, RMSE)
-├── eval_fallbacks.py               # CNN vs Classical fallback analysis
-│
-├── utils/
-│   ├── __init__.py
-│   ├── reader.py                   # FileReader: image/label file I/O
-│   ├── visualizer.py               # Visualizer: bbox overlay visualization
-│   └── dataset.py                  # DatasetBuilder: TF tensor dataset loader
-│
-├── result/                         # Prediction visualizations and training curves
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-- Python 3.8+
-- TensorFlow 2.10+
-- CUDA-compatible GPU (recommended for training)
+## Setup & Execution
 
 ### Installation
-
-1. **Clone the repository:**
-   ```bash
-   git clone -b pipeline https://github.com/Asmit-Kumar/Object-Detection-from-Scratch-using-tensorflow.git
-   cd Object-Detection-from-Scratch-using-tensorflow
-   ```
-
-2. **Create a virtual environment (recommended):**
-   ```bash
-   python -m venv .venv
-   .venv\Scripts\activate    # Windows
-   source .venv/bin/activate  # Linux/Mac
-   ```
-
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
----
-
-## 💻 Usage
-
-### Dataset Generation
-
 ```bash
-python GenerateDataset.py
+pip install -r requirements.txt
 ```
 
-### Training
-
-| Notebook | Purpose |
-|----------|---------|
-| `ObjectDetect.ipynb` | Base model — initial CNN architecture |
-| `ObjectDetect_Performance.ipynb` | Performance model — improved architecture |
-
-### Running the Detection Pipeline
-
-After training, run the full pipeline (bbox detection + digit classification):
-
+### Running the Full Pipeline Test
+To test the pipeline on the `TestImages/` directory:
 ```bash
-python digit_detector.py
+python eval_pipeline.py
 ```
+This script will load the pre-trained checkpoints from `./checkpoint/` and `./Models/`, process the test images, and generate a visual output grid `pipeline_test_results.png`.
 
-**Using the pipeline in code:**
-
-```python
-from digit_detector import DigitDetectionPipeline
-import tensorflow as tf
-
-bbox_model = tf.keras.models.load_model("bbox_model.keras")
-classifier_model = tf.keras.models.load_model("Models/DigitRecog.h5")
-
-pipeline = DigitDetectionPipeline(
-    bbox_model=bbox_model,
-    classifier_model=classifier_model,
-    normalize_bbox=True
-)
-
-# Single image prediction
-result = pipeline.predict(image)
-# → {"bbox": [x_min, y_min, x_max, y_max], "digit": 7, "confidence": 0.98}
-
-# Batch prediction (efficient)
-results = pipeline.predict_batch(images_batch, batch_size=32)
-```
-
-### Evaluation
-
-**Bbox evaluation:**
+To run a massive batched test on all images and save the prediction logs:
 ```bash
-python evaluate_bbox.py
+python run_full_test.py
 ```
 
-**CNN vs Fallback analysis:**
-```bash
-python eval_fallbacks.py
-```
+## Performance Benchmarks
 
----
+In migrating from our original TensorFlow architecture to the modular **PyTorch** architecture, the pipeline's overall throughput and confidence improved. 
 
-## 📊 Results
+Benchmarks were executed locally on an **RTX 5070 Ti Desktop GPU**.
+Tested on **28,000 images** (Detection + Cropping + Classification):
 
-### Training Curves (Performance Model)
+| Run | Architecture | Overall Mean Confidence |
+|---|---|---|
+| `run_01` | TF CNN + Classical Fallback | 94.01% |
+| `run_03` | TF CNN Only | 97.63% |
+| **`run_torch`** | **PyTorch Ultra-Light Pipeline** | **99.06%** |
 
-![Training Curves](result/training_curves.png)
+The PyTorch pipeline achieves a significantly higher confidence threshold while taking just **~3.6 seconds** to process all 28,000 images via `predict_batch`.
 
-### Prediction Visualizations
+## Prediction Visualizations
 
-Bounding box predictions — Green: Ground Truth | Red: Predicted:
+The following grid showcases the end-to-end PyTorch pipeline in action.
+- **Lime Box**: Detected Digit Region
+- **Title**: PyTorch classification result & BBox source (CNN vs Classical Fallback)
 
-![Prediction Grid](result/prediction_grid.png)
-
-### Base Model Predictions
-
-| Image | Visualization |
-|-------|---------------|
-| `result/1.png` | ![1.png](result/1.png) |
-| `result/2.png` | ![2.png](result/2.png) |
-| `result/3.png` | ![3.png](result/3.png) |
-| `result/4.png` | ![4.png](result/4.png) |
-| `result/5.png` | ![5.png](result/5.png) |
-
----
-
-## 🌿 Branches
-
-| Branch | Description |
-|--------|-------------|
-| `main` | Base object detection — dataset generation, CNN bbox model, classical fallback, evaluation |
-| `v3` | Performance-tuned model — improved architecture and training |
-| **`pipeline`** | **← You are here** — Full detection pipeline with CNN + fallback + digit classification |
-
----
-
-## Contributing
-
-Contributions are welcome!  
-Fork the repository, create a branch, and submit a pull request.
-
----
-
-## 👤 Author
-
-- **Asmit Kumar** — [GitHub](https://github.com/Asmit-Kumar)
+![Pipeline Test Results](pipeline_test_results.png)

@@ -1,6 +1,6 @@
 from utils.reader import FileReader as FR
 import os
-import tensorflow as tf
+import torch
 import numpy as np
 from scipy.ndimage import label
 
@@ -34,10 +34,9 @@ class BboxDetector:
         Load all images from the configured path.
 
         Returns:
-            list: List of image tensors/arrays.
+            list: List of image tensors.
         """
-        # image_paths = FR.read_files(self.images_path, "png")
-        images = [] # Can directly append to the self.images instead of returning or maybe directly reading the images will be efficient
+        images = []
         for file_name in self.images_files:
             images.append(FR.read_image(os.path.join(self.images_path, file_name)))
 
@@ -49,10 +48,8 @@ class BboxDetector:
         
         Populates self.actual_bboxes.
         """
-        # label_paths = FR.read_files(self.txt_files, "txt")
         for file in self.txt_files:
             bbox = FR.read_label(os.path.join(self.txt_path, file))
-            # self.digits.append(digits)
             self.actual_bboxes.append(bbox)
 
     def _read_image(self, file_name):
@@ -63,7 +60,7 @@ class BboxDetector:
             file_name (str): Name of the file in the images directory.
 
         Returns:
-            tf.Tensor: Processed image.
+            torch.Tensor: Processed image.
         """
         image = FR.read_image(os.path.join(self.images_path, file_name))
         return image
@@ -74,28 +71,31 @@ class BboxDetector:
         Calculate bounding box using connected components (classical approach).
 
         Args:
-            img (tf.Tensor | np.ndarray): Input image.
+            img (torch.Tensor | np.ndarray): Input image.
             threshold (float, optional): Threshold for binarization. Defaults to 0.15.
             margin (int, optional): Margin to add to the bbox. Defaults to 2.
 
         Returns:
             list: [x_min, y_min, x_max, y_max] or None if no object found.
         """
-        img = img.numpy().squeeze()
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu().numpy()
+            
+        img = img.squeeze()
 
         binary = img > threshold
 
-        labels, num = label(binary)
+        labels_map, num = label(binary)
 
         if num == 0:
             return None
 
         largest_label = max(
             range(1, num + 1),
-            key=lambda i: np.sum(labels == i)
+            key=lambda i: np.sum(labels_map == i)
         )
 
-        ys, xs = np.where(labels == largest_label)
+        ys, xs = np.where(labels_map == largest_label)
 
         y_min, y_max = ys.min(), ys.max()
         x_min, x_max = xs.min(), xs.max()
@@ -115,6 +115,4 @@ class BboxDetector:
         """
         for image_file in self.images_files:
             image = self._read_image(image_file)
-
             self.pred_bboxes.append(self.find_digit_bbox(image))
-

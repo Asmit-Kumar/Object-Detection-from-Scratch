@@ -19,14 +19,17 @@ csvs/
 
 # Model Files
 Models/
+checkpoint/
 *.h5
 *.keras
+*.pth
 New folder/
 
 # Logs
 logs/
 
 # Scratch / Debug scripts
+scratch/
 test.py
 test_model_load.py
 extract_nb_images.py

@@ -1,11 +1,37 @@
 import os
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, TensorDataset, DataLoader
 from utils.reader import FileReader as FR
+from torchvision import transforms
+
+
+class AugmentedTensorDataset(Dataset):
+    """
+    Custom Dataset that wraps tensors and applies dynamic torchvision transforms
+    on the fly during __getitem__.
+    """
+    def __init__(self, images, labels, transform=None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __getitem__(self, index):
+        x = self.images[index]
+        y = self.labels[index]
+        
+        if self.transform:
+            x = self.transform(x)
+            
+        return x, y
+
+    def __len__(self):
+        return self.images.size(0)
 
 
 class DatasetBuilder:
     """
-    Utility class for building TensorFlow tensor datasets
+    Utility class for building PyTorch datasets
     from image and label directories.
     """
 
@@ -19,24 +45,7 @@ class DatasetBuilder:
         limit=None
     ):
         """
-        Load images and bounding box labels as TensorFlow tensors.
-
-        Reads all matching image/label pairs from the given directories
-        and returns stacked tensors ready for model training or evaluation.
-
-        Args:
-            images_dir (str): Path to the directory containing images.
-            labels_dir (str): Path to the directory containing bbox label files (.txt).
-            image_ext (str): Image file extension. Defaults to "png".
-            image_shape (tuple): Target image size (H, W). Defaults to (128, 128).
-            normalize_bbox (bool): If True, normalize bbox coords to [0, 1]
-                                   relative to image_shape. Defaults to False.
-            limit (int, optional): Max number of samples to load. Defaults to None.
-
-        Returns:
-            tuple: (images_tensor, bboxes_tensor)
-                - images_tensor: tf.Tensor of shape (N, H, W, 1), float32
-                - bboxes_tensor: tf.Tensor of shape (N, 4), float32
+        Load images and bounding box labels as PyTorch tensors on CPU.
         """
         image_files = FR.read_files(images_dir, image_ext, limit=limit)
         if image_files is None:
@@ -61,12 +70,12 @@ class DatasetBuilder:
         if len(images) == 0:
             raise ValueError("No matching image-label pairs found.")
 
-        images_tensor = tf.stack(images)            # (N, H, W, 1)
-        bboxes_tensor = tf.constant(bboxes, dtype=tf.float32)  # (N, 4)
+        images_tensor = torch.stack(images)            # (N, 1, H, W)
+        bboxes_tensor = torch.tensor(bboxes, dtype=torch.float32)  # (N, 4)
 
         if normalize_bbox:
             h, w = image_shape
-            scale = tf.constant([w, h, w, h], dtype=tf.float32)
+            scale = torch.tensor([w, h, w, h], dtype=torch.float32)
             bboxes_tensor = bboxes_tensor / scale
 
         return images_tensor, bboxes_tensor
@@ -77,25 +86,11 @@ class DatasetBuilder:
         class_dir,
         image_ext="png",
         num_classes=10,
-        one_hot=True,
+        one_hot=False,
         limit=None
     ):
         """
-        Load images and class labels as TensorFlow tensors.
-
-        Args:
-            images_dir (str): Path to the directory containing images.
-            class_dir (str): Path to the directory containing class label files (.txt).
-            image_ext (str): Image file extension. Defaults to "png".
-            num_classes (int): Number of classes for one-hot encoding. Defaults to 10.
-            one_hot (bool): If True, return one-hot encoded labels. Defaults to True.
-            limit (int, optional): Max number of samples to load. Defaults to None.
-
-        Returns:
-            tuple: (images_tensor, labels_tensor)
-                - images_tensor: tf.Tensor of shape (N, H, W, 1), float32
-                - labels_tensor: tf.Tensor of shape (N, num_classes) if one_hot,
-                                 else (N,) int32
+        Load images and class labels as PyTorch tensors on CPU.
         """
         image_files = FR.read_files(images_dir, image_ext, limit=limit)
         if image_files is None:
@@ -121,34 +116,76 @@ class DatasetBuilder:
         if len(images) == 0:
             raise ValueError("No matching image-label pairs found.")
 
-        images_tensor = tf.stack(images)
-        labels_tensor = tf.constant(labels, dtype=tf.int32)
+        images_tensor = torch.stack(images)
+        labels_tensor = torch.tensor(labels, dtype=torch.int64)
 
         if one_hot:
-            labels_tensor = tf.one_hot(labels_tensor, depth=num_classes)
+            labels_tensor = F.one_hot(labels_tensor, num_classes=num_classes).to(torch.float32)
 
         return images_tensor, labels_tensor
 
     @staticmethod
-    def as_tf_dataset(images, labels, batch_size=32, shuffle=True, buffer_size=1000):
+    def as_dataloader(images, labels, batch_size=32, shuffle=True, drop_last=False, transform=None):
         """
-        Wrap tensor arrays into a batched tf.data.Dataset.
+        Wrap tensor arrays into a PyTorch DataLoader, optionally with transforms.
+        """
+        dataset = AugmentedTensorDataset(images, labels, transform=transform)
+        
+        loader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=shuffle, 
+            drop_last=drop_last
+        )
+
+        return loader
+
+    @staticmethod
+    def create_dataloaders(images, labels, batch_size=32, val_split=0.15, test_split=0.15, seed=42, drop_last=False, train_transform=None, eval_transform=None):
+        """
+        Wrap tensor arrays into PyTorch DataLoaders with automatic train/val/test splits and augmentations.
+        If val_split and test_split are 0, returns a single DataLoader.
+        If one of them is 0, returns a tuple of two DataLoaders.
 
         Args:
-            images (tf.Tensor): Images tensor.
-            labels (tf.Tensor): Labels tensor.
+            images (torch.Tensor): Images tensor.
+            labels (torch.Tensor): Labels tensor.
             batch_size (int): Batch size. Defaults to 32.
-            shuffle (bool): Whether to shuffle the dataset. Defaults to True.
-            buffer_size (int): Shuffle buffer size. Defaults to 1000.
+            val_split (float): Fraction of data to use for validation. Defaults to 0.15.
+            test_split (float): Fraction of data to use for testing. Defaults to 0.15.
+            seed (int): Random seed for reproducibility. Defaults to 42.
+            drop_last (bool): Whether to drop the last incomplete batch. Defaults to False.
+            train_transform (callable): Transforms applied only to the training set.
+            eval_transform (callable): Transforms applied to the validation and testing sets.
 
         Returns:
-            tf.data.Dataset: Batched (and optionally shuffled) dataset.
+            DataLoader | tuple: 1 to 3 DataLoaders depending on split fractions.
         """
-        dataset = tf.data.Dataset.from_tensor_slices((images, labels))
-
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=buffer_size)
-
-        dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-        return dataset
+        num_samples = len(images)
+        test_size = int(test_split * num_samples)
+        val_size = int(val_split * num_samples)
+        train_size = num_samples - val_size - test_size
+        
+        indices = torch.randperm(num_samples, generator=torch.Generator().manual_seed(seed))
+        
+        train_idx = indices[:train_size]
+        val_idx = indices[train_size:train_size+val_size]
+        test_idx = indices[train_size+val_size:]
+        
+        loaders = []
+        
+        if train_size > 0:
+            train_ds = AugmentedTensorDataset(images[train_idx], labels[train_idx], transform=train_transform)
+            loaders.append(DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=drop_last))
+            
+        if val_size > 0:
+            val_ds = AugmentedTensorDataset(images[val_idx], labels[val_idx], transform=eval_transform)
+            loaders.append(DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=drop_last))
+            
+        if test_size > 0:
+            test_ds = AugmentedTensorDataset(images[test_idx], labels[test_idx], transform=eval_transform)
+            loaders.append(DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=drop_last))
+            
+        if len(loaders) == 1:
+            return loaders[0]
+        return tuple(loaders)

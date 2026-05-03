@@ -1,5 +1,7 @@
 import os
-import tensorflow as tf
+import torch
+import torchvision.io as io
+import torchvision.transforms.functional as F
 
 class FileReader:
     """
@@ -54,11 +56,9 @@ class FileReader:
             image_path (str): Path to the image file.
 
         Returns:
-            tf.Tensor: Preprocessed image tensor of shape (128, 128, 1).
+            torch.Tensor: Preprocessed image tensor of shape (1, 128, 128).
         """
-        image = tf.io.read_file(image_path)
-        image = tf.image.decode_png(image, channels=1)
-        image = tf.image.resize(image, [128, 128])
-        image = tf.cast(image, tf.float32) / 255.0
+        image = io.read_image(image_path, mode=io.ImageReadMode.GRAY)
+        image = F.resize(image, [128, 128], antialias=True)
+        image = image.to(torch.float32) / 255.0
         return image
-
