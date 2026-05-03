@@ -9,8 +9,25 @@ CLASS_DIR = "Testclass"
 LABELS_DIR = "Testlabel"
 
 def generateData(images, labels=None):
+    """
+    Generate synthetic dataset by placing 28x28 digits onto 128x128 canvases.
+    Saves generated images, bounding box coordinates, and class labels to disk.
+
+    Args:
+        images (np.ndarray): Array of flattened digit images.
+        labels (np.ndarray, optional): Array of corresponding digit classes.
+    """
 
     def createCanvas(digit):
+        """
+        Place a digit randomly on a 128x128 canvas.
+
+        Args:
+            digit (np.ndarray): 28x28 digit image.
+
+        Returns:
+            tuple: (128x128 canvas image, [x_min, y_min, x_max, y_max] bbox)
+        """
         canvas = np.zeros((128, 128), dtype=np.uint8)
 
         # row = y, col = x
@@ -25,15 +42,18 @@ def generateData(images, labels=None):
         return canvas, bbox
 
     def saveImage(img, name):
+        """Save the generated 128x128 image to the images directory."""
         os.makedirs(IMAGES_DIR, exist_ok=True)
         Image.fromarray(img).save(f"{IMAGES_DIR}/{name}.png")
 
     def saveBbox(bbox, name):
+        """Save the bounding box coordinates to a text file."""
         os.makedirs(LABELS_DIR, exist_ok=True)
         with open(f"{LABELS_DIR}/{name}.txt", "w") as f:
             f.write(f"{bbox[0]} {bbox[1]} {bbox[2]} {bbox[3]}")
 
     def saveClassLabel(label, name):
+        """Save the digit class label to a text file."""
         os.makedirs(CLASS_DIR, exist_ok=True)
         with open(f"{CLASS_DIR}/{name}.txt", "w") as f:
             f.write(str(label))
