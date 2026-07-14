@@ -1,21 +1,15 @@
-# Core Dependencies (Windows Native / Python 3.8+)
-numpy==1.23.5
-pandas==1.5.3
-scipy==1.10.1
-matplotlib
-pillow
-scikit-learn==1.2.2
+# Core
+numpy>=2.0
+scipy>=1.13
+matplotlib>=3.9
+pillow>=11.0
+scikit-learn>=1.5
+opencv-python>=4.9
+pandas>=2.0
 
-# PyTorch Ecosystem
+# PyTorch (install separately with correct CUDA version from https://pytorch.org)
 torch
 torchvision
-torchaudio
 
-# WSL requirements (Reference)
-# numpy==2.0.2
-# pandas==2.2.3
-# scipy==1.13.1
-# matplotlib==3.9.4
-# pillow==11.1.0
-# scikit-learn==1.6.1
-# tensorflow==2.20.0-dev0+selfbuilt # Supports the Blackwell Architecture CUDA GPUs
+# Experiment tracking (optional)
+wandb

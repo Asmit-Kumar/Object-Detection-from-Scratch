@@ -16,6 +16,7 @@ Testlabel/
 class/
 Testclass/
 csvs/
+data/
 
 # Model Files
 Models/
@@ -27,9 +28,11 @@ New folder/
 
 # Logs
 logs/
+wandb/
 
 # Scratch / Debug scripts
 scratch/
 test.py
 test_model_load.py
 extract_nb_images.py
+archive/

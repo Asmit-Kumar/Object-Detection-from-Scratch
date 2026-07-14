@@ -61,7 +61,7 @@ class ModelCheckpoint:
         model: torch.nn.Module,
         checkpoint_path: str = "./checkpoint/model.pth",
         best_model_path: str = "./checkpoint/best_model.pth",
-        mode: str = "min",
+        mode: str = "max",
         verbose: bool = True,
     ):
         self.model = model

@@ -1,64 +1,117 @@
-import os
+from pathlib import Path
+import json
 import torch
-import torchvision.io as io
-import torchvision.transforms.functional as F
+import cv2
+from dataclasses import dataclass
+import numpy as np
 
-class FileReader:
-    """
-    Utility class for reading files and processing images/labels.
-    """
 
-    @staticmethod
-    def read_files(path, extension, limit=None):
-        """
-        Read files with specific extension from directory.
+ROOT_DIR = Path(__file__).resolve().parent.parent / 'data' / 'OD'
 
-        Args:
-            path (str): Directory path to search in.
-            extension (str): File extension to filter by (e.g., 'png', 'txt').
-            limit (int, optional): Maximum number of files to return. Defaults to None.
 
-        Returns:
-            list: List of filenames matching the extension, or None if path doesn't exist.
-        """
-        if os.path.exists(path):
-            files = [f for f in os.listdir(path) if f.endswith(extension)]
-            if limit:
-                files = files[:limit]
-            return files
-        return None
+@dataclass
+class Record:
+    image: torch.Tensor
+    boxes: torch.Tensor
+    labels: torch.Tensor
+    classes: list[str]
 
-    @staticmethod
-    def read_label(label_path):
-        """
-        Read and process label file containing bounding box coordinates.
+@dataclass(slots=True)
+class Metadata:
+    image: str
+    boxes: np.ndarray
+    labels: np.ndarray
+    classes: list[str]
 
-        Args:
-            label_path (str): Path to the label text file.
 
-        Returns:
-            list: [x_min, y_min, x_max, y_max] coordinates.
-        """
-        with open(label_path, 'r') as file:
-            lines = file.readlines()
-            x_min, y_min, x_max, y_max = list(map(int, lines[0].strip().split()))
-            return [x_min, y_min, x_max, y_max]
+class DataReader:
+    """Reads a generated dataset directory (images/ + metadata.jsonl)."""
 
-    @staticmethod
-    def read_image(image_path):
-        """
-        Read and preprocess image for the model.
-        
-        Reads the image, decodes it as grayscale, resizes to 128x128, 
-        and normalizes pixel values to [0, 1].
+    def __init__(
+            self,
+            root: str | Path,
+            image_size: tuple = (224, 224),
+    ):
+        self.root = Path(root)
+        self.image_size = image_size
+        self.images_dir = self.root / 'images'
+        self.records: list[Metadata] = []       # parsed JSONL rows
+        self.metadata_path = self.root / 'metadata.jsonl'
+        self._load_metadata()
 
-        Args:
-            image_path (str): Path to the image file.
+    def _load_metadata(self):
+        """Parse metadata.jsonl → self.records list."""
+        self.records = []
 
-        Returns:
-            torch.Tensor: Preprocessed image tensor of shape (1, 128, 128).
-        """
-        image = io.read_image(image_path, mode=io.ImageReadMode.GRAY)
-        image = F.resize(image, [128, 128], antialias=True)
-        image = image.to(torch.float32) / 255.0
-        return image
+        with open(self.metadata_path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+
+                rec = json.loads(line)
+                objects = rec["objects"]
+
+                boxes = []
+                labels = []
+                classes = []
+
+                for obj in objects:
+                    boxes.append(obj["bbox"])
+                    labels.append(obj["label"])
+                    classes.append(obj["char"])
+
+                self.records.append(
+                    Metadata(
+                        image=rec["image"],
+                        boxes=np.asarray(boxes, dtype=np.float32),
+                        labels=np.asarray(labels, dtype=np.int64),
+                        classes=classes,
+                    )
+                )
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def read_image(self, filename: str) -> torch.Tensor:
+        """Read image → float32 (1, H, W) normalised to [0, 1]."""
+        path = str(self.images_dir / filename)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)  # uint8 (H, W)
+        if img is None:
+            raise FileNotFoundError(path)
+        return torch.from_numpy(img).unsqueeze(0).float().div_(255.0)
+
+    def get_record(self, idx: int) -> Record:
+        """Return Record with image Tensor(1, H, W), boxes Tensor(M, 4), labels Tensor(M,)."""
+        rec = self.records[idx]
+        image = self.read_image(rec.image)
+        boxes = torch.from_numpy(rec.boxes)
+        labels = torch.from_numpy(rec.labels)
+        classes = rec.classes
+
+        return Record(
+            image=image,
+            boxes=boxes,
+            labels=labels,
+            classes=classes
+        )
+
+
+if __name__ == '__main__':
+    reader = DataReader(ROOT_DIR / 'train', image_size=(224, 224))
+    record = reader.get_record(np.random.randint(0, len(reader.records)))
+    for cls, lbl, bbox in zip(record.classes, record.labels, record.boxes):
+        print(f" - Char '{cls}' (label {lbl}) at bbox {bbox}")
+
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    fig, ax = plt.subplots()
+    ax.imshow(record.image.detach().cpu().squeeze().numpy(), cmap='gray')
+
+    for cls, bbox in zip(record.classes, record.boxes):
+        x, y, w, h = bbox
+        rect = patches.Rectangle((x, y), w, h, linewidth=1, edgecolor='r', facecolor='none')
+        ax.add_patch(rect)
+        ax.text(x, y - 2, cls, color='red', fontsize=12, fontweight='bold')
+
+    plt.show()

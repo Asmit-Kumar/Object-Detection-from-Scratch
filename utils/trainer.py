@@ -3,92 +3,250 @@ Training and Evaluation Utilities.
 
 Provides reusable functions for training loops, validation, testing, and
 metrics computation (both classification and regression) with AMP support.
+
+BF16 + GradScaler note:
+    bfloat16 has a wider dynamic range than float16, so it does NOT require
+    loss scaling in practice. However, GradScaler is accepted here for API
+    uniformity — when device_type='cuda' and dtype=bfloat16, PyTorch
+    automatically makes the scaler a no-op (scale stays at 1.0, no overflow
+    checks). Pass  scaler=torch.amp.GradScaler('cuda')  if you want the
+    unified API, or simply pass  scaler=None  for bf16 runs.
 """
 
 import time
 import torch
 import torch.nn.functional as F
+from .losses import pairwise_iou, mean_iou, DetectionLoss  # noqa: F401
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+# Default AMP dtype used across all training helpers.
+_AMP_DTYPE = torch.bfloat16
+
 
 def train_one_epoch(
         model, loader, criterion, optimizer,
-        device, scheduler=None, scaler=None
+        device, scheduler=None, scaler=None,
+        clip_grad_norm: float = 0.0,
+        step_scheduler_per_batch: bool = True,
+        gpu_augment=None,
 ):
     """
     Run one full training epoch.
+
+    Uses bfloat16 autocast when a CUDA device is detected.
+
+    Args:
+        clip_grad_norm: If > 0, clip gradient norms to this value before the
+            optimizer step. Requires scaler.unscale_() which is handled
+            automatically. Defaults to 0.0 (disabled).
+        step_scheduler_per_batch: If True (default), step the scheduler after
+            every mini-batch (e.g. OneCycleLR). If False, the caller (fit())
+            is responsible for stepping once per epoch (e.g. CosineAnnealingLR).
+        gpu_augment (callable | None): A torchvision.transforms.v2 transform
+            applied to the batch ON the GPU after .to(device). Use
+            get_emnist_gpu_transform() to create this. Much faster than
+            per-sample CPU augmentation inside the DataLoader. Defaults to None.
+
+    GPU throughput notes:
+      - non_blocking=True on .to(device) overlaps CPU→GPU transfer with compute,
+        requires pin_memory=True in the DataLoader (set by get_emnist_dataloaders).
+      - set_to_none=True on zero_grad is faster than zeroing (avoids memset).
+      - On Windows: num_workers > 0 requires training to run inside
+        `if __name__ == '__main__':` — otherwise workers silently fall back to 0.
     """
     model.train()
     epoch_loss = 0.0
     n_batches = 0
 
-    for inputs, labels in loader:
-        inputs, labels = inputs.to(device), labels.to(device)
-        optimizer.zero_grad()
+    use_amp = device.type == "cuda"
 
-        if scaler is not None:
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+    for inputs, labels in loader:
+        # non_blocking=True: async CPU→GPU copy while GPU runs previous batch
+        inputs = inputs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # GPU batch augmentation — single vectorised CUDA op, far faster than
+        # per-sample CPU augmentation inside the DataLoader workers.
+        if gpu_augment is not None:
+            with torch.no_grad():
+                inputs = gpu_augment(inputs)
+
+        # set_to_none is faster than zeroing — skips the memset
+        optimizer.zero_grad(set_to_none=True)
+
+        if use_amp:
+            with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             outputs = model(inputs)
             loss = criterion(outputs, labels)
+
+        # Record scale before stepping to detect overflow
+        prev_scale = scaler.get_scale() if scaler is not None else None
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if clip_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             loss.backward()
+            if clip_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
             optimizer.step()
 
-        if scheduler is not None:
-            # Assumes scheduler is stepped per batch (e.g. OneCycleLR)
-            scheduler.step()
+        if scheduler is not None and step_scheduler_per_batch:
+            overflow = (
+                scaler is not None
+                and prev_scale is not None
+                and scaler.get_scale() < prev_scale
+            )
+            if not overflow:
+                scheduler.step()
 
         epoch_loss += loss.item()
+        if wandb is not None and wandb.run is not None:
+            wandb.log({"train/batch_loss": loss.item()})
+
         n_batches += 1
 
     return epoch_loss / n_batches
 
 
-def evaluate_classification(model, loader, criterion, device):
+def _infer_class_names_from_loader(loader):
+    """Return class labels exposed by a DataLoader dataset, if available."""
+    dataset = getattr(loader, "dataset", None)
+    return _infer_class_names_from_dataset(dataset, seen=set())
+
+
+def _infer_class_names_from_dataset(dataset, seen):
+    if dataset is None or id(dataset) in seen:
+        return None
+    seen.add(id(dataset))
+
+    for attr in ("class_names", "classes"):
+        values = getattr(dataset, attr, None)
+        if values is not None:
+            return list(values)
+
+    class_to_idx = getattr(dataset, "class_to_idx", None)
+    if class_to_idx:
+        return [name for name, _ in sorted(class_to_idx.items(), key=lambda item: item[1])]
+
+    nested_dataset = getattr(dataset, "dataset", None)
+    names = _infer_class_names_from_dataset(nested_dataset, seen)
+    if names is not None:
+        return names
+
+    for child in getattr(dataset, "datasets", ()):
+        names = _infer_class_names_from_dataset(child, seen)
+        if names is not None:
+            return names
+
+    return None
+
+
+def evaluate_classification(
+    model, loader, criterion, device,
+    print_per_class_accuracy: bool = False,
+    class_names=None,
+):
     """
     Evaluate model on a classification dataset.
+
+    Args:
+        print_per_class_accuracy (bool): If True, print accuracy for each class
+            after evaluation. Defaults to False.
+        class_names (Sequence | None): Optional display names indexed by class id.
+            When None, names are inferred from loader.dataset when available.
+
+    Returns:
+        (avg_loss, accuracy): Average loss and overall accuracy percentage.
     """
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
+    class_correct = None
+    class_total = None
+
+    use_amp = device.type == "cuda"
 
     with torch.no_grad():
         for imgs, labels in loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            outputs = model(imgs)
-            total_loss += criterion(outputs, labels).item()
+            imgs   = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                    outputs = model(imgs)
+                    total_loss += criterion(outputs, labels).item()
+            else:
+                outputs = model(imgs)
+                total_loss += criterion(outputs, labels).item()
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
+            if print_per_class_accuracy:
+                num_classes = outputs.size(1)
+                if class_correct is None:
+                    class_correct = torch.zeros(num_classes, dtype=torch.long)
+                    class_total = torch.zeros(num_classes, dtype=torch.long)
+
+                labels_cpu = labels.detach().view(-1).to("cpu")
+                correct_mask_cpu = (predicted == labels).detach().view(-1).to("cpu")
+
+                class_total += torch.bincount(labels_cpu, minlength=num_classes)
+                class_correct += torch.bincount(
+                    labels_cpu[correct_mask_cpu],
+                    minlength=num_classes,
+                )
+
     avg_loss = total_loss / len(loader)
     accuracy = 100.0 * correct / total
+
+    if print_per_class_accuracy and class_total is not None:
+        if class_names is None:
+            class_names = _infer_class_names_from_loader(loader)
+        elif not isinstance(class_names, list):
+            class_names = list(class_names)
+
+        print("Per-class accuracy:")
+        for class_idx in range(class_total.numel()):
+            class_count = class_total[class_idx].item()
+            class_label = (
+                class_names[class_idx]
+                if class_names is not None and class_idx < len(class_names)
+                else f"Class {class_idx}"
+            )
+            if class_count == 0:
+                print(f"  {class_label}: n/a (0/0)")
+                continue
+
+            class_hits = class_correct[class_idx].item()
+            class_accuracy = 100.0 * class_hits / class_count
+            print(f"  {class_label}: {class_accuracy:.2f}% ({class_hits}/{class_count})")
+
     return avg_loss, accuracy
 
-def compute_iou(pred_bboxes, target_bboxes):
-    """
-    Computes Intersection over Union (IoU) between predicted and target bounding boxes.
-    Assumes bounding boxes are in format [x_min, y_min, x_max, y_max].
-    """
-    x1 = torch.max(pred_bboxes[:, 0], target_bboxes[:, 0])
-    y1 = torch.max(pred_bboxes[:, 1], target_bboxes[:, 1])
-    x2 = torch.min(pred_bboxes[:, 2], target_bboxes[:, 2])
-    y2 = torch.min(pred_bboxes[:, 3], target_bboxes[:, 3])
+def compute_iou(pred_boxes, target_boxes):
+    """Mean IoU between paired (N,4) boxes in [x, y, w, h] format.
 
-    inter_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
-    
-    pred_area = (pred_bboxes[:, 2] - pred_bboxes[:, 0]) * (pred_bboxes[:, 3] - pred_bboxes[:, 1])
-    target_area = (target_bboxes[:, 2] - target_bboxes[:, 0]) * (target_bboxes[:, 3] - target_bboxes[:, 1])
-    
-    union_area = pred_area + target_area - inter_area
-    iou = inter_area / torch.clamp(union_area, min=1e-6)
-    
-    return iou.mean().item()
+    Thin wrapper around ``losses.mean_iou`` kept for backward compatibility
+    with ``evaluate_regression``.
+    """
+    return mean_iou(pred_boxes, target_boxes)
+
+
+# _pairwise_iou is imported from .losses as pairwise_iou
+_pairwise_iou = pairwise_iou
+
 
 def evaluate_regression(model, loader, criterion, device):
     """
@@ -98,12 +256,21 @@ def evaluate_regression(model, loader, criterion, device):
     total_loss = 0.0
     total_mae = 0.0
     total_iou = 0.0
-    
+
+    use_amp = device.type == "cuda"
+
     with torch.no_grad():
         for imgs, bboxes in loader:
-            imgs, bboxes = imgs.to(device), bboxes.to(device)
-            outputs = model(imgs)
-            
+            imgs   = imgs.to(device, non_blocking=True)
+            bboxes = bboxes.to(device, non_blocking=True)
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                    outputs = model(imgs)
+            else:
+                outputs = model(imgs)
+
+            # Cast back to float32 for loss/metric computation
+            outputs = outputs.float()
             total_loss += criterion(outputs, bboxes).item()
             total_mae += F.l1_loss(outputs, bboxes).item()
             total_iou += compute_iou(outputs, bboxes)
@@ -112,18 +279,222 @@ def evaluate_regression(model, loader, criterion, device):
     avg_loss = total_loss / n_batches
     avg_mae = total_mae / n_batches
     avg_iou = total_iou / n_batches
-    
+
     return avg_loss, avg_mae, avg_iou
+
+
+
+def records_to_padded_tensors(records, device):
+    """Converts a batch of Record dataclasses to padded tensors on the GPU."""
+    counts = [r.boxes.size(0) for r in records]
+    max_gt = max(counts, default=0)
+    B = len(records)
+    
+    # Pre-allocate on CPU (fast zeroing and slicing)
+    boxes = torch.zeros((B, max_gt, 4), dtype=torch.float32)
+    labels = torch.zeros((B, max_gt), dtype=torch.int64)
+    mask = torch.zeros((B, max_gt), dtype=torch.bool)
+    
+    classes_list = []
+    for i, r in enumerate(records):
+        n = r.boxes.size(0)
+        if n > 0:
+            boxes[i, :n] = r.boxes
+            labels[i, :n] = r.labels
+            mask[i, :n] = True
+        
+    # Bulk transfer to GPU once
+    boxes = boxes.to(device, non_blocking=True)
+    labels = labels.to(device, non_blocking=True)
+    mask = mask.to(device, non_blocking=True)
+    
+    return boxes, labels, mask
+
+def train_one_epoch_detection(
+    model, loader, criterion, optimizer, device,
+    scheduler=None, scaler=None,
+    clip_grad_norm: float = 0.0,
+    step_scheduler_per_batch: bool = True,
+):
+    """Training loop for multi-object detection.
+
+    Expects loader to yield (images, list[Record]).
+    Uses records_to_padded_tensors internally before loss computation.
+    """
+    model.train()
+    epoch_loss = 0.0
+    epoch_match_ratio = 0.0
+    n_batches  = 0
+    use_amp    = device.type == "cuda"
+
+    loader_iter = iter(loader)
+    while True:
+        is_timing = n_batches < 5
+        if is_timing:
+            torch.cuda.synchronize()
+            t_start = time.perf_counter()
+
+        try:
+            images, boxes, labels, mask = next(loader_iter)
+        except StopIteration:
+            break
+
+        if is_timing:
+            torch.cuda.synchronize()
+            t_data = time.perf_counter()
+
+        images = images.to(device, non_blocking=True)
+        boxes = boxes.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+
+        if is_timing:
+            torch.cuda.synchronize()
+            t_pad = time.perf_counter()
+
+        optimizer.zero_grad(set_to_none=True)
+        
+        if is_timing:
+            t0 = t_pad
+
+        if use_amp:
+            with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                outputs = model(images)
+                if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
+                loss = criterion(outputs, boxes, mask)
+                if is_timing: torch.cuda.synchronize(); t2 = time.perf_counter()
+        else:
+            outputs = model(images)
+            if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
+            loss = criterion(outputs, boxes, mask)
+            if is_timing: torch.cuda.synchronize(); t2 = time.perf_counter()
+
+        prev_scale = scaler.get_scale() if scaler is not None else None
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if is_timing: torch.cuda.synchronize(); t3 = time.perf_counter()
+            if clip_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if is_timing: torch.cuda.synchronize(); t3 = time.perf_counter()
+            if clip_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            optimizer.step()
+            
+        epoch_match_ratio += getattr(criterion, 'last_matched_ratio', 1.0)
+
+        if is_timing:
+            torch.cuda.synchronize()
+            t4 = time.perf_counter()
+            print(
+                f"Batch {n_batches+1:2d} | "
+                f"match={getattr(criterion, 'last_matched_ratio', 1.0):.2f} "
+                f"hungar={getattr(criterion, 'last_hungarian_time', 0.0):.1f}ms "
+                f"data={(t_data-t_start)*1000:.1f}ms "
+                f"pad={(t_pad-t_data)*1000:.1f}ms "
+                f"forward={(t1-t0)*1000:.1f}ms "
+                f"loss={(t2-t1)*1000:.1f}ms "
+                f"backward={(t3-t2)*1000:.1f}ms "
+                f"step={(t4-t3)*1000:.1f}ms"
+            )
+
+        if scheduler is not None and step_scheduler_per_batch:
+            overflow = (
+                scaler is not None
+                and prev_scale is not None
+                and scaler.get_scale() < prev_scale
+            )
+            if not overflow:
+                scheduler.step()
+
+        epoch_loss += loss.item()
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "train/batch_loss": loss.item(),
+                "train/match_ratio": getattr(criterion, 'last_matched_ratio', 1.0)
+            })
+
+        n_batches += 1
+
+    if hasattr(criterion, 'last_matched_ratio'):
+        print(f"  --> Epoch Average Match Ratio: {epoch_match_ratio / n_batches:.4f}")
+
+    return epoch_loss / n_batches
+
+
+def evaluate_detection(model, loader, criterion, device):
+    """Evaluate a detection model. Returns (avg_loss, mean_iou).
+
+    IoU is computed per-image by greedily matching each GT box to the
+    predicted box with the highest IoU. Averages across all GT boxes.
+
+    Expects loader to yield (images, list[Record]).
+    """
+    print(f"Validation batches: {len(loader)}")
+    model.eval()
+    total_loss = 0.0
+    total_iou  = 0.0
+    n_images   = 0
+    use_amp    = device.type == "cuda"
+
+    with torch.no_grad():
+        for images, boxes, labels, mask in loader:
+            images = images.to(device, non_blocking=True)
+            boxes = boxes.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                    outputs = model(images)
+                    loss = criterion(outputs, boxes, mask)
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, boxes, mask)
+
+            total_loss += loss.item()
+
+            pred_boxes = outputs[..., :4]
+            iou = _pairwise_iou(pred_boxes, boxes)  # (B, N_pred, max_gt)
+            iou.masked_fill_(~mask.unsqueeze(1), -1.0)
+            matched_iou = iou.max(dim=1).values     # (B, max_gt)
+
+            for b in range(images.size(0)):
+                b_mask = mask[b]
+                if b_mask.any():
+                    total_iou += matched_iou[b, b_mask].mean().item()
+                    n_images  += 1
+
+    avg_loss = total_loss / len(loader)
+    mean_iou = total_iou / max(n_images, 1)
+    return avg_loss, mean_iou
 
 
 def fit(
     model, trainloader, valloader, criterion,
     optimizer, device, epochs, task_type="classification",
     scheduler=None, scaler=None, checkpoint=None,
+    log=False, log_dir=None,
+    clip_grad_norm: float = 1.0,
+    step_scheduler_per_batch: bool = True,
+    gpu_augment=None,
+    verbose: int = 1,
+    print_per_class_accuracy: bool = False,
+    class_names=None,
+    model_label: str = None,
+    resume: bool = False,
 ):
     """
     Full training loop with per-epoch logging, validation, and optional checkpointing.
     Supports both classification and bounding box regression tasks.
+
+    Uses bfloat16 autocast automatically on CUDA devices. Pass a GradScaler
+    for API uniformity (it behaves as a no-op with bf16).
 
     Args:
         model (nn.Module): The model to train.
@@ -136,14 +507,36 @@ def fit(
         task_type (str): One of "classification" or "regression".
             - "classification": Tracks Val Loss and Val Accuracy (%).
             - "regression": Tracks Val Loss, Val MAE, and Val IoU.
-        scheduler (LRScheduler, optional): LR scheduler stepped per mini-batch (e.g. OneCycleLR).
-            If None, no LR scheduling is applied. Defaults to None.
-        scaler (GradScaler, optional): torch.amp.GradScaler for AMP mixed precision training.
-            If None, training runs in full float32 precision. Defaults to None.
+        scheduler (LRScheduler, optional): LR scheduler. Defaults to None.
+            - step_scheduler_per_batch=True (default): stepped every mini-batch
+              (e.g. OneCycleLR, CyclicLR).
+            - step_scheduler_per_batch=False: stepped once per epoch after
+              validation (e.g. CosineAnnealingLR, StepLR).
+        scaler (GradScaler, optional): torch.amp.GradScaler for AMP training.
+            For bf16 this is a no-op but is accepted for API compatibility.
+            Defaults to None.
+        clip_grad_norm (float): Clip gradient norms to this value before the
+            optimizer step. Matches the CIFAR reference (default 1.0).
+            Set to 0.0 to disable. Defaults to 1.0.
+        gpu_augment (callable | None): GPU batch augmentation from
+            get_emnist_gpu_transform(). Applied on-device before forward pass.
+            Defaults to None.
         checkpoint (ModelCheckpoint, optional): Callback invoked after each epoch.
             For classification, monitors Val Accuracy.
             For regression, monitors Val IoU.
             Defaults to None.
+        log (bool): If True, record this run with RunLogger. Each run is saved as
+            its own timestamped JSON file — nothing is ever overwritten.
+            Defaults to False.
+        log_dir (str | None): Directory to store run JSON files.
+            When None (default), auto-derived from the model class name::
+
+                CharacterClassifier  →  logs/CharacterClassifier/
+                ObjectDetectorRes    →  logs/ObjectDetectorRes/
+        print_per_class_accuracy (bool): If True, print per-class validation
+            accuracy for classification runs. Defaults to False.
+        class_names (Sequence | None): Optional display names indexed by class id
+            for per-class accuracy output. When None, inferred from the loader.
 
     Returns:
         dict: history dict with keys:
@@ -154,46 +547,202 @@ def fit(
     if task_type == "regression":
         history['val_mae'] = []
         history['val_iou'] = []
+    elif task_type == "detection":
+        history['val_iou'] = []
+
+    amp_info = "bf16 autocast" if device.type == "cuda" else "fp32 (CPU)"
+    metric_unit = "%" if task_type == "classification" else ""
+    print(f"Training with {amp_info} | Task: {task_type} | Epochs: {epochs}")
+
+    # ── Set up RunLogger ──────────────────────────────────────────────────────
+    logger = None
+    if log:
+        from .logger import RunLogger
+        model_name = type(model).__name__
+        resolved_log_dir = log_dir if log_dir is not None else f"logs/{model_name}"
+        logger = RunLogger(log_dir=resolved_log_dir, verbose=verbose, metric_unit=metric_unit)
+        config = {
+            "model":     model_name,
+            "task":      task_type,
+            "optimizer": type(optimizer).__name__,
+            "scheduler": type(scheduler).__name__ if scheduler else None,
+            "lr":        optimizer.param_groups[0]["lr"],
+            "epochs":    epochs,
+            "device":    str(device),
+            "clip_grad_norm": clip_grad_norm,
+            "step_scheduler_per_batch": step_scheduler_per_batch,
+            "gpu_augment": gpu_augment is not None,
+            "print_per_class_accuracy": print_per_class_accuracy,
+        }
+        if model_label: config["label"] = model_label
+        logger.start(config=config)
 
     total_start = time.time()
+    best_val_metric = float('-inf')
+    start_epoch = 0
+    
+    if resume and checkpoint is not None:
+        try:
+            start_epoch = checkpoint.resume_training(optimizer, scheduler, scaler)
+            print(f"Resuming training from epoch {start_epoch}")
+        except FileNotFoundError as e:
+            print(f"Could not resume training: {e}")
 
-    for epoch in range(epochs):
-        start_time = time.time()
+    for epoch in range(start_epoch, epochs):
+        train_start = time.perf_counter()
 
         # Train
-        avg_train_loss = train_one_epoch(
-            model, trainloader, criterion, optimizer, device, scheduler, scaler
-        )
+        if task_type == "detection":
+            avg_train_loss = train_one_epoch_detection(
+                model, trainloader, criterion, optimizer, device,
+                scheduler, scaler,
+                clip_grad_norm=clip_grad_norm,
+                step_scheduler_per_batch=step_scheduler_per_batch,
+            )
+        else:
+            avg_train_loss = train_one_epoch(
+                model, trainloader, criterion, optimizer, device,
+                scheduler, scaler,
+                clip_grad_norm=clip_grad_norm,
+                step_scheduler_per_batch=step_scheduler_per_batch,
+                gpu_augment=gpu_augment,
+            )
         history['train_loss'].append(avg_train_loss)
+        
+        train_end = time.perf_counter()
+
+        # Step scheduler per epoch (e.g. CosineAnnealingLR)
+        if scheduler is not None and not step_scheduler_per_batch:
+            scheduler.step()
 
         # Validate
+        current_lr = optimizer.param_groups[0]["lr"]
+
         if task_type == "classification":
-            avg_val_loss, val_metric = evaluate_classification(model, valloader, criterion, device)
+            avg_val_loss, val_metric = evaluate_classification(
+                model, valloader, criterion, device,
+                print_per_class_accuracy=print_per_class_accuracy,
+                class_names=class_names,
+            )
+            val_end = time.perf_counter()
+            elapsed = train_end - train_start
+            
+            print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
+            
             history['val_loss'].append(avg_val_loss)
             history['val_metric'].append(val_metric)  # Accuracy
-            
+
             if checkpoint is not None:
-                checkpoint(val_metric, epoch, optimizer, scheduler, scaler)
-                
-            elapsed = time.time() - start_time
-            print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_metric:.2f}% | Time: {elapsed:.2f}s')
+                is_best = checkpoint(val_metric, epoch, optimizer, scheduler, scaler)
+            else:
+                is_best = val_metric > best_val_metric
+            if is_best:
+                best_val_metric = val_metric
+
+            if wandb is not None and wandb.run is not None:
+                wandb.log({
+                    "train/epoch_loss": avg_train_loss,
+                    "val/loss": avg_val_loss,
+                    "val/accuracy": val_metric,
+                    "epoch": epoch + 1
+                })
+
+            if logger is not None:
+                logger.log_epoch(
+                    epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
+                    val_metric=val_metric, lr=current_lr,
+                    epoch_time=elapsed, metric_label="val_acc",
+                )
+            elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
+                best_marker = "  ★ NEW BEST" if is_best else ""
+                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_metric:.2f}% | Time: {elapsed:.2f}s{best_marker}')
 
         elif task_type == "regression":
             avg_val_loss, val_mae, val_iou = evaluate_regression(model, valloader, criterion, device)
+            val_end = time.perf_counter()
+            elapsed = train_end - train_start
+            
+            print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
+            
             history['val_loss'].append(avg_val_loss)
             history['val_mae'].append(val_mae)
             history['val_iou'].append(val_iou)
-            
+
             # Using validation IoU as the checkpointing metric
             if checkpoint is not None:
-                checkpoint(val_iou, epoch, optimizer, scheduler, scaler)
-                
-            elapsed = time.time() - start_time
-            print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val MAE: {val_mae:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s')
+                is_best = checkpoint(val_iou, epoch, optimizer, scheduler, scaler)
+            else:
+                is_best = val_iou > best_val_metric
+            if is_best:
+                best_val_metric = val_iou
+
+            if wandb is not None and wandb.run is not None:
+                wandb.log({
+                    "train/epoch_loss": avg_train_loss,
+                    "val/loss": avg_val_loss,
+                    "val/mae": val_mae,
+                    "val/iou": val_iou,
+                    "epoch": epoch + 1
+                })
+
+            if logger is not None:
+                logger.log_epoch(
+                    epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
+                    val_metric=val_iou, lr=current_lr,
+                    epoch_time=elapsed, metric_label="val_iou",
+                    val_mae=val_mae,
+                )
+            elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
+                best_marker = "  ★ NEW BEST" if is_best else ""
+                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val MAE: {val_mae:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}')
+
+        elif task_type == "detection":
+            avg_val_loss, val_iou = evaluate_detection(model, valloader, criterion, device)
+            val_end = time.perf_counter()
+            elapsed = train_end - train_start
+            
+            print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
+            
+            history['val_loss'].append(avg_val_loss)
+            history['val_iou'].append(val_iou)
+
+            if checkpoint is not None:
+                is_best = checkpoint(val_iou, epoch, optimizer, scheduler, scaler)
+            else:
+                is_best = val_iou > best_val_metric
+            if is_best:
+                best_val_metric = val_iou
+
+            if wandb is not None and wandb.run is not None:
+                wandb.log({
+                    "train/epoch_loss": avg_train_loss,
+                    "val/loss": avg_val_loss,
+                    "val/iou": val_iou,
+                    "epoch": epoch + 1
+                })
+
+            if logger is not None:
+                logger.log_epoch(
+                    epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
+                    val_metric=val_iou, lr=current_lr,
+                    epoch_time=elapsed, metric_label="val_iou",
+                )
+            elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
+                best_marker = "  ★ NEW BEST" if is_best else ""
+                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}')
+
 
     total_minutes = (time.time() - total_start) / 60
-    print(f'\nFinished Training in {total_minutes:.2f} minutes')
+    if verbose >= 2 or verbose is True:
+        print(f'\nFinished Training in {total_minutes:.2f} minutes')
+
+    best = None
     if checkpoint is not None:
-        print(f'Best Validation Metric: {checkpoint.best_score:.4f}')
+        best = checkpoint.best_score
+        print(f'Best Validation Metric: {best:.4f}')
+
+    if logger is not None:
+        logger.finish(best_val_metric=best)
 
     return history
+

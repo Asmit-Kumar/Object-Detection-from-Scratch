@@ -61,37 +61,75 @@ class Visualizer:
         plt.axis('off')
         plt.show()
 
+    @staticmethod
+    def visualize_training_curves(train_losses, val_losses, val_metric, metric_label="Val Metric"):
+        """
+        Plot training/validation loss and a validation metric side by side.
 
-def plot_training_curves(train_losses, val_losses, val_metric, metric_label="Val Metric"):
-    """
-    Plot training/validation loss and a validation metric side by side.
+        Args:
+            train_losses (list): Per-epoch training losses.
+            val_losses (list): Per-epoch validation losses.
+            val_metric (list): Per-epoch validation metric (e.g. accuracy or IoU).
+            metric_label (str): Y-axis label and title for the metric plot.
+                Defaults to "Val Metric". Use "Accuracy (%)" for classification
+                or "IoU" for regression.
+        """
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    Args:
-        train_losses (list): Per-epoch training losses.
-        val_losses (list): Per-epoch validation losses.
-        val_metric (list): Per-epoch validation metric (e.g. accuracy or IoU).
-        metric_label (str): Y-axis label and title for the metric plot.
-            Defaults to "Val Metric". Use "Accuracy (%)" for classification
-            or "IoU" for regression.
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        ax1.plot(train_losses, label='Train Loss')
+        ax1.plot(val_losses, label='Val Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training & Validation Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
 
-    ax1.plot(train_losses, label='Train Loss')
-    ax1.plot(val_losses, label='Val Loss')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training & Validation Loss')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+        ax2.plot(val_metric, label=metric_label, color='green')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel(metric_label)
+        ax2.set_title(f'Validation {metric_label}')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
 
-    ax2.plot(val_metric, label=metric_label, color='green')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel(metric_label)
-    ax2.set_title(f'Validation {metric_label}')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
 
-    plt.tight_layout()
-    plt.show()
+    @staticmethod
+    def visualize_multi_detection_batch(imgs_v, preds, boxes_v, mask_v, conf_thresh=0.5):
+        """
+        Visualize a batch of multi-object detections.
+        """
+        import matplotlib.patches as patches
+        
+        N_SHOW = min(10, imgs_v.size(0))
+        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+
+        for i, ax in enumerate(axes.flat[:N_SHOW]):
+            img        = imgs_v[i].squeeze().numpy()
+            pred_slots = preds[i]
+            
+            b_mask     = mask_v[i]
+            gt_boxes   = boxes_v[i][b_mask]
+
+            conf_scores = torch.sigmoid(pred_slots[:, 4])
+            keep        = conf_scores > conf_thresh
+            pred_boxes  = pred_slots[keep, :4]
+
+            ax.imshow(img, cmap='gray')
+
+            for box in gt_boxes:
+                x, y, w, h = box
+                rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='lime', facecolor='none')
+                ax.add_patch(rect)
+
+            for box in pred_boxes:
+                x, y, w, h = box
+                rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='red', linestyle='--', facecolor='none')
+                ax.add_patch(rect)
+
+            ax.axis('off')
+
+        plt.tight_layout()
+        plt.show()
 
 
