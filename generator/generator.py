@@ -77,7 +77,6 @@ class DatasetGenerator:
         metadata_path = self._metadata_path(subset)
 
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
         image_dir.mkdir(parents=True, exist_ok=True)
 
         counter_gen = count()
@@ -101,20 +100,14 @@ class DatasetGenerator:
                     [cv2.IMWRITE_PNG_COMPRESSION, 3],
                 )
                     
-                record = {
-                    "image_idx": idx,
-                    "placement": canvas.placement,
-                    "objects": [
-                        {
-                            "bbox":  obj.bbox,
-                            "label": obj.label,
-                            "char":  obj.char,
-                        }
-                        }
-                        for obj in canvas.objects
-                    ],
-                }
-                record["image"] = filename
+                record = {"image_idx": idx, "placement": canvas.placement, "objects": [
+                    {
+                        "bbox": obj.bbox,
+                        "label": obj.label,
+                        "char": obj.char,
+                    }
+                    for obj in canvas.objects
+                ], "image": filename}
 
                 line = json.dumps(record, separators=(',', ':'))
                 with lock:
