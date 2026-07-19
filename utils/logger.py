@@ -162,6 +162,49 @@ class RunLogger:
                 f"lr={lr:.2e}{t_str}{best_marker}"
             )
 
+    def log_test_results(
+        self,
+        test_results: list,
+        iou_threshold: float = 0.5,
+        label: str = "threshold_sweep",
+    ) -> None:
+        """Persist test-set evaluation results into the run JSON.
+
+        Note: `logger` is created internally by `fit()` and is not returned.
+        To use this method, create a standalone RunLogger instance and call
+        `logger.start()` / `logger.finish()` manually, or reload a run via
+        `logger.load_run(run_name)`.
+
+        Args:
+            test_results:  List of dicts returned by evaluate_detection_sweep(),
+                           each containing conf, precision, recall, f1, tp, fp, fn.
+            iou_threshold: The IoU threshold used during the sweep.
+            label:         Key name under which results are stored in the JSON.
+                           Defaults to 'threshold_sweep'.
+
+        Results are stored under run["test_results"][label] and written
+        to disk immediately so they survive a crash.
+        """
+        if "test_results" not in self._run:
+            self._run["test_results"] = {}
+        self._run["test_results"][label] = {
+            "iou_threshold": iou_threshold,
+            "results": test_results,
+        }
+        self._save_run()
+
+        if self.verbose >= 1:
+            print(f"\n[RunLogger] Test sweep ({label}) — IoU threshold: {iou_threshold}")
+            print(f"{'Conf':>6}  {'P':>6}  {'R':>6}  {'F1':>6}")
+            print("-" * 32)
+            for r in test_results:
+                print(
+                    f"{r['conf']:6.2f}  {r['precision']:6.4f}  "
+                    f"{r['recall']:6.4f}  {r['f1']:6.4f}"
+                )
+
+
+
     def finish(self, best_val_metric: float | None = None) -> None:
         """
         Finalise the run and write it to its own JSON file.
@@ -213,7 +256,7 @@ class RunLogger:
 
         col_w = [36, 14, 12, 8, 8]
         headers = ["Run Name", f"Best ({self.metric_unit})", "Time (min)", "Epochs", "LR"]
-        sep = "─" * (sum(col_w) + len(headers) * 2)
+        sep = "-" * (sum(col_w) + len(headers) * 2)
         print(f"\n{'Run Summary':^{len(sep)}}")
         print(sep)
         print("  ".join(h.ljust(w) for h, w in zip(headers, col_w)))

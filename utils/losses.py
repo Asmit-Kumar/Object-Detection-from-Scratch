@@ -68,8 +68,8 @@ class DetectionLoss(nn.Module):
     """Confidence-aware detection loss for multi-object localisation.
 
     For each image in the batch:
-      1. **Greedy IoU match** — for each GT box, assign the predicted slot
-         with the highest IoU.
+      1. **Hungarian match** — assign each GT box to the predicted slot that
+         minimises the overall IoU cost (via ``scipy.optimize.linear_sum_assignment``).
       2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) pairs.
       3. **Conf loss (BCE)** — ``BCEWithLogitsLoss`` on all slots; matched slots
          get target ``1.0``, background slots get ``0.0``.
