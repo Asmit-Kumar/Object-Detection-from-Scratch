@@ -5,11 +5,11 @@ from torch.nn import functional as F
 
 class SimpleResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
-        super(SimpleResBlock, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn1   = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn2   = nn.BatchNorm2d(out_channels)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
@@ -19,27 +19,72 @@ class SimpleResBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out  = F.relu(self.bn1(self.conv1(x)))
+        out  = self.bn2(self.conv2(out))
         out += self.shortcut(x)
-        out = F.relu(out)
-        return out
+        return F.relu(out)
 
 
 class ObjectDetectorResNet(nn.Module):
-    def __init__(self, max_objects=24):
-        super(ObjectDetectorResNet, self).__init__()
+    """ResNet-style object detector with configurable channel widths.
+
+    Args:
+        max_objects (int):      Maximum number of predicted bounding boxes. Default: 24.
+        channels (list[int]):   Channel widths for the 4 residual layers.
+                                Use ``get_detector(size=...)`` for named presets.
+        pool_size (int):        Spatial size for AdaptiveAvgPool2d before the FC head.
+                                1 = global average pool (most compact).
+                                2 = 2x2 spatial grid (retains coarse layout, default).
+                                7 = original large pool (very high param count).
+    """
+
+    # Named size presets: (stem_out, [layer1..4 channels])
+    CONFIGS = {
+        "n": (32, [32,  64,  64,  128]),   # Nano   ~1.1M params
+        "s": (64, [64,  128, 128, 256]),   # Small  ~3.0M params  (default / v1)
+        "m": (64, [128, 256, 256, 512]),   # Medium ~9.2M params
+    }
+
+    def __init__(self, max_objects: int = 24, channels: list[int] | None = None, pool_size: int = 2):
+        super().__init__()
+        if channels is None:
+            channels = self.CONFIGS["s"][1]
+            stem_out = self.CONFIGS["s"][0]
+        else:
+            # stem_out = first channel entry in the list
+            stem_out = channels[0]
+
+        assert len(channels) == 4, "channels must have exactly 4 entries (one per res-layer)"
+
         self.max_objects = max_objects
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=2, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
 
-        self.layer1 = SimpleResBlock(64, 64, stride=2)
-        self.layer2 = SimpleResBlock(64, 128, stride=2)
-        self.layer3 = SimpleResBlock(128, 128, stride=2)
-        self.layer4 = SimpleResBlock(128, 256, stride=2)
+        # Stem
+        self.conv1 = nn.Conv2d(1, stem_out, kernel_size=3, stride=2, bias=False)
+        self.bn1   = nn.BatchNorm2d(stem_out)
 
-        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
-        self.fc = nn.Linear(256 * 7 * 7, max_objects * 5)
+        # Residual layers — strides fixed at 2 to progressively downsample
+        c = channels
+        self.layer1 = SimpleResBlock(stem_out,  c[0], stride=2)
+        self.layer2 = SimpleResBlock(c[0],      c[1], stride=2)
+        self.layer3 = SimpleResBlock(c[1],      c[2], stride=2)
+        self.layer4 = SimpleResBlock(c[2],      c[3], stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
+
+        # Shared FC: flatten → shared representation → common hidden
+        shared_dim = c[3] * 2          # e.g. 512 for Small
+        head_dim   = shared_dim // 2   # e.g. 256 for Small
+        fc_in      = c[3] * pool_size * pool_size
+        self.shared_fc = nn.Sequential(
+            nn.Linear(fc_in, shared_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(shared_dim, head_dim),    # common hidden layer
+            nn.ReLU(inplace=True),
+        )
+
+        # Branch: thin final projections from the shared hidden representation
+        self.box_head = nn.Linear(head_dim, max_objects * 4)   # [x, y, w, h]
+        self.obj_head = nn.Linear(head_dim, max_objects * 1)   # confidence logit
 
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
@@ -49,50 +94,19 @@ class ObjectDetectorResNet(nn.Module):
         x = self.layer4(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.fc(x)
-        x = x.view(-1, self.max_objects, 5)
 
-        return x
+        shared = self.shared_fc(x)                              # (B, shared_dim)
+
+        boxes = self.box_head(shared).view(-1, self.max_objects, 4)   # (B, N, 4)
+        confs = self.obj_head(shared).view(-1, self.max_objects, 1)   # (B, N, 1)
+
+        return torch.cat([boxes, confs], dim=-1)                      # (B, N, 5)
 
 
+if __name__ == "__main__":
+    for size in ("n", "s", "m"):
+        stem, ch = ObjectDetectorResNet.CONFIGS[size]
+        m = ObjectDetectorResNet(channels=ch)
+        n = sum(p.numel() for p in m.parameters())
+        print(f"  {size}  channels={ch}  params={n:,}")
 
-# class ResBlock(nn.Module):
-#     """Standard residual block with a skip connection."""
-#     def __init__(self, in_c, out_c):
-#         super().__init__()
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(in_c, out_c, 3, padding=1), nn.BatchNorm2d(out_c), nn.ReLU(),
-#             nn.Conv2d(out_c, out_c, 3, padding=1), nn.BatchNorm2d(out_c)
-#         )
-#         self.skip = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
-#
-#     def forward(self, x):
-#         return F.relu(self.conv(x) + self.skip(x))
-#
-#
-# class ObjectDetectorRes(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.stem = nn.Sequential(
-#             nn.Conv2d(1, 32, 3, padding=1),
-#             nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2)
-#         )
-#         self.res1 = nn.Sequential(ResBlock(32, 64),  nn.MaxPool2d(2))
-#         self.res2 = nn.Sequential(ResBlock(64, 128), nn.MaxPool2d(2))
-#         self.res3 = nn.Sequential(ResBlock(128, 64), nn.MaxPool2d(2))
-#         self.head = nn.Sequential(
-#             nn.AdaptiveAvgPool2d((4, 4)),
-#             nn.Flatten(),
-#             nn.Linear(64 * 4 * 4, 256),
-#             nn.ReLU(),
-#             nn.Dropout(0.3),
-#             nn.Linear(256, 4)
-#         )
-#
-#     def forward(self, x):
-#         return self.head(self.res3(self.res2(self.res1(self.stem(x)))))
-
-if __name__ == '__main__':
-    model = ObjectDetectorResNet()
-    print(model)
-    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
