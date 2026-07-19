@@ -66,7 +66,34 @@ We went through several optimizer and loss configurations to push past the 89% c
 ## Stage 2 -- Object Detector
 
 ### Architecture
-A **ResNet-based** backbone with a multi-slot detection head. The model predicts `N` fixed slots, each producing a `[x, y, w, h, confidence]` vector. The maximum number of objects per image defines the slot count.
+A **ResNet-based** backbone with a configurable multi-slot detection head. The model predicts `N` fixed slots, each producing a `[x, y, w, h, confidence]` vector.
+
+The head was refactored from a single monolithic FC layer into a two-branch structure:
+
+```
+Backbone (ResNet blocks)
+        |
+  AdaptiveAvgPool2d(2x2)
+        |
+     Flatten
+        |
+    shared_fc     Linear -> ReLU -> Linear -> ReLU  (shared hidden)
+        |
+   +---------+
+   |         |
+box_head   obj_head     (thin final linear projections)
+  N x 4      N x 1      [x,y,w,h]  /  confidence logit
+   |         |
+   +-- cat --+  -> (B, N, 5)
+```
+
+Three size variants are available via `get_detector(size=...)`:
+
+| Size | Channels | Params |
+|------|----------|--------|
+| n (Nano)   | `[32, 64, 64, 128]`   | 2.0M |
+| s (Small)  | `[64, 128, 128, 256]` | 2.2M |
+| m (Medium) | `[128, 256, 256, 512]` | 8.8M |
 
 ### From Greedy to Hungarian Matching
 
@@ -94,8 +121,6 @@ This **mathematically guarantees** that every ground-truth object is assigned a 
 | Greedy (later runs) | Argmax | 0.803-0.810 |
 | **Hungarian** | **Bipartite** | **0.903** |
 
-![Detector Training Curves](result/detector_resnet_s_curves.png)
-
 The jump from ~0.81 to **0.903** in a single swap shows just how much the slot collision problem was bottlenecking performance.
 
 ### Performance Optimization
@@ -110,8 +135,32 @@ Fixed by:
 
 Result: loss computation time dropped from ~200ms -> **~5ms per batch**. Full epoch time from ~170s -> **~70s**.
 
+### Size Scaling Results
+
+All three variants trained with identical config (AdamW, OneCycleLR, lr=4e-5, 60 epochs, 255k train images).
+
+#### Validation IoU
+
+| Size | Best Val IoU | Train Time |
+|------|-------------|-----------|
+| n (Nano)   | 0.7950 | ~69 min |
+| s (Small)  | 0.8666 | ~83 min |
+| **m (Medium)** | **0.9106** | ~148 min |
+
+#### Test-Set @ conf=0.50 (IoU threshold=0.5, 45k images)
+
+| Size | P      | R      | F1     |
+|------|--------|--------|--------|
+| n (Nano)   | 0.8977 | 0.8420 | 0.8690 |
+| s (Small)  | 0.9469 | 0.9091 | 0.9276 |
+| **m (Medium)** | **0.9676** | **0.9563** | **0.9619** |
+
+Increasing backbone capacity consistently improved localisation and detection quality. The Nano model was under-parameterised for the task, while the Medium model achieved the best localisation (0.9106 IoU) and detection performance (0.9619 F1). Performance gains began to diminish beyond the Small model, indicating the onset of diminishing returns.
+
+![Detector Training Curves](result/detector_resnet_s_curves.png)
+
 ### Training Config
-- **Model**: `ObjectDetectorResNet`
+- **Model**: `ObjectDetectorResNet` (via `get_detector(size=...)`)
 - **Optimizer**: `AdamW`
 - **Scheduler**: `OneCycleLR`
 - **Loss**: Huber (box regression) + BCE (confidence) with Hungarian assignment
@@ -127,9 +176,9 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 **Dataset size**: 255,000 training / 45,000 test images.
 
 ### Example Predictions
-Here are sample multi-object detections from the test set, visualizing the predicted bounding boxes:
+Sample multi-object detections from the test set (Medium model, conf=0.50):
 
-![Detection Output](result/output.png)
+![Detection Output](result/detection_output_latest.png)
 
 ---
 

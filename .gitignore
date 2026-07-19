@@ -36,3 +36,6 @@ test.py
 test_model_load.py
 extract_nb_images.py
 archive/
+
+# Private experiment log
+INSIGHTS.md
