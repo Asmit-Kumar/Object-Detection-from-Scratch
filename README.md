@@ -157,7 +157,7 @@ All three variants trained with identical config (AdamW, OneCycleLR, lr=4e-5, 60
 
 Increasing backbone capacity consistently improved localisation and detection quality. The Nano model was under-parameterised for the task, while the Medium model achieved the best localisation (0.9106 IoU) and detection performance (0.9619 F1). Performance gains began to diminish beyond the Small model, indicating the onset of diminishing returns.
 
-![Detector Training Curves](result/detector_resnet_s_curves.png)
+![Medium Detector Training Curves](result/detector_medium_curves.png)
 
 ### Training Config
 - **Model**: `ObjectDetectorResNet` (via `get_detector(size=...)`)
