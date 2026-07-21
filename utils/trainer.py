@@ -430,18 +430,19 @@ def train_one_epoch_detection(
 
 
 def evaluate_detection(
-    model, loader, criterion, device,
+    model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
     """Evaluate a detection model on a single pass.
 
-    Computes greedy mean IoU (the training/validation metric).
-    For full P/R/F1 threshold analysis, use evaluate_detection_sweep().
+    Computes greedy mean IoU and fixed-threshold P/R/F1.
+    For full P/R/F1 threshold analysis across a sweep, use evaluate_detection_sweep().
     Expects loader to yield (images, boxes, labels, mask).
     """
     model.eval()
     total_loss = 0.0
     total_iou  = 0.0
     n_images   = 0
+    tp = fp = fn = 0
     use_amp    = device.type == "cuda"
 
     with torch.no_grad():
@@ -461,21 +462,53 @@ def evaluate_detection(
             total_loss += loss.item()
 
             pred_boxes = outputs[..., :4].float()
+            pred_conf  = torch.sigmoid(outputs[..., 4].float())
 
             iou = _pairwise_iou(pred_boxes, boxes)   # (B, N_pred, max_gt)
-            iou.masked_fill_(~mask.unsqueeze(1), -1.0)
-            matched_iou = iou.max(dim=1).values       # (B, max_gt)
+            iou_masked = iou.masked_fill(~mask.unsqueeze(1), -1.0)
+            matched_iou = iou_masked.max(dim=1).values       # (B, max_gt)
+
+            conf_np, iou_np, mask_np = pred_conf.cpu().numpy(), iou.cpu().numpy(), mask.cpu().numpy()
 
             for b in range(images.size(0)):
-                b_mask = mask[b]
-                if b_mask.any():
-                    total_iou += matched_iou[b, b_mask].mean().item()
-                    n_images  += 1
+                b_mask = mask_np[b]
+                n_gt = int(b_mask.sum())
+                if n_gt == 0:
+                    continue
+                total_iou += matched_iou[b, mask[b]].mean().item()
+                n_images  += 1
+
+                pr_idx = np.where(conf_np[b] > conf_threshold)[0]
+                if len(pr_idx) == 0:
+                    fn += n_gt
+                    continue
+                order = pr_idx[np.argsort(-conf_np[b][pr_idx])]
+                sub_iou = iou_np[b][:, b_mask]
+                matched = set()
+                for i in order:
+                    j = int(np.argmax(sub_iou[i]))
+                    if sub_iou[i, j] >= iou_threshold and j not in matched:
+                        matched.add(j)
+                        tp += 1
+                    else:
+                        fp += 1
+                fn += n_gt - len(matched)
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) else 0.0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
 
     avg_loss = total_loss / len(loader)
     mean_iou = total_iou / max(n_images, 1)
 
-    return {"val_loss": avg_loss, "val_iou": mean_iou}
+    return {
+        "val_loss": avg_loss, 
+        "val_iou": mean_iou,
+        "val_precision": precision,
+        "val_recall": recall,
+        "val_f1": f1,
+        "tp": tp, "fp": fp, "fn": fn
+    }
 
 
 def evaluate_detection_sweep(
@@ -595,6 +628,109 @@ def evaluate_detection_sweep(
     return results
 
 
+def evaluate_density_sweep(
+    model, loader, device,
+    conf_threshold: float = 0.5,
+    iou_threshold: float = 0.5,
+    buckets: list[tuple[int, int]] = [(1, 3), (4, 7), (8, 24)]
+):
+    """Run a single-threshold evaluation, stratified by ground-truth object count.
+
+    Useful for diagnosing density-dependent recall drop-off.
+    Args:
+        buckets: List of (min_gt, max_gt) inclusive tuples.
+    """
+    model.eval()
+    use_amp = device.type == "cuda"
+    
+    # Store records: (pred_conf_np, iou_np, n_gt)
+    records = []
+    
+    with torch.no_grad():
+        for images, boxes, labels, mask in loader:
+            images = images.to(device, non_blocking=True)
+            boxes  = boxes.to(device, non_blocking=True)
+            mask   = mask.to(device, non_blocking=True)
+
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                    outputs = model(images)
+            else:
+                outputs = model(images)
+
+            pred_boxes = outputs[..., :4].float()
+            pred_conf  = torch.sigmoid(outputs[..., 4].float())
+            iou        = _pairwise_iou(pred_boxes, boxes)
+            
+            pred_conf_np = pred_conf.cpu().numpy()
+            iou_np       = iou.cpu().numpy()
+            mask_np      = mask.cpu().numpy()
+
+            for b in range(images.size(0)):
+                gt_valid = mask_np[b]
+                n_gt = int(gt_valid.sum())
+                if n_gt == 0:
+                    continue
+                records.append((
+                    pred_conf_np[b],
+                    iou_np[b][:, gt_valid],
+                    n_gt
+                ))
+
+    import numpy as np
+    
+    bucket_results = []
+    for (min_gt, max_gt) in buckets:
+        tp = fp = fn = 0
+        n_images = 0
+        for conf, sub_iou, n_gt in records:
+            if not (min_gt <= n_gt <= max_gt):
+                continue
+            n_images += 1
+            
+            pr_mask = conf > conf_threshold
+            pr_indices = np.where(pr_mask)[0]
+            n_pr = len(pr_indices)
+
+            if n_pr == 0:
+                fn += n_gt
+                continue
+
+            order = pr_indices[np.argsort(-conf[pr_indices])]
+            matched = set()
+            for i in order:
+                best_j = int(np.argmax(sub_iou[i]))
+                if sub_iou[i, best_j] >= iou_threshold and best_j not in matched:
+                    matched.add(best_j)
+                    tp += 1
+                else:
+                    fp += 1
+            fn += n_gt - len(matched)
+            
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall    = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        
+        bucket_results.append({
+            "bucket": f"{min_gt}-{max_gt}",
+            "n_images": n_images,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "tp": tp, "fp": fp, "fn": fn
+        })
+
+    print(f"\nStratified Evaluation (Conf: {conf_threshold}, IoU: {iou_threshold})")
+    print(f"{'Bucket':>8}  {'Images':>6}  {'P':>6}  {'R':>6}  {'F1':>6}  {'TP':>5}  {'FP':>5}  {'FN':>5}")
+    print("-" * 62)
+    for r in bucket_results:
+        print(f"{r['bucket']:>8}  {r['n_images']:6d}  {r['precision']:6.4f}  {r['recall']:6.4f}  {r['f1']:6.4f}  {r['tp']:5d}  {r['fp']:5d}  {r['fn']:5d}")
+        
+    return bucket_results
+
+
+
+
 
 def fit(
     model, trainloader, valloader, criterion,
@@ -674,6 +810,9 @@ def fit(
         history['val_iou'] = []
     elif task_type == "detection":
         history['val_iou'] = []
+        history['val_f1'] = []
+        history['val_precision'] = []
+        history['val_recall'] = []
 
     amp_info = "bf16 autocast" if device.type == "cuda" else "fp32 (CPU)"
     metric_unit = "%" if task_type == "classification" else ""
@@ -758,7 +897,10 @@ def fit(
             history['val_metric'].append(val_metric)  # Accuracy
 
             if checkpoint is not None:
-                is_best = checkpoint(val_metric, epoch, optimizer, scheduler, scaler)
+                is_best = checkpoint(
+                    val_metric, epoch, optimizer, scheduler, scaler,
+                    metrics={"val_loss": avg_val_loss, "val_acc": val_metric}
+                )
             else:
                 is_best = val_metric > best_val_metric
             if is_best:
@@ -795,7 +937,10 @@ def fit(
 
             # Using validation IoU as the checkpointing metric
             if checkpoint is not None:
-                is_best = checkpoint(val_iou, epoch, optimizer, scheduler, scaler)
+                is_best = checkpoint(
+                    val_iou, epoch, optimizer, scheduler, scaler,
+                    metrics={"val_loss": avg_val_loss, "val_mae": val_mae, "val_iou": val_iou}
+                )
             else:
                 is_best = val_iou > best_val_metric
             if is_best:
@@ -825,38 +970,57 @@ def fit(
             metrics     = evaluate_detection(model, valloader, criterion, device)
             avg_val_loss = metrics["val_loss"]
             val_iou     = metrics["val_iou"]
+            val_f1      = metrics["val_f1"]
+            val_precision = metrics["val_precision"]
+            val_recall  = metrics["val_recall"]
             val_end     = time.perf_counter()
             elapsed     = train_end - train_start
 
             print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
+            print(f"  --> PR: {val_precision:.3f} | Rec: {val_recall:.3f} | F1: {val_f1:.3f} | TP: {metrics['tp']} FP: {metrics['fp']} FN: {metrics['fn']}")
 
             history['val_loss'].append(avg_val_loss)
             history['val_iou'].append(val_iou)
+            history['val_f1'].append(val_f1)
+            history['val_precision'].append(val_precision)
+            history['val_recall'].append(val_recall)
 
             if checkpoint is not None:
-                is_best = checkpoint(val_iou, epoch, optimizer, scheduler, scaler)
+                is_best = checkpoint(
+                    val_f1, epoch, optimizer, scheduler, scaler,
+                    metrics={
+                        "val_loss": avg_val_loss, "val_iou": val_iou,
+                        "val_f1": val_f1, "val_precision": val_precision, "val_recall": val_recall
+                    }
+                )
             else:
-                is_best = val_iou > best_val_metric
+                is_best = val_f1 > best_val_metric
             if is_best:
-                best_val_metric = val_iou
+                best_val_metric = val_f1
 
             if wandb is not None and wandb.run is not None:
                 wandb.log({
                     "train/epoch_loss": avg_train_loss,
                     "val/loss": avg_val_loss,
                     "val/iou": val_iou,
+                    "val/precision": val_precision,
+                    "val/recall": val_recall,
+                    "val/f1": val_f1,
                     "epoch": epoch + 1
                 })
 
             if logger is not None:
                 logger.log_epoch(
                     epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
-                    val_metric=val_iou, lr=current_lr,
-                    epoch_time=elapsed, metric_label="val_iou",
+                    val_metric=val_f1, lr=current_lr,
+                    epoch_time=elapsed, metric_label="val_f1",
+                    val_iou=val_iou, val_precision=val_precision, val_recall=val_recall
                 )
             elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
-                best_marker = "  * NEW BEST" if is_best else ""
-                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}')
+                best_marker = "  ★ NEW BEST" if is_best else ""
+                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val F1: {val_f1:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}')
+
+
 
 
     total_minutes = (time.time() - total_start) / 60
