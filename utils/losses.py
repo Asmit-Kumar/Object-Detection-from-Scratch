@@ -6,6 +6,7 @@ Contains IoU helpers and loss functions for the object detection pipeline.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 import numpy as np
 import time
@@ -92,9 +93,10 @@ class DetectionLoss(nn.Module):
           or setting ``pos_weight`` in ``BCEWithLogitsLoss``.
     """
 
-    def __init__(self, lambda_conf: float = 1.0, delta: float = 1.0):
+    def __init__(self, lambda_conf: float = 1.0, delta: float = 1.0, use_pos_weight: bool = False):
         super().__init__()
         self.lambda_conf = lambda_conf
+        self.use_pos_weight = use_pos_weight
         self.huber = nn.HuberLoss(reduction='mean', delta=delta)
         self.bce   = nn.BCEWithLogitsLoss(reduction='mean')
 
@@ -172,6 +174,16 @@ class DetectionLoss(nn.Module):
         # Scatter 1.0 into targets where GT exists
         obj_target[b_idx[mask], matched_idx[mask]] = 1.0
 
-        conf_loss = self.bce(pred_conf, obj_target)
+        if self.use_pos_weight:
+            n_pos = mask.sum()
+            n_slots = obj_target.numel()
+            if n_pos > 0:
+                pw = (n_slots - n_pos) / n_pos
+                pos_weight = torch.tensor([pw], dtype=pred_conf.dtype, device=device)
+            else:
+                pos_weight = None
+            conf_loss = F.binary_cross_entropy_with_logits(pred_conf, obj_target, pos_weight=pos_weight)
+        else:
+            conf_loss = self.bce(pred_conf, obj_target)
 
         return box_loss + self.lambda_conf * conf_loss
