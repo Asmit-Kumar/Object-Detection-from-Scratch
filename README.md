@@ -163,9 +163,15 @@ Increasing backbone capacity consistently improved localisation and detection qu
 - **Model**: `ObjectDetectorResNet` (via `get_detector(size=...)`)
 - **Optimizer**: `AdamW`
 - **Scheduler**: `OneCycleLR`
-- **Loss**: Huber (box regression) + BCE (confidence) with Hungarian assignment
+- **Loss**: Huber (box regression) + BCE with logits (confidence, dynamic `pos_weight`) with Hungarian assignment
 - **Epochs**: 60
 - **Device**: RTX 5070 Ti
+
+### Validation Metric & Checkpointing
+
+The training loop monitors **F1 @ conf=0.5, IoU=0.5** as the primary checkpoint metric instead of greedy IoU. Greedy IoU matches the closest prediction to each GT box regardless of confidence, which means a model that predicts 24 low-confidence boxes can score well while being useless in practice. F1 directly penalises both false positives and false negatives, so `best_model.pth` always reflects the most deployable checkpoint.
+
+A **dynamic `pos_weight`** is applied to the BCE confidence loss, computed per-batch as `(total_slots - n_positive) / n_positive`. This rebalances the gradient in sparse scenes (few objects, many background slots) to prevent the model from becoming overly conservative.
 
 ---
 
