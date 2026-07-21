@@ -2,48 +2,6 @@ import torch
 from pathlib import Path
 
 
-class EarlyStopping:
-    """
-    Early stops the training if a monitored metric doesn't improve after a given patience.
-
-    Args:
-        patience (int): How many epochs to wait after last improvement before stopping.
-        min_delta (float): Minimum change to qualify as an improvement.
-        mode (str): 'min' for loss (lower is better), 'max' for accuracy (higher is better).
-        verbose (bool): Print a message for each epoch where metric doesn't improve.
-    """
-    def __init__(self, patience=5, min_delta=0.001, mode='min', verbose=False):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.verbose = verbose
-        self.counter = 0
-        self.early_stop = False
-
-        if self.mode == 'min':
-            self.best_score = float('inf')
-        elif self.mode == 'max':
-            self.best_score = float('-inf')
-        else:
-            raise ValueError("mode must be 'min' or 'max'")
-
-    def __call__(self, current_score):
-        if self.mode == 'min':
-            is_improvement = current_score < (self.best_score - self.min_delta)
-        else:
-            is_improvement = current_score > (self.best_score + self.min_delta)
-
-        if is_improvement:
-            self.best_score = current_score
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.verbose:
-                print(f"[EarlyStopping] No improvement: {self.counter}/{self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
-
-
 class ModelCheckpoint:
     """
     Saves the best model weights and maintains a crash-protection checkpoint
@@ -63,12 +21,14 @@ class ModelCheckpoint:
         best_model_path: str = "./checkpoint/best_model.pth",
         mode: str = "max",
         verbose: bool = True,
+        config: dict = None,
     ):
         self.model = model
         self.checkpoint_path = Path(checkpoint_path)
         self.best_model_path = Path(best_model_path)
         self.mode = mode
         self.verbose = verbose
+        self.config = config
 
         # Ensure checkpoint directories exist at init time
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +41,7 @@ class ModelCheckpoint:
         else:
             raise ValueError("mode must be 'min' or 'max'")
 
-    def __call__(self, current_score: float, epoch: int = 0, optimizer=None, scheduler=None, scaler=None) -> bool:
+    def __call__(self, current_score: float, epoch: int = 0, optimizer=None, scheduler=None, scaler=None, metrics: dict = None) -> bool:
         """
         Save the latest checkpoint and conditionally update the best model.
 
@@ -91,6 +51,7 @@ class ModelCheckpoint:
             optimizer: The optimizer (state saved for crash protection).
             scheduler: The LR scheduler (state saved for crash protection).
             scaler: The AMP GradScaler (state saved for crash protection).
+            metrics: Optional dictionary of additional metrics to store.
 
         Returns:
             True if a new best was found.
@@ -99,7 +60,13 @@ class ModelCheckpoint:
         checkpoint = {
             'epoch': epoch,
             'model_state': self.model.state_dict(),
+            'best_score': self.best_score,
+            'current_score': current_score,
         }
+        if self.config is not None:
+            checkpoint['config'] = self.config
+        if metrics is not None:
+            checkpoint['metrics'] = metrics
         if optimizer is not None:
             checkpoint['optimizer_state'] = optimizer.state_dict()
         if scheduler is not None:
@@ -159,8 +126,13 @@ class ModelCheckpoint:
             scheduler.load_state_dict(ckpt['scheduler_state'])
         if scaler is not None and 'scaler_state' in ckpt:
             scaler.load_state_dict(ckpt['scaler_state'])
+            
+        if 'best_score' in ckpt:
+            self.best_score = ckpt['best_score']
 
         resume_epoch = ckpt['epoch'] + 1
         if self.verbose:
             print(f"[ModelCheckpoint] Resumed from epoch {ckpt['epoch'] + 1}, starting at epoch {resume_epoch + 1}")
+            if 'best_score' in ckpt:
+                print(f"[ModelCheckpoint] Restored previous best score: {self.best_score:.4f}")
         return resume_epoch
