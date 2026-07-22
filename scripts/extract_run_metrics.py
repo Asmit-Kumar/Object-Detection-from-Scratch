@@ -6,9 +6,9 @@ LOG_DIR = "logs/ObjectDetectorResNet"
 
 # The three comparison runs
 runs = {
-    "n": "detector_n_v2_20260718_121834.json",
-    "s": "detector_s_v2_20260719_100048.json",
-    "m": "detector_m_20260718_144358.json",
+    "n": "detector_n_new_20260721_120818.json",
+    "s": "detector_s_new_20260721_140651.json",
+    "m": "detector_m_new_20260721_153303.json",
 }
 
 for size, fname in runs.items():
@@ -17,8 +17,8 @@ for size, fname in runs.items():
         data = json.load(f)
 
     epochs = data.get("epochs", [])
-    best_iou = max(e["val_metric"] for e in epochs)
-    best_epoch = next(e for e in epochs if e["val_metric"] == best_iou)
+    best_f1 = max((e.get("val_metric", 0) for e in epochs), default=0)
+    best_iou = max((e.get("val_iou", e.get("val_metric", 0)) for e in epochs), default=0)
 
     # test results if present
     test = data.get("test_results", {})
@@ -31,6 +31,7 @@ for size, fname in runs.items():
     print(f"  Size: {size.upper()}  |  {fname}")
     print(f"{'='*55}")
     print(f"  Total epochs   : {len(epochs)}")
+    print(f"  Best val F1    : {best_f1:.4f}")
     print(f"  Best val IoU   : {best_iou:.4f}")
     print(f"  Final train loss: {epochs[-1]['train_loss']:.4f}")
     print(f"  Final val loss  : {epochs[-1]['val_loss']:.4f}")

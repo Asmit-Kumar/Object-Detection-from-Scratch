@@ -139,25 +139,34 @@ Result: loss computation time dropped from ~200ms -> **~5ms per batch**. Full ep
 
 All three variants trained with identical config (AdamW, OneCycleLR, lr=4e-5, 60 epochs, 255k train images).
 
-#### Validation IoU
+#### Validation F1 and IoU
 
-| Size | Best Val IoU | Train Time |
-|------|-------------|-----------|
-| n (Nano)   | 0.7950 | ~69 min |
-| s (Small)  | 0.8666 | ~83 min |
-| **m (Medium)** | **0.9106** | ~148 min |
+| Size | Best Val F1 (conf=0.5) | Best Val IoU |
+|------|------------------------|--------------|
+| n (Nano)   | 0.8619                 | 0.8034       |
+| s (Small)  | 0.9356                 | 0.8745       |
+| **m (Medium)** | **0.9399**             | **0.9133**   |
 
-#### Test-Set @ conf=0.50 (IoU threshold=0.5, 45k images)
+#### Test-Set @ Optimal Confidence Threshold (IoU threshold=0.5, 45k images)
 
-| Size | P      | R      | F1     |
-|------|--------|--------|--------|
-| n (Nano)   | 0.8977 | 0.8420 | 0.8690 |
-| s (Small)  | 0.9469 | 0.9091 | 0.9276 |
-| **m (Medium)** | **0.9676** | **0.9563** | **0.9619** |
+| Size | Conf | P      | R      | F1     |
+|------|------|--------|--------|--------|
+| n (Nano)   | 0.70 | 0.8990 | 0.8443 | 0.8708 |
+| s (Small)  | 0.70 | 0.9611 | 0.9394 | 0.9501 |
+| **m (Medium)** | **0.70** | **0.9728** | **0.9500** | **0.9613** |
 
-Increasing backbone capacity consistently improved localisation and detection quality. The Nano model was under-parameterised for the task, while the Medium model achieved the best localisation (0.9106 IoU) and detection performance (0.9619 F1). Performance gains began to diminish beyond the Small model, indicating the onset of diminishing returns.
+Increasing backbone capacity consistently improved localisation and detection quality. The Nano model was under-parameterised for the task, while the Medium model achieved the best localisation (0.9133 IoU) and detection performance (0.9613 F1). Performance gains began to diminish beyond the Small model, indicating the onset of diminishing returns.
 
-![Medium Detector Training Curves](result/detector_medium_curves.png)
+#### Model Training Curves (Clean Dataset)
+
+**Nano Model (2.0M params)**
+![Nano Detector Training Curves](result/nano_new_ds.png)
+
+**Small Model (2.2M params)**
+![Small Detector Training Curves](result/small_new_ds.png)
+
+**Medium Model (8.8M params)**
+![Medium Detector Training Curves](result/medium_new_ds.png)
 
 ### Training Config
 - **Model**: `ObjectDetectorResNet` (via `get_detector(size=...)`)
