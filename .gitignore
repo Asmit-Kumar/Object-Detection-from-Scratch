@@ -35,6 +35,9 @@ scratch/
 test.py
 test_model_load.py
 extract_nb_images.py
+scripts/eval_diagnostics.py
+scripts/extract_nb_image.py
+scripts/extract_run_metrics.py
 archive/
 
 # Private experiment log
