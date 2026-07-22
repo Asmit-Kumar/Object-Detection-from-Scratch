@@ -67,7 +67,8 @@ class CanvasGenerator:
         return fn(count)
 
     def _bboxes_random(self, count):
-        stride = 28 - 2
+        # stride = 28 ensures no nominal cell overlap (previously 28-2 = 26, causing up to 2px overlap)
+        stride = 28
         candidates = [
             [x, y, 28, 28]
             for y in range(0, self.canvas_size - 28, stride)
@@ -95,7 +96,8 @@ class CanvasGenerator:
         return bboxes[:count]
 
     def _bboxes_line(self, count):
-        spacing = np.random.randint(1, 6)
+        # spacing minimum bumped from 1 to 5 to absorb worst-case rotation drift (~3.6px at ±15°)
+        spacing = np.random.randint(5, 10)
         line_height = 28 + np.random.randint(8, 20)
         chars_per_row = (self.canvas_size + spacing) // (28 + spacing)
 
@@ -135,8 +137,10 @@ class CanvasGenerator:
         return bboxes
 
     def _bboxes_words(self, count):
-        char_spacing = np.random.randint(1, 4)
-        word_gap = np.random.randint(16, 28)
+        # char_spacing minimum bumped from 1 to 5 to absorb worst-case rotation drift (~3.6px)
+        # word_gap minimum bumped from 16 to 20 similarly
+        char_spacing = np.random.randint(5, 8)
+        word_gap = np.random.randint(20, 32)
         line_height = 28 + np.random.randint(12, 28)
 
         bboxes = []
@@ -204,6 +208,13 @@ class CanvasGenerator:
 
         return canvas
 
+    @staticmethod
+    def _boxes_overlap(b1, b2):
+        """Return True if two [x, y, w, h] boxes overlap (share any pixel area)."""
+        x1, y1, w1, h1 = b1
+        x2, y2, w2, h2 = b2
+        return not (x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1)
+
     def generate_canvas(self, subset="train", placement="random"):
         count = self.get_count(placement)
         distribution = PLACEMENT_DISTRIBUTIONS.get(placement, 'uniform')
@@ -212,7 +223,16 @@ class CanvasGenerator:
 
         patches = patches[:len(bboxes)]
 
+        # Apply rotation and tight-bbox crop per character, then check for overlap.
+        # On overlap: revert the offending character to its original (unrotated) bbox.
+        # If it still overlaps, drop it entirely.
+        original_bboxes = [list(b) for b in bboxes]
+        keep = [True] * len(patches)
+
         for i in range(len(patches)):
+            orig_bbox = list(bboxes[i])
+            orig_image = patches[i].image.copy()
+
             angle = self._get_random_rotation()
             if angle is not None:
                 M = cv2.getRotationMatrix2D((14.0, 14.0), angle, 1.0)
@@ -224,9 +244,33 @@ class CanvasGenerator:
             non_zero = cv2.findNonZero(patches[i].image)
             if non_zero is not None:
                 tx, ty, tw, th = cv2.boundingRect(non_zero)
-                bboxes[i] = [bboxes[i][0] + tx, bboxes[i][1] + ty, tw, th]
+                bboxes[i] = [orig_bbox[0] + tx, orig_bbox[1] + ty, tw, th]
                 patches[i].image = patches[i].image[ty:ty+th, tx:tx+tw]
-        
+            else:
+                bboxes[i] = orig_bbox
+
+            # Post-hoc overlap check against all previously accepted characters
+            overlapping = any(
+                keep[j] and self._boxes_overlap(bboxes[i], bboxes[j])
+                for j in range(i)
+            )
+            if overlapping:
+                # Strategy 1: revert to the original unrotated 28x28 box
+                patches[i].image = orig_image
+                bboxes[i] = orig_bbox
+                # Re-check with unrotated box
+                still_overlapping = any(
+                    keep[j] and self._boxes_overlap(bboxes[i], bboxes[j])
+                    for j in range(i)
+                )
+                if still_overlapping:
+                    # Strategy 2: drop the character entirely
+                    keep[i] = False
+
+        # Filter out dropped characters
+        patches = [p for p, k in zip(patches, keep) if k]
+        bboxes  = [b for b, k in zip(bboxes,  keep) if k]
+
         canvas_img = self._get_patched_canvas(patches, bboxes)
         
         objects = [
