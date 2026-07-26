@@ -1,3 +1,9 @@
+"""
+Multi-Threaded Synthetic Dataset Generator.
+
+Orchestrates parallel scene generation by compositing EMNIST characters onto
+224x224 grayscale canvases and writing images to disk alongside metadata.jsonl annotations.
+"""
 import json
 import threading
 from itertools import count
@@ -20,7 +26,19 @@ _DEFAULT_PROBS = np.array(tuple(PLACEMENT_PROBS.values()), dtype=float)
 
 
 class DatasetGenerator:
-    def __init__(
+    """
+    Multi-threaded generator for synthetic object detection datasets.
+
+    Args:
+        split (str): EMNIST dataset split name ('bymerge' or 'byclass'). Default: 'bymerge'.
+        dest_dir (Path): Base directory path where output dataset splits will be saved.
+        train_len (int): Number of training images to generate. Default: 255,000.
+        test_len (int): Number of test images to generate. Default: 45,000.
+        placement (str | None): Specific layout placement strategy to force ('random', 'grid', 'words', 'line'). Default: None (weighted random).
+        subset (str | None): Specific split to generate ('train' or 'test'). Default: None (generates both).
+        num_workers (int): Number of parallel worker threads per split. Default: 4.
+        write_buffer_size (int): Batch size for metadata JSONL file buffer writes. Default: 128.
+    """
         self,
         split: str = 'bymerge',
         dest_dir: Path = ROOT_DIR,

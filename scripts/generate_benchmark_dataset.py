@@ -1,3 +1,9 @@
+"""
+Benchmark Dataset Generation Script.
+
+Generates a stratified 10,000-image evaluation dataset (2,500 images per layout placement:
+'random', 'grid', 'words', 'line') saved under data/OD_benchmark/.
+"""
 import sys, time
 from pathlib import Path
 root_dir = Path(__file__).resolve().parent.parent

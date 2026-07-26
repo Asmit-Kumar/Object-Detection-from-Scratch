@@ -1,3 +1,12 @@
+"""
+Canvas Scene Generation Engine.
+
+Handles character placement algorithms across 4 layout strategies:
+  - 'random': Unconstrained spatial positioning across the canvas.
+  - 'grid'  : Structured rows and columns forming tabular arrangements.
+  - 'words' : Sequential character groupings mimicking word text blocks.
+  - 'line'  : Horizontal text line layouts.
+"""
 from dataclasses import dataclass
 from dataset import EmnistDataset
 import numpy as np
@@ -7,15 +16,19 @@ from scipy.stats import poisson
 
 @dataclass
 class CanvasObject:
+    """Represents a single character object placed on the canvas."""
     bbox: list[int]
     label: int
     char: str
 
+
 @dataclass
 class Canvas:
+    """Represents a fully rendered multi-object canvas scene."""
     placement: str
     image: np.ndarray
     objects: list[CanvasObject]
+
 
 PLACEMENT_DISTRIBUTIONS = {
     'random': 'uniform',
@@ -24,8 +37,16 @@ PLACEMENT_DISTRIBUTIONS = {
     'words': {'digits': 0.05, 'uppercase': 0.10, 'lowercase': 0.85},
 }
 
+
 class CanvasGenerator:
-    def __init__(self, canvas_size=224, mean_objs=None, split='bymerge'):
+    """
+    Orchestrates character placement, rotation, scaling, and composite canvas rendering.
+
+    Args:
+        canvas_size (int): Spatial dimensions of the square canvas. Default: 224.
+        mean_objs (int | None): Expected number of objects (Poisson parameter). Default: canvas_size // 28.
+        split (str): EMNIST split to draw characters from ('bymerge' or 'byclass'). Default: 'bymerge'.
+    """
         self.canvas_size = canvas_size
         self.dataset = EmnistDataset(split=split)
         self.min_count = 2
