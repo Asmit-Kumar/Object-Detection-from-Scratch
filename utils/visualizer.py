@@ -132,4 +132,42 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
+    @staticmethod
+    def visualize_pipeline_detections(image, detections, title="End-to-End Pipeline Detections"):
+        """
+        Visualize end-to-end pipeline detection results with annotated character labels and confidence scores.
+
+        Args:
+            image (torch.Tensor or numpy.ndarray): Input image tensor or array.
+            detections (list[DetectionResult]): List of DetectionResult objects from EndToEndPipeline.
+            title (str): Title for the plot.
+        """
+        import matplotlib.patches as patches
+        import numpy as np
+
+        if isinstance(image, torch.Tensor):
+            img_np = image.detach().cpu().squeeze().numpy()
+        else:
+            img_np = np.squeeze(image)
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(img_np, cmap='gray')
+
+        for det in detections:
+            x, y, w, h = det.bbox
+            rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='cyan', facecolor='none')
+            ax.add_patch(rect)
+
+            label_text = f"{det.char_label} ({det.joint_conf:.2f})"
+            ax.text(
+                x, max(0, y - 4), label_text,
+                color='yellow', fontsize=11, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6, edgecolor='none')
+            )
+
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.axis('off')
+        plt.tight_layout()
+        plt.show()
+
 

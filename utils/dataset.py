@@ -344,7 +344,8 @@ def get_detection_loaders(
         data_root: Path = ROOT_DIR,
         batch_size: int = 128,
         shuffle: bool = True,
-        test:bool = False,
+        test: bool = False,
+        test_only: bool = False,
         image_size: tuple = (224, 224),
         val_size: float | int = 15_000,
         num_workers: int | None = None,
@@ -353,29 +354,9 @@ def get_detection_loaders(
         normalize_boxes: bool = False,
         seed: int = 42,
         prefetch_factor: int = 2,
-)-> tuple | DataLoader:
+) -> tuple | DataLoader:
     if num_workers is None:
         num_workers = _auto_detection_workers()
-
-    train_root = data_root / "train"
-    if not train_root.exists():
-        raise FileNotFoundError(train_root)
-
-    train_reader = DataReader(
-        root=train_root,
-        image_size=image_size,
-    )
-
-    ds_size = len(train_reader)
-    if isinstance(val_size, float):
-        val_len = int(ds_size * val_size)
-    else:
-        val_len = val_size
-
-    train_len = ds_size - val_len
-
-    g = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(ds_size, generator=g)
 
     def _get_loader(
             reader,
@@ -399,12 +380,42 @@ def get_detection_loaders(
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             batch_size=batch_size,
             shuffle=shuffle,
-            )
+        )
 
         return DataLoader(**loader_kwargs)
 
-    loaders = []
+    # Fast path: load ONLY the test set without reading train set metadata
+    if test_only:
+        test_root = Path(data_root) / "test"
+        if not test_root.exists():
+            raise FileNotFoundError(f"Test directory not found at: {test_root}")
+        test_reader = DataReader(
+            root=test_root,
+            image_size=image_size,
+        )
+        return _get_loader(test_reader, transform=None, shuffle=False)
 
+    train_root = Path(data_root) / "train"
+    if not train_root.exists():
+        raise FileNotFoundError(train_root)
+
+    train_reader = DataReader(
+        root=train_root,
+        image_size=image_size,
+    )
+
+    ds_size = len(train_reader)
+    if isinstance(val_size, float):
+        val_len = int(ds_size * val_size)
+    else:
+        val_len = val_size
+
+    train_len = ds_size - val_len
+
+    g = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(ds_size, generator=g)
+
+    loaders = []
 
     train_idx = indices[:train_len]
     loaders.append(_get_loader(
@@ -423,23 +434,23 @@ def get_detection_loaders(
             val_idx,
         ))
 
-    test_root = data_root / "test"
+    test_root = Path(data_root) / "test"
     if test:
         if not test_root.exists():
             raise FileNotFoundError(test_root)
-    else:
-        return loaders[0] if len(loaders) == 1 else tuple(loaders)
+        loaders.append(_get_loader(
+            reader=DataReader(
+                root=test_root,
+                image_size=image_size,
+            ),
+            transform=None,
+            shuffle=False,
+        ))
 
-    loaders.append(_get_loader(
-        reader=DataReader(
-            root=test_root,
-            image_size=image_size,
-        ),
-        transform=None,
-        shuffle=False,
-    ))
+    return loaders[0] if len(loaders) == 1 else tuple(loaders)
 
-    return tuple(loaders)
+
+
 
 
 # ── EMNIST ByClass convenience loaders ───────────────────────────────────────
