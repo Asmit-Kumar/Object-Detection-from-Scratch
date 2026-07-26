@@ -8,28 +8,32 @@ Trained on a custom synthetic dataset generated from EMNIST, running on an **RTX
 
 ---
 
-## Architecture
+## Pipeline Architecture & Workflow
 
 ```
-Input Image (224x224 grayscale)
-        |
-        v
-+----------------------+
-|   Object Detector    |  ResNet backbone
-|   (ResNet CNN)       |  -> (N, 5) slots: [x, y, w, h, confidence]
-+----------+-----------+
-           |  Per-slot confidence thresholding
-           v
-+----------------------+
-|   Crop & Pad         |  Extract bbox region, add margin, pad to square,
-|   & Resize           |  then resize to 28x28 (preserves aspect ratio)
-+----------+-----------+
-           |
-           v
-+----------------------+
-| Character Classifier |  ResNet-based
-| (47 classes)         |  -> character label + confidence per crop
-+----------------------+
+                   Input Image (224x224 grayscale)
+                                 │
+                                 ▼
+                     ResNet Backbone (Detector)
+                                 │
+                                 ▼
+                  Prediction Head (24 Output Slots)
+                                 │
+                      Predicted Boxes + Scores
+                                 │
+       ┌─────────────────────────┴─────────────────────────┐
+       │                                                   │
+ ──────── Training ────────                         ──────── Inference ────────
+    Hungarian Matching                                 Confidence Threshold
+            │                                               │
+      Detection Loss                                       NMS
+ (Huber + BCE w/ pos_weight)                                │
+                                                       Final Boxes
+                                                            │
+                                                   Crop, Pad & Resize
+                                                            │
+                                                  Character Classifier
+                                                      (47 classes)
 ```
 
 ---
@@ -37,7 +41,7 @@ Input Image (224x224 grayscale)
 ## Stage 1 -- Character Classifier
 
 ### Architecture
-A lightweight **ResNet** backbone with a fully-connected classification head. Input: 28x28 grayscale crop. Output: probability distribution over 47 character classes.
+A lightweight **ResNet** backbone (370,351 parameters / **0.37M**) with a fully-connected classification head. Input: 28x28 grayscale crop. Output: probability distribution over 47 character classes.
 
 ### EMNIST Split -- Why `bymerge`?
 
@@ -89,11 +93,11 @@ box_head   obj_head     (thin final linear projections)
 
 Three size variants are available via `get_detector(size=...)`:
 
-| Size | Channels | Params |
-|------|----------|--------|
-| n (Nano)   | `[32, 64, 64, 128]`   | 2.0M |
-| s (Small)  | `[64, 128, 128, 256]` | 2.2M |
-| m (Medium) | `[128, 256, 256, 512]` | 8.8M |
+| Size | Channels | Detector Params | Combined Pipeline Params (Det + Cls) |
+|------|----------|:---:|:---:|
+| n (Nano)   | `[32, 64, 64, 128]`   | **0.57M** (565K) | **0.94M** (936K) |
+| s (Small)  | `[64, 128, 128, 256]` | **2.23M** (2.2M) | **2.60M** (2.6M) |
+| m (Medium) | `[128, 256, 256, 512]` | **8.84M** (8.8M) | **9.21M** (9.2M) |
 
 ### From Greedy to Hungarian Matching
 
@@ -159,13 +163,13 @@ Increasing backbone capacity consistently improved localisation and detection qu
 
 #### Model Training Curves (Clean Dataset)
 
-**Nano Model (2.0M params)**
+**Nano Model (0.57M params)**
 ![Nano Detector Training Curves](result/nano_new_ds.png)
 
-**Small Model (2.2M params)**
+**Small Model (2.23M params)**
 ![Small Detector Training Curves](result/small_new_ds.png)
 
-**Medium Model (8.8M params)**
+**Medium Model (8.84M params)**
 ![Medium Detector Training Curves](result/medium_new_ds.png)
 
 ### Training Config
@@ -184,16 +188,22 @@ A **dynamic `pos_weight`** is applied to the BCE confidence loss, computed per-b
 
 ---
 
-## Dataset
+## Dataset & Layout Placement Strategies
 
-The synthetic dataset is generated from scratch using EMNIST characters composited onto blank canvases. See [`generator/README.md`](generator/README.md) for full documentation on the generation pipeline, layout strategies, and metadata format.
+The synthetic dataset is generated from scratch using EMNIST characters composited onto blank 224×224 canvases. See [`generator/README.md`](generator/README.md) for full documentation on the generation pipeline, layout strategies, and metadata format.
 
 **Dataset size**: 255,000 training / 45,000 test images.
 
-### Example Predictions
-Sample multi-object detections from the test set (Medium model, conf=0.50):
+### Generated Layout Examples
 
-![Detection Output](result/detection_output_latest.png)
+The generator utilizes 4 placement strategies to emulate real-world scene structures:
+
+| Layout Strategy | Sample Scene 1 | Sample Scene 2 | Description |
+|:---|:---:|:---:|:---|
+| **🎲 Random** | ![](result/dataset/random_1.png) | ![](result/dataset/random_2.png) | Unconstrained random spatial locations across the 224×224 canvas. |
+| **📐 Grid** | ![](result/dataset/grid_1.png) | ![](result/dataset/grid_2.png) | Structured rows and columns forming tabular or grid patterns. |
+| **📝 Words** | ![](result/dataset/words_1.png) | ![](result/dataset/words_2.png) | Character sequences mimicking multi-character word groupings. |
+| **📏 Line** | ![](result/dataset/line_1.png) | ![](result/dataset/line_2.png) | Single horizontal line text layout. |
 
 ---
 
