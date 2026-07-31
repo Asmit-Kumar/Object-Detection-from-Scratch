@@ -124,20 +124,4 @@ Each image shows a 224×224 canvas with detected bounding boxes. Labels display 
 - **Classifier Acc** — Top-1 accuracy on correctly localized boxes (predicted IoU ≥ 0.50 with a GT box).
 - **End-to-End F1** — A detection counts as correct only if the box *and* character label are both right.
 
----
 
-## Reproducing the Benchmark
-
-```bash
-# Generate benchmark dataset (10,000 images, 2,500/layout)
-python scripts/generate_benchmark_dataset.py
-
-# Run full evaluation across all 3 detectors (Hungarian matching by default)
-python scripts/run_full_benchmark.py
-
-# Run evaluation for a single detector (Small by default)
-python scripts/verify_pipeline.py
-
-# Regenerate sample visualization images
-python scripts/generate_benchmark_visuals.py
-```
