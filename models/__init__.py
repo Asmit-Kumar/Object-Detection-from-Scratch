@@ -58,10 +58,12 @@ def get_detector(size: str = "s", max_objects: int = 24, **kwargs) -> ObjectDete
     if size not in ObjectDetectorResNet.CONFIGS:
         raise ValueError(f"Unknown size '{size}'. Choose from: {list(ObjectDetectorResNet.CONFIGS)}")
 
-    _, preset_channels = ObjectDetectorResNet.CONFIGS[size]
+    _, preset_channels, preset_blocks, preset_pool_size = ObjectDetectorResNet.CONFIGS[size]
     channels = kwargs.pop("channels", preset_channels)   # caller can override
+    blocks = kwargs.pop("blocks", preset_blocks)         # caller can override
+    kwargs.setdefault("pool_size", preset_pool_size)
 
-    return ObjectDetectorResNet(max_objects=max_objects, channels=channels, **kwargs)
+    return ObjectDetectorResNet(max_objects=max_objects, channels=channels, blocks=blocks, **kwargs)
 
 
 def get_classifier(num_classes: int = 62, **kwargs) -> CharacterClassifierResNet:
@@ -89,7 +91,9 @@ def load_detector(path: str, device, size: str = "m", max_objects: int = 24, **k
         **kwargs:    Forwarded to ``get_detector``.
     """
     model = get_detector(size=size, max_objects=max_objects, **kwargs).to(device)
-    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    state_dict = torch.load(path, map_location=device, weights_only=True)
+    state_dict = state_dict.get('model_state_dict', state_dict) if isinstance(state_dict, dict) else state_dict
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model
 

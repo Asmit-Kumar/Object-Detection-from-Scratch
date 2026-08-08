@@ -75,16 +75,18 @@ class DetectionLoss(nn.Module):
       3. **Conf loss (BCE)** — ``BCEWithLogitsLoss`` on all slots; matched slots
          get target ``1.0``, background slots get ``0.0``.
 
-    Total loss = box_loss + ``lambda_conf`` * conf_loss
+    Total loss = box_loss + ``lambda_conf`` * conf_loss + ``lambda_class`` * class_loss
 
     Args:
         lambda_conf : Weight for the confidence loss term. Default ``1.0``.
         delta       : Huber loss delta (transition point). Default ``1.0``.
+        lambda_class : Weight for the classification loss. Default ``1.0``.
 
     Inputs:
-        outputs : ``Tensor (B, MAX_OBJECTS, 5)``
-                  Last dim: ``[x, y, w, h, conf_logit]``.
+        outputs : ``Tensor (B, MAX_OBJECTS, 5 + num_classes)``
+                  Last dim: ``[x, y, w, h, conf_logit, class_logits...]``.
         boxes   : ``list[Tensor(N_gt, 4)]`` — GT boxes per image in ``[x, y, w, h]``.
+        labels  : ``Tensor (B, max_gt)`` — GT class ids aligned with ``boxes``.
 
     Note:
         - ``conf_logit`` is a raw logit; apply ``sigmoid`` at inference to get
@@ -93,24 +95,34 @@ class DetectionLoss(nn.Module):
           or setting ``pos_weight`` in ``BCEWithLogitsLoss``.
     """
 
-    def __init__(self, lambda_conf: float = 1.0, delta: float = 1.0, use_pos_weight: bool = False):
+    def __init__(
+        self,
+        lambda_conf: float = 1.0,
+        delta: float = 1.0,
+        use_pos_weight: bool = False,
+        lambda_class: float = 1.0,
+    ):
         super().__init__()
         self.lambda_conf = lambda_conf
+        self.lambda_class = lambda_class
         self.use_pos_weight = use_pos_weight
         self.huber = nn.HuberLoss(reduction='mean', delta=delta)
         self.bce   = nn.BCEWithLogitsLoss(reduction='mean')
+        self.ce = nn.CrossEntropyLoss(reduction='mean')
 
     def forward(
         self,
         outputs: torch.Tensor,
         padded_gt: torch.Tensor,
-        mask: torch.Tensor
+        mask: torch.Tensor,
+        labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B = outputs.size(0)
         device = outputs.device
         
         pred_boxes = outputs[..., :4]
         pred_conf  = outputs[..., 4]
+        pred_class = outputs[..., 5:]
 
         max_gt = padded_gt.size(1)
         if max_gt == 0:
@@ -186,4 +198,13 @@ class DetectionLoss(nn.Module):
         else:
             conf_loss = self.bce(pred_conf, obj_target)
 
-        return box_loss + self.lambda_conf * conf_loss
+        class_loss = outputs.new_tensor(0.0)
+        if labels is not None and mask.any():
+            gathered_class_logits = torch.gather(
+                pred_class,
+                1,
+                matched_idx.unsqueeze(-1).expand(-1, -1, pred_class.size(-1)),
+            )
+            class_loss = self.ce(gathered_class_logits[mask], labels[mask].long())
+
+        return box_loss + self.lambda_conf * conf_loss + self.lambda_class * class_loss

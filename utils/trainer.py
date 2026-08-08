@@ -359,16 +359,10 @@ def train_one_epoch_detection(
         if is_timing:
             t0 = t_pad
 
-        if use_amp:
-            with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
-                outputs = model(images)
-                if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
-                loss = criterion(outputs, boxes, mask)
-                if is_timing: torch.cuda.synchronize(); t2 = time.perf_counter()
-        else:
+        with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
             outputs = model(images)
             if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
-            loss = criterion(outputs, boxes, mask)
+            loss = criterion(outputs, boxes, mask, labels)
             if is_timing: torch.cuda.synchronize(); t2 = time.perf_counter()
 
         prev_scale = scaler.get_scale() if scaler is not None else None
@@ -434,80 +428,221 @@ def evaluate_detection(
 ):
     """Evaluate a detection model on a single pass.
 
-    Computes greedy mean IoU and fixed-threshold P/R/F1.
-    For full P/R/F1 threshold analysis across a sweep, use evaluate_detection_sweep().
+    Computes detection, classification, and end-to-end metrics using the same
+    confidence-sorted greedy IoU matching.
+
+    Detection metrics  ("detection" key): localization-only P/R/F1 — a TP is
+    any predicted box whose best-matching GT IoU >= iou_threshold, regardless
+    of predicted class.
+
+    Classification metrics ("classification" key): accuracy on matched
+    detections, full confusion matrix, and per-class accuracy.
+
+    End-to-end metrics ("end_to_end" and per_class[k]["e2e_*"]): box matches
+    AND correct class prediction.  Per-class E2E lets you pinpoint which
+    classes are hardest to both locate and classify together.
+
+    For full P/R/F1 threshold analysis use evaluate_detection_sweep().
     Expects loader to yield (images, boxes, labels, mask).
     """
     model.eval()
     total_loss = 0.0
-    total_iou  = 0.0
-    n_images   = 0
+    total_iou = 0.0
+    n_images = 0
     tp = fp = fn = 0
-    use_amp    = device.type == "cuda"
+    e2e_tp = e2e_fp = e2e_fn = 0
+    class_correct = 0
+    class_total = 0
+    confusion_matrix = None
+    per_class_e2e_tp = per_class_e2e_fp = per_class_e2e_fn = None
+    class_names = _infer_class_names_from_loader(loader)
+    use_amp = device.type == "cuda"
 
     with torch.no_grad():
         for images, boxes, labels, mask in loader:
             images = images.to(device, non_blocking=True)
-            boxes  = boxes.to(device, non_blocking=True)
-            mask   = mask.to(device, non_blocking=True)
+            boxes = boxes.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
                     outputs = model(images)
-                    loss    = criterion(outputs, boxes, mask)
+                    loss = criterion(outputs, boxes, mask, labels)
             else:
                 outputs = model(images)
-                loss    = criterion(outputs, boxes, mask)
+                loss = criterion(outputs, boxes, mask, labels)
 
             total_loss += loss.item()
 
             pred_boxes = outputs[..., :4].float()
-            pred_conf  = torch.sigmoid(outputs[..., 4].float())
+            pred_conf = torch.sigmoid(outputs[..., 4].float())
+            pred_class = outputs[..., 5:]
+            if pred_class.size(-1) == 0:
+                raise ValueError(
+                    "evaluate_detection requires model outputs with class logits."
+                )
+            pred_labels = pred_class.float().argmax(dim=-1)
 
-            iou = _pairwise_iou(pred_boxes, boxes)   # (B, N_pred, max_gt)
+            iou = _pairwise_iou(pred_boxes, boxes)  # (B, N_pred, max_gt)
             iou_masked = iou.masked_fill(~mask.unsqueeze(1), -1.0)
-            matched_iou = iou_masked.max(dim=1).values       # (B, max_gt)
+            matched_iou = iou_masked.max(dim=1).values  # (B, max_gt)
 
-            conf_np, iou_np, mask_np = pred_conf.cpu().numpy(), iou.cpu().numpy(), mask.cpu().numpy()
+            conf_np = pred_conf.cpu().numpy()
+            iou_np = iou.cpu().numpy()
+            mask_np = mask.cpu().numpy()
+            labels_np = labels.cpu().numpy()
+            pred_labels_np = pred_labels.cpu().numpy()
+
+            if confusion_matrix is None:
+                num_classes = pred_class.size(-1)
+                confusion_matrix = np.zeros(
+                    (num_classes, num_classes), dtype=np.int64
+                )
+                per_class_e2e_tp = np.zeros(num_classes, dtype=np.int64)
+                per_class_e2e_fp = np.zeros(num_classes, dtype=np.int64)
+                per_class_e2e_fn = np.zeros(num_classes, dtype=np.int64)
 
             for b in range(images.size(0)):
                 b_mask = mask_np[b]
                 n_gt = int(b_mask.sum())
-                if n_gt == 0:
-                    continue
-                total_iou += matched_iou[b, mask[b]].mean().item()
-                n_images  += 1
+                valid_gt_indices = np.flatnonzero(b_mask)
+                if n_gt > 0:
+                    total_iou += matched_iou[b, mask[b]].mean().item()
+                    n_images += 1
 
                 pr_idx = np.where(conf_np[b] > conf_threshold)[0]
                 if len(pr_idx) == 0:
                     fn += n_gt
+                    e2e_fn += n_gt
+                    for gi in valid_gt_indices:
+                        per_class_e2e_fn[int(labels_np[b, gi])] += 1
                     continue
+
                 order = pr_idx[np.argsort(-conf_np[b][pr_idx])]
-                sub_iou = iou_np[b][:, b_mask]
+                sub_iou = iou_np[b][:, valid_gt_indices]
                 matched = set()
+
                 for i in order:
+                    if n_gt == 0:
+                        fp += 1
+                        e2e_fp += 1
+                        per_class_e2e_fp[int(pred_labels_np[b, i])] += 1
+                        continue
+
                     j = int(np.argmax(sub_iou[i]))
                     if sub_iou[i, j] >= iou_threshold and j not in matched:
                         matched.add(j)
                         tp += 1
+
+                        gt_index = valid_gt_indices[j]
+                        gt_label = int(labels_np[b, gt_index])
+                        pred_label = int(pred_labels_np[b, i])
+                        if not 0 <= gt_label < confusion_matrix.shape[0]:
+                            raise ValueError(
+                                f"Ground-truth class {gt_label} is outside the "
+                                f"model's class range [0, {confusion_matrix.shape[0]})."
+                            )
+
+                        confusion_matrix[gt_label, pred_label] += 1
+                        class_total += 1
+                        if pred_label == gt_label:
+                            class_correct += 1
+                            e2e_tp += 1
+                            per_class_e2e_tp[gt_label] += 1
+                        else:
+                            e2e_fp += 1
+                            e2e_fn += 1
+                            per_class_e2e_fp[pred_label] += 1
+                            per_class_e2e_fn[gt_label] += 1
                     else:
                         fp += 1
+                        e2e_fp += 1
+                        per_class_e2e_fp[int(pred_labels_np[b, i])] += 1
+
                 fn += n_gt - len(matched)
+                e2e_fn += n_gt - len(matched)
+                for local_j in set(range(n_gt)) - matched:
+                    gi = valid_gt_indices[local_j]
+                    per_class_e2e_fn[int(labels_np[b, gi])] += 1
 
     precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall    = tp / (tp + fn) if (tp + fn) else 0.0
-    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall)
+        else 0.0
+    )
+    e2e_precision = (
+        e2e_tp / (e2e_tp + e2e_fp) if (e2e_tp + e2e_fp) else 0.0
+    )
+    e2e_recall = e2e_tp / (e2e_tp + e2e_fn) if (e2e_tp + e2e_fn) else 0.0
+    e2e_f1 = (
+        2 * e2e_precision * e2e_recall / (e2e_precision + e2e_recall)
+        if (e2e_precision + e2e_recall)
+        else 0.0
+    )
 
     avg_loss = total_loss / len(loader)
     mean_iou = total_iou / max(n_images, 1)
 
+    per_class = {}
+    if confusion_matrix is not None:
+        for class_idx in range(confusion_matrix.shape[0]):
+            class_count = int(confusion_matrix[class_idx].sum())
+            class_hits = int(confusion_matrix[class_idx, class_idx])
+
+            e2e_tp_k  = int(per_class_e2e_tp[class_idx])
+            e2e_fp_k  = int(per_class_e2e_fp[class_idx])
+            e2e_fn_k  = int(per_class_e2e_fn[class_idx])
+            e2e_p_k   = e2e_tp_k / (e2e_tp_k + e2e_fp_k) if (e2e_tp_k + e2e_fp_k) else 0.0
+            e2e_r_k   = e2e_tp_k / (e2e_tp_k + e2e_fn_k) if (e2e_tp_k + e2e_fn_k) else 0.0
+            e2e_f1_k  = (
+                2 * e2e_p_k * e2e_r_k / (e2e_p_k + e2e_r_k)
+                if (e2e_p_k + e2e_r_k) else 0.0
+            )
+
+            class_metrics = {
+                "accuracy": class_hits / class_count if class_count else 0.0,
+                "correct":  class_hits,
+                "total":    class_count,
+                "e2e_tp":        e2e_tp_k,
+                "e2e_fp":        e2e_fp_k,
+                "e2e_fn":        e2e_fn_k,
+                "e2e_precision": round(e2e_p_k,  4),
+                "e2e_recall":    round(e2e_r_k,  4),
+                "e2e_f1":        round(e2e_f1_k, 4),
+            }
+            if class_names is not None and class_idx < len(class_names):
+                class_metrics["name"] = class_names[class_idx]
+            per_class[class_idx] = class_metrics
+
     return {
-        "val_loss": avg_loss, 
-        "val_iou": mean_iou,
-        "val_precision": precision,
-        "val_recall": recall,
-        "val_f1": f1,
-        "tp": tp, "fp": fp, "fn": fn
+        "loss": avg_loss,
+        "detection": {
+            "iou": mean_iou,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+        },
+        "classification": {
+            "accuracy": class_correct / class_total if class_total else 0.0,
+            "per_class": per_class,
+            "confusion_matrix": (
+                confusion_matrix.tolist() if confusion_matrix is not None else []
+            ),
+        },
+        "end_to_end": {
+            "precision": e2e_precision,
+            "recall": e2e_recall,
+            "f1": e2e_f1,
+            "tp": e2e_tp,
+            "fp": e2e_fp,
+            "fn": e2e_fn,
+        },
     }
 
 
@@ -517,10 +652,14 @@ def evaluate_detection_sweep(
     iou_threshold: float = 0.5,
     print_table: bool = True,
 ):
-    """Run a confidence threshold sweep and return a list of P/R/F1 dicts.
+    """Run a confidence threshold sweep and return a list of metric dicts.
 
-    Unlike evaluate_detection, this does NOT compute loss — it only computes
-    detection metrics at multiple thresholds in a single forward pass.
+    Unlike evaluate_detection, this does NOT compute loss — it performs a
+    single forward pass, caches raw predictions on CPU, then sweeps all
+    thresholds without re-running the model.
+
+    Returns per-threshold detection P/R/F1 AND overall classification accuracy
+    + per-class E2E F1, mirroring the full metric surface of evaluate_detection.
 
     Intended for use on the test set after training completes. Results are
     returned as a list of dicts (one per threshold) suitable for saving into
@@ -528,29 +667,31 @@ def evaluate_detection_sweep(
 
     Args:
         model:             Trained detection model.
-        loader:            Test DataLoader.
+        loader:            Test DataLoader (yields images, boxes, labels, mask).
         device:            torch.device.
         conf_thresholds:   Iterable of confidence thresholds to sweep.
         iou_threshold:     IoU threshold for a TP match.
-        print_table:       If True, print a formatted P/R/F1 table.
+        print_table:       If True, print a formatted metric table.
 
     Returns:
         List of dicts: [{"conf": 0.2, "precision": ..., "recall": ..., "f1": ...,
-                         "tp": ..., "fp": ..., "fn": ...}, ...]
+                         "tp": ..., "fp": ..., "fn": ...,
+                         "cls_accuracy": ..., "per_class_e2e": {class_idx: {"f1":...}}},
+                        ...]
     """
     thresholds = sorted(conf_thresholds)
     model.eval()
     use_amp = device.type == "cuda"
+    class_names = _infer_class_names_from_loader(loader)
 
-    # Collect (pred_conf_cpu, pred_boxes_cpu, iou_cpu, n_gt) per image across
-    # the whole loader — then sweep thresholds on CPU. This avoids re-running
-    # the model N times.
-    records = []  # list of (pred_conf np.ndarray, iou np.ndarray, n_gt int)
+    records = []
+    num_classes = None
 
     with torch.no_grad():
         for images, boxes, labels, mask in loader:
             images = images.to(device, non_blocking=True)
             boxes  = boxes.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             mask   = mask.to(device, non_blocking=True)
 
             if use_amp:
@@ -559,41 +700,52 @@ def evaluate_detection_sweep(
             else:
                 outputs = model(images)
 
-            pred_boxes = outputs[..., :4].float()
-            pred_conf  = torch.sigmoid(outputs[..., 4].float())
-            iou        = _pairwise_iou(pred_boxes, boxes)  # (B, N_pred, max_gt)
+            pred_boxes  = outputs[..., :4].float()
+            pred_conf   = torch.sigmoid(outputs[..., 4].float())
+            pred_class  = outputs[..., 5:]
+            pred_labels = pred_class.float().argmax(dim=-1)
+            iou         = _pairwise_iou(pred_boxes, boxes)
 
-            # Pull everything off GPU in one shot per batch
-            pred_conf_np = pred_conf.cpu().numpy()
-            iou_np       = iou.cpu().numpy()
-            mask_np      = mask.cpu().numpy()
+            if num_classes is None:
+                num_classes = pred_class.size(-1)
+
+            pred_conf_np   = pred_conf.cpu().numpy()
+            iou_np         = iou.cpu().numpy()
+            mask_np        = mask.cpu().numpy()
+            labels_np      = labels.cpu().numpy()
+            pred_labels_np = pred_labels.cpu().numpy()
 
             for b in range(images.size(0)):
-                gt_valid = mask_np[b]  # (max_gt,) bool
+                gt_valid = mask_np[b]
                 n_gt = int(gt_valid.sum())
                 if n_gt == 0:
                     continue
+                gt_labels_b  = labels_np[b][gt_valid]
                 records.append((
-                    pred_conf_np[b],            # (N_pred,)
-                    iou_np[b][:, gt_valid],     # (N_pred, n_gt) — only valid GT cols
+                    pred_conf_np[b],
+                    iou_np[b][:, gt_valid],
+                    pred_labels_np[b],
+                    gt_labels_b,
                     n_gt,
                 ))
-
-    import numpy as np
 
     results = []
     for thr in thresholds:
         tp = fp = fn = 0
-        for conf, sub_iou, n_gt in records:
-            pr_mask = conf > thr
-            pr_indices = np.where(pr_mask)[0]
-            n_pr = len(pr_indices)
+        cls_correct = cls_total = 0
+        per_class_e2e_tp = np.zeros(num_classes, dtype=np.int64)
+        per_class_e2e_fp = np.zeros(num_classes, dtype=np.int64)
+        per_class_e2e_fn = np.zeros(num_classes, dtype=np.int64)
 
-            if n_pr == 0:
+        for conf, sub_iou, pred_lbl, gt_lbl, n_gt in records:
+            pr_indices = np.where(conf > thr)[0]
+
+            if len(pr_indices) == 0:
                 fn += n_gt
+                for k in gt_lbl:
+                    per_class_e2e_fn[int(k)] += 1
                 continue
 
-            # Sort active preds by confidence descending (COCO convention)
             order = pr_indices[np.argsort(-conf[pr_indices])]
             matched = set()
             for i in order:
@@ -601,28 +753,59 @@ def evaluate_detection_sweep(
                 if sub_iou[i, best_j] >= iou_threshold and best_j not in matched:
                     matched.add(best_j)
                     tp += 1
+                    p_lbl = int(pred_lbl[i])
+                    g_lbl = int(gt_lbl[best_j])
+                    cls_total += 1
+                    if p_lbl == g_lbl:
+                        cls_correct += 1
+                        per_class_e2e_tp[g_lbl] += 1
+                    else:
+                        per_class_e2e_fp[p_lbl] += 1
+                        per_class_e2e_fn[g_lbl] += 1
                 else:
                     fp += 1
+                    per_class_e2e_fp[int(pred_lbl[i])] += 1
             fn += n_gt - len(matched)
+            for local_j in set(range(n_gt)) - matched:
+                per_class_e2e_fn[int(gt_lbl[local_j])] += 1
 
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall    = tp / (tp + fn) if (tp + fn) else 0.0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        cls_acc = cls_correct / cls_total if cls_total else 0.0
+
+        per_class_e2e = {}
+        for k in range(num_classes):
+            tp_k = int(per_class_e2e_tp[k])
+            fp_k = int(per_class_e2e_fp[k])
+            fn_k = int(per_class_e2e_fn[k])
+            p_k  = tp_k / (tp_k + fp_k) if (tp_k + fp_k) else 0.0
+            r_k  = tp_k / (tp_k + fn_k) if (tp_k + fn_k) else 0.0
+            f_k  = 2 * p_k * r_k / (p_k + r_k) if (p_k + r_k) else 0.0
+            entry = {"e2e_precision": round(p_k, 4), "e2e_recall": round(r_k, 4),
+                     "e2e_f1": round(f_k, 4), "e2e_tp": tp_k, "e2e_fp": fp_k, "e2e_fn": fn_k}
+            if class_names is not None and k < len(class_names):
+                entry["name"] = class_names[k]
+            per_class_e2e[k] = entry
+
         results.append({
-            "conf": round(thr, 2),
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "f1": round(f1, 4),
+            "conf":         round(thr, 2),
+            "precision":    round(precision, 4),
+            "recall":       round(recall, 4),
+            "f1":           round(f1, 4),
             "tp": tp, "fp": fp, "fn": fn,
+            "cls_accuracy": round(cls_acc, 4),
+            "per_class_e2e": per_class_e2e,
         })
 
     if print_table:
-        print(f"\n{'Conf':>6}  {'P':>6}  {'R':>6}  {'F1':>6}  {'TP':>7}  {'FP':>7}  {'FN':>7}")
-        print("-" * 56)
+        print(f"\n{'Conf':>6}  {'P':>6}  {'R':>6}  {'F1':>6}  {'ClsAcc':>7}  {'TP':>7}  {'FP':>7}  {'FN':>7}")
+        print("-" * 66)
         for r in results:
             print(
                 f"{r['conf']:6.2f}  {r['precision']:6.4f}  {r['recall']:6.4f}  "
-                f"{r['f1']:6.4f}  {r['tp']:7d}  {r['fp']:7d}  {r['fn']:7d}"
+                f"{r['f1']:6.4f}  {r['cls_accuracy']:7.4f}  "
+                f"{r['tp']:7d}  {r['fp']:7d}  {r['fn']:7d}"
             )
 
     return results
@@ -729,41 +912,32 @@ def evaluate_density_sweep(
     return bucket_results
 
 
-
-
-
 def fit(
     model, trainloader, valloader, criterion,
-    optimizer, device, epochs, task_type="classification",
+    optimizer, device, epochs,
     scheduler=None, scaler=None, checkpoint=None,
     log=False, log_dir=None,
     clip_grad_norm: float = 1.0,
     step_scheduler_per_batch: bool = True,
-    gpu_augment=None,
     verbose: int = 1,
-    print_per_class_accuracy: bool = False,
-    class_names=None,
     model_label: str = None,
     resume: bool = False,
 ):
     """
     Full training loop with per-epoch logging, validation, and optional checkpointing.
-    Supports both classification and bounding box regression tasks.
+    Detection-only: uses train_one_epoch_detection and evaluate_detection.
 
     Uses bfloat16 autocast automatically on CUDA devices. Pass a GradScaler
     for API uniformity (it behaves as a no-op with bf16).
 
     Args:
         model (nn.Module): The model to train.
-        trainloader (DataLoader): Training DataLoader. Must be produced by DatasetBuilder.
+        trainloader (DataLoader): Training DataLoader.
         valloader (DataLoader): Validation DataLoader.
-        criterion (callable): Loss function (e.g. nn.CrossEntropyLoss, nn.HuberLoss).
+        criterion (callable): Detection loss (e.g. DetectionLoss).
         optimizer (Optimizer): PyTorch optimizer (e.g. SGD, Adam).
         device (torch.device): Target device ('cuda' or 'cpu').
         epochs (int): Number of epochs to train.
-        task_type (str): One of "classification" or "regression".
-            - "classification": Tracks Val Loss and Val Accuracy (%).
-            - "regression": Tracks Val Loss, Val MAE, and Val IoU.
         scheduler (LRScheduler, optional): LR scheduler. Defaults to None.
             - step_scheduler_per_batch=True (default): stepped every mini-batch
               (e.g. OneCycleLR, CyclicLR).
@@ -773,50 +947,47 @@ def fit(
             For bf16 this is a no-op but is accepted for API compatibility.
             Defaults to None.
         clip_grad_norm (float): Clip gradient norms to this value before the
-            optimizer step. Matches the CIFAR reference (default 1.0).
-            Set to 0.0 to disable. Defaults to 1.0.
-        gpu_augment (callable | None): GPU batch augmentation from
-            get_emnist_gpu_transform(). Applied on-device before forward pass.
-            Defaults to None.
+            optimizer step. Set to 0.0 to disable. Defaults to 1.0.
         checkpoint (ModelCheckpoint, optional): Callback invoked after each epoch.
-            For classification, monitors Val Accuracy.
-            For regression, monitors Val IoU.
-            Defaults to None.
+            Monitors Val F1. Defaults to None.
         log (bool): If True, record this run with RunLogger. Each run is saved as
             its own timestamped JSON file — nothing is ever overwritten.
             Defaults to False.
         log_dir (str | None): Directory to store run JSON files.
-            When None (default), auto-derived from the model class name::
-
-                CharacterClassifier  →  logs/CharacterClassifier/
-                ObjectDetectorRes    →  logs/ObjectDetectorRes/
-        print_per_class_accuracy (bool): If True, print per-class validation
-            accuracy for classification runs. Defaults to False.
-        class_names (Sequence | None): Optional display names indexed by class id
-            for per-class accuracy output. When None, inferred from the loader.
+            When None (default), auto-derived from the model class name.
+        verbose (int): 0 = silent, 1 = log on new best (default), 2 = every epoch.
+        model_label (str | None): Optional label added to the run config.
+        resume (bool): If True, resume from the last checkpoint. Defaults to False.
 
     Returns:
         tuple: (history, logger)
-            - history (dict): per-epoch metric lists.
-              Keys: 'train_loss', 'val_loss', 'val_metric'
-              Detection adds: 'val_iou' | Regression adds: 'val_mae', 'val_iou'
+            - history (dict): per-epoch metric lists with keys:
+              'train_loss', 'val_loss', 'val_metric',
+              'val_iou', 'val_f1', 'val_precision', 'val_recall',
+              'val_cls_acc' (classification accuracy on matched detections),
+              'val_e2e_f1', 'val_e2e_precision', 'val_e2e_recall'
+              (end-to-end: correct localisation + correct class)
             - logger (RunLogger | None): the logger instance when log=True,
               otherwise None. Use it after fit() to call e.g.
               logger.log_test_results(sweep_results).
     """
-    history = {'train_loss': [], 'val_loss': [], 'val_metric': []}
-    if task_type == "regression":
-        history['val_mae'] = []
-        history['val_iou'] = []
-    elif task_type == "detection":
-        history['val_iou'] = []
-        history['val_f1'] = []
-        history['val_precision'] = []
-        history['val_recall'] = []
+
+    history = {
+        'train_loss':       [],
+        'val_loss':         [],
+        'val_metric':       [],
+        'val_iou':          [],
+        'val_f1':           [],
+        'val_precision':    [],
+        'val_recall':       [],
+        'val_cls_acc':      [],
+        'val_e2e_f1':       [],
+        'val_e2e_precision': [],
+        'val_e2e_recall':   [],
+    }
 
     amp_info = "bf16 autocast" if device.type == "cuda" else "fp32 (CPU)"
-    metric_unit = "%" if task_type == "classification" else ""
-    print(f"Training with {amp_info} | Task: {task_type} | Epochs: {epochs}")
+    print(f"Training with {amp_info} | Epochs: {epochs}")
 
     # ── Set up RunLogger ──────────────────────────────────────────────────────
     logger = None
@@ -824,10 +995,9 @@ def fit(
         from .logger import RunLogger
         model_name = type(model).__name__
         resolved_log_dir = log_dir if log_dir is not None else f"logs/{model_name}"
-        logger = RunLogger(log_dir=resolved_log_dir, verbose=verbose, metric_unit=metric_unit)
+        logger = RunLogger(log_dir=resolved_log_dir, verbose=verbose)
         config = {
             "model":     model_name,
-            "task":      task_type,
             "optimizer": type(optimizer).__name__,
             "scheduler": type(scheduler).__name__ if scheduler else None,
             "lr":        optimizer.param_groups[0]["lr"],
@@ -835,8 +1005,6 @@ def fit(
             "device":    str(device),
             "clip_grad_norm": clip_grad_norm,
             "step_scheduler_per_batch": step_scheduler_per_batch,
-            "gpu_augment": gpu_augment is not None,
-            "print_per_class_accuracy": print_per_class_accuracy,
         }
         if model_label: config["label"] = model_label
         logger.start(config=config)
@@ -844,7 +1012,7 @@ def fit(
     total_start = time.time()
     best_val_metric = float('-inf')
     start_epoch = 0
-    
+
     if resume and checkpoint is not None:
         try:
             start_epoch = checkpoint.resume_training(optimizer, scheduler, scaler)
@@ -855,173 +1023,117 @@ def fit(
     for epoch in range(start_epoch, epochs):
         train_start = time.perf_counter()
 
-        # Train
-        if task_type == "detection":
-            avg_train_loss = train_one_epoch_detection(
-                model, trainloader, criterion, optimizer, device,
-                scheduler, scaler,
-                clip_grad_norm=clip_grad_norm,
-                step_scheduler_per_batch=step_scheduler_per_batch,
-            )
-        else:
-            avg_train_loss = train_one_epoch(
-                model, trainloader, criterion, optimizer, device,
-                scheduler, scaler,
-                clip_grad_norm=clip_grad_norm,
-                step_scheduler_per_batch=step_scheduler_per_batch,
-                gpu_augment=gpu_augment,
-            )
+        # ── Train ─────────────────────────────────────────────────────────────
+        avg_train_loss = train_one_epoch_detection(
+            model, trainloader, criterion, optimizer, device,
+            scheduler, scaler,
+            clip_grad_norm=clip_grad_norm,
+            step_scheduler_per_batch=step_scheduler_per_batch,
+        )
         history['train_loss'].append(avg_train_loss)
-        
         train_end = time.perf_counter()
 
         # Step scheduler per epoch (e.g. CosineAnnealingLR)
         if scheduler is not None and not step_scheduler_per_batch:
             scheduler.step()
 
-        # Validate
+        # ── Validate ──────────────────────────────────────────────────────────
         current_lr = optimizer.param_groups[0]["lr"]
 
-        if task_type == "classification":
-            avg_val_loss, val_metric = evaluate_classification(
-                model, valloader, criterion, device,
-                print_per_class_accuracy=print_per_class_accuracy,
-                class_names=class_names,
+        metrics           = evaluate_detection(model, valloader, criterion, device)
+        avg_val_loss      = metrics["loss"]
+        det               = metrics["detection"]
+        cls               = metrics["classification"]
+        e2e               = metrics["end_to_end"]
+        val_iou           = det["iou"]
+        val_f1            = det["f1"]
+        val_precision     = det["precision"]
+        val_recall        = det["recall"]
+        val_cls_acc       = cls["accuracy"]
+        val_e2e_f1        = e2e["f1"]
+        val_e2e_precision = e2e["precision"]
+        val_e2e_recall    = e2e["recall"]
+        val_metric        = val_f1
+
+        history['val_loss'].append(avg_val_loss)
+        history['val_iou'].append(val_iou)
+        history['val_f1'].append(val_f1)
+        history['val_precision'].append(val_precision)
+        history['val_recall'].append(val_recall)
+        history['val_cls_acc'].append(val_cls_acc)
+        history['val_e2e_f1'].append(val_e2e_f1)
+        history['val_e2e_precision'].append(val_e2e_precision)
+        history['val_e2e_recall'].append(val_e2e_recall)
+        history['val_metric'].append(val_metric)
+
+        val_end = time.perf_counter()
+        elapsed = train_end - train_start
+        print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
+        print(
+            f"  --> Det  | PR: {val_precision:.3f} | Rec: {val_recall:.3f} | F1: {val_f1:.3f} "
+            f"| TP: {det['tp']} FP: {det['fp']} FN: {det['fn']}"
+        )
+        print(
+            f"  --> Cls  | Acc: {val_cls_acc:.3f}"
+        )
+        print(
+            f"  --> E2E  | F1: {val_e2e_f1:.3f} "
+            f"| PR: {e2e['precision']:.3f} | Rec: {e2e['recall']:.3f}"
+        )
+
+        # ── Checkpoint / best tracking ────────────────────────────────────────
+        if checkpoint is not None:
+            is_best = checkpoint(
+                val_metric, epoch, optimizer, scheduler, scaler,
+                metrics={
+                    "val_loss": avg_val_loss, "val_iou": val_iou,
+                    "val_f1": val_f1, "val_precision": val_precision,
+                    "val_recall": val_recall, "val_cls_acc": val_cls_acc,
+                    "val_e2e_f1": val_e2e_f1,
+                    "val_e2e_precision": val_e2e_precision,
+                    "val_e2e_recall": val_e2e_recall,
+                }
             )
-            val_end = time.perf_counter()
-            elapsed = train_end - train_start
-            
-            print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
-            
-            history['val_loss'].append(avg_val_loss)
-            history['val_metric'].append(val_metric)  # Accuracy
+        else:
+            is_best = val_metric > best_val_metric
+        if is_best:
+            best_val_metric = val_metric
 
-            if checkpoint is not None:
-                is_best = checkpoint(
-                    val_metric, epoch, optimizer, scheduler, scaler,
-                    metrics={"val_loss": avg_val_loss, "val_acc": val_metric}
-                )
-            else:
-                is_best = val_metric > best_val_metric
-            if is_best:
-                best_val_metric = val_metric
+        # ── Logging ───────────────────────────────────────────────────────────
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "train/epoch_loss":   avg_train_loss,
+                "val/loss":           avg_val_loss,
+                "val/iou":            val_iou,
+                "val/precision":      val_precision,
+                "val/recall":         val_recall,
+                "val/f1":             val_f1,
+                "val/cls_acc":        val_cls_acc,
+                "val/e2e_f1":         val_e2e_f1,
+                "val/e2e_precision":  val_e2e_precision,
+                "val/e2e_recall":     val_e2e_recall,
+                "epoch":              epoch + 1,
+            })
 
-            if wandb is not None and wandb.run is not None:
-                wandb.log({
-                    "train/epoch_loss": avg_train_loss,
-                    "val/loss": avg_val_loss,
-                    "val/accuracy": val_metric,
-                    "epoch": epoch + 1
-                })
-
-            if logger is not None:
-                logger.log_epoch(
-                    epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
-                    val_metric=val_metric, lr=current_lr,
-                    epoch_time=elapsed, metric_label="val_acc",
-                )
-            elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
-                best_marker = "  ★ NEW BEST" if is_best else ""
-                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_metric:.2f}% | Time: {elapsed:.2f}s{best_marker}')
-
-        elif task_type == "regression":
-            avg_val_loss, val_mae, val_iou = evaluate_regression(model, valloader, criterion, device)
-            val_end = time.perf_counter()
-            elapsed = train_end - train_start
-            
-            print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
-            
-            history['val_loss'].append(avg_val_loss)
-            history['val_mae'].append(val_mae)
-            history['val_iou'].append(val_iou)
-
-            # Using validation IoU as the checkpointing metric
-            if checkpoint is not None:
-                is_best = checkpoint(
-                    val_iou, epoch, optimizer, scheduler, scaler,
-                    metrics={"val_loss": avg_val_loss, "val_mae": val_mae, "val_iou": val_iou}
-                )
-            else:
-                is_best = val_iou > best_val_metric
-            if is_best:
-                best_val_metric = val_iou
-
-            if wandb is not None and wandb.run is not None:
-                wandb.log({
-                    "train/epoch_loss": avg_train_loss,
-                    "val/loss": avg_val_loss,
-                    "val/mae": val_mae,
-                    "val/iou": val_iou,
-                    "epoch": epoch + 1
-                })
-
-            if logger is not None:
-                logger.log_epoch(
-                    epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
-                    val_metric=val_iou, lr=current_lr,
-                    epoch_time=elapsed, metric_label="val_iou",
-                    val_mae=val_mae,
-                )
-            elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
-                best_marker = "  ★ NEW BEST" if is_best else ""
-                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val MAE: {val_mae:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}')
-
-        elif task_type == "detection":
-            metrics     = evaluate_detection(model, valloader, criterion, device)
-            avg_val_loss = metrics["val_loss"]
-            val_iou     = metrics["val_iou"]
-            val_f1      = metrics["val_f1"]
-            val_precision = metrics["val_precision"]
-            val_recall  = metrics["val_recall"]
-            val_end     = time.perf_counter()
-            elapsed     = train_end - train_start
-
-            print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
-            print(f"  --> PR: {val_precision:.3f} | Rec: {val_recall:.3f} | F1: {val_f1:.3f} | TP: {metrics['tp']} FP: {metrics['fp']} FN: {metrics['fn']}")
-
-            history['val_loss'].append(avg_val_loss)
-            history['val_iou'].append(val_iou)
-            history['val_f1'].append(val_f1)
-            history['val_precision'].append(val_precision)
-            history['val_recall'].append(val_recall)
-
-            if checkpoint is not None:
-                is_best = checkpoint(
-                    val_f1, epoch, optimizer, scheduler, scaler,
-                    metrics={
-                        "val_loss": avg_val_loss, "val_iou": val_iou,
-                        "val_f1": val_f1, "val_precision": val_precision, "val_recall": val_recall
-                    }
-                )
-            else:
-                is_best = val_f1 > best_val_metric
-            if is_best:
-                best_val_metric = val_f1
-
-            if wandb is not None and wandb.run is not None:
-                wandb.log({
-                    "train/epoch_loss": avg_train_loss,
-                    "val/loss": avg_val_loss,
-                    "val/iou": val_iou,
-                    "val/precision": val_precision,
-                    "val/recall": val_recall,
-                    "val/f1": val_f1,
-                    "epoch": epoch + 1
-                })
-
-            if logger is not None:
-                logger.log_epoch(
-                    epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
-                    val_metric=val_f1, lr=current_lr,
-                    epoch_time=elapsed, metric_label="val_f1",
-                    val_iou=val_iou, val_precision=val_precision, val_recall=val_recall
-                )
-            elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
-                best_marker = "  ★ NEW BEST" if is_best else ""
-                print(f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val F1: {val_f1:.4f} | Val IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}')
-
-
-
+        if logger is not None:
+            logger.log_epoch(
+                epoch, train_loss=avg_train_loss, val_loss=avg_val_loss,
+                val_metric=val_metric, lr=current_lr,
+                epoch_time=elapsed, metric_label="val_f1",
+                val_iou=val_iou, val_precision=val_precision, val_recall=val_recall,
+                val_cls_acc=val_cls_acc,
+                val_e2e_f1=val_e2e_f1,
+                val_e2e_precision=val_e2e_precision,
+                val_e2e_recall=val_e2e_recall,
+            )
+        elif verbose >= 2 or verbose is True or (verbose == 1 and is_best):
+            best_marker = "  ★ NEW BEST" if is_best else ""
+            print(
+                f'Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {avg_train_loss:.4f} '
+                f'| Val Loss: {avg_val_loss:.4f} | Det F1: {val_f1:.4f} '
+                f'| Cls Acc: {val_cls_acc:.4f} | E2E F1: {val_e2e_f1:.4f} '
+                f'| IoU: {val_iou:.4f} | Time: {elapsed:.2f}s{best_marker}'
+            )
 
     total_minutes = (time.time() - total_start) / 60
     if verbose >= 2 or verbose is True:

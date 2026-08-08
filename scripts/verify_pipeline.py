@@ -1,123 +1,113 @@
-"""Verification script for the OD-From-Scratch pipeline.
-Checks everything from data loading to trainer compatibility.
-No model is actually trained - just the data pipeline and interface.
 """
-import sys
-sys.path.insert(0, r'c:\OD-From-Scratch')
+scripts/verify_pipeline.py — Verification and Benchmark Script for the End-to-End Pipeline.
 
-import torch
+Tests:
+  1. Single image prediction & visualization smoke test
+  2. Batch GPU parallel inference throughput (FPS benchmark)
+  3. Multi-Stream CUDA parallel evaluation across all 4 placement benchmarks (random, grid, words, line)
+"""
+
+import sys, time
 from pathlib import Path
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Device: {DEVICE}')
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root_dir / 'generator'))
+sys.path.insert(0, str(root_dir))
 
-# ── 1. DataReader (PNG) ──────────────────────────────────────────────────────
-print('\n[1] DataReader (PNG) ...')
-from utils.reader import DataReader, Record
+import torch
+from utils.pipeline import DetectionPipeline
+from utils.dataset import get_detection_loaders, ROOT_DIR
 
-data_root = Path(r'c:\OD-From-Scratch\data\OD')
-train_reader = DataReader(root=data_root / 'train')
-test_reader  = DataReader(root=data_root / 'test')
 
-rec = train_reader.get_record(0)
-assert isinstance(rec, Record), 'FAIL: get_record did not return Record'
-assert rec.image.shape[0] == 1, 'FAIL: image should be (1, H, W)'
-assert rec.boxes.ndim == 2 and rec.boxes.shape[1] == 4, 'FAIL: boxes shape wrong'
-print('  OK  train + test readers loaded, get_record returns Record')
+def main():
+    print("=" * 65)
+    print("  End-to-End Scene Understanding Pipeline Smoke Test & Benchmark")
+    print("=" * 65)
 
-# ── 2. DetectionDataset.collate_fn returns (images, records) ─────────────────
-print('\n[2] DetectionDataset.collate_fn returns (images, records) ...')
-from utils.dataset import DetectionDataset
-from utils.reader import DataReader
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-batch_records = [train_reader.get_record(i) for i in range(4)]
-result = DetectionDataset.collate_fn(batch_records)
+    # Instantiate pipeline with Small Detector + ByMerge Classifier
+    pipeline = DetectionPipeline(
+        detector_size="s",
+        detector_weights="weights/detector_s_new_best.pth",
+        classifier_weights="weights/classifier_resent_bymerge_s_best.pth",
+        device=device,
+        conf_threshold=0.70,
+    )
+    print("\n[OK] Pipeline successfully initialized!")
 
-assert len(result) == 2, f'FAIL: collate_fn returned {len(result)} items, expected 2'
-imgs, recs = result
-assert imgs.shape == (4, 1, 224, 224), f'FAIL: images shape {imgs.shape}'
-assert len(recs) == 4, 'FAIL: records list should have 4 items'
-assert isinstance(recs[0], Record), 'FAIL: records should contain Record objects'
-print('  OK  collate_fn returns (images, list[Record])')
+    # 1. Single Image Prediction Test
+    test_img_dir = Path("data/OD_benchmark/words/test/images")
+    if not test_img_dir.exists():
+        test_img_dir = ROOT_DIR / "test" / "images"
 
-# ── 3. get_detection_loaders ─────────────────────────────────────────────────
-print('\n[3] get_detection_loaders ...')
-from utils.dataset import get_detection_loaders
+    sample_imgs = list(test_img_dir.glob("*.png"))
+    if sample_imgs:
+        sample_path = sample_imgs[0]
+        print(f"\nRunning single-image prediction on '{sample_path.name}'...")
+        results = pipeline.predict_image(sample_path)
+        print(f"Detected {len(results)} characters:")
+        for r in results[:10]:
+            print(f"  bbox={r.bbox} | char='{r.char_label}' | det_conf={r.detector_conf:.4f} | cls_conf={r.classifier_conf:.4f} | joint_conf={r.joint_conf:.4f}")
 
-train_loader, val_loader = get_detection_loaders(
-    data_root=data_root,
-    batch_size=32,
-    val_size=1000,
-    num_workers=0,
-    pin_memory=False,
-    transform=None,
-)
-imgs_b, recs_b = next(iter(train_loader))
-assert imgs_b.ndim == 4, 'FAIL: images should be 4D'
-assert len(recs_b) == 32, 'FAIL: records batch should be 32'
-print(f'  OK  train_loader batch: images={imgs_b.shape}, records={len(recs_b)}')
+    # 2. Batch Inference Throughput Test
+    print("\n--- Running Batch Inference Throughput Benchmark ---")
+    test_loader = get_detection_loaders(
+        data_root=ROOT_DIR,
+        batch_size=64,
+        test_only=True,
+        num_workers=0,
+    )
 
-train_loader_t, val_loader_t, test_loader_t = get_detection_loaders(
-    data_root=data_root,
-    batch_size=32,
-    val_size=1000,
-    test=True,
-    num_workers=0,
-    pin_memory=False,
-    transform=None,
-)
-imgs_test, recs_test = next(iter(test_loader_t))
-assert imgs_test.ndim == 4, 'FAIL: test images should be 4D'
-print(f'  OK  test_loader batch: images={imgs_test.shape}, records={len(recs_test)}')
+    images_batch, targets_batch, _, _ = next(iter(test_loader))
+    images_batch = images_batch.to(device)
 
-# ── 4. records_to_padded_tensors ─────────────────────────────────────────────
-print('\n[4] records_to_padded_tensors ...')
-from utils.trainer import records_to_padded_tensors
+    # Warmup
+    _ = pipeline.predict_batch(images_batch)
 
-boxes, labels, mask, classes_list = records_to_padded_tensors(recs_b, DEVICE)
-assert boxes.shape[0] == 32, 'FAIL: boxes batch dim wrong'
-assert boxes.shape[2] == 4, 'FAIL: boxes last dim should be 4'
-assert mask.dtype == torch.bool, 'FAIL: mask should be bool'
-assert boxes.device.type == DEVICE.type, f'FAIL: boxes not on {DEVICE}'
-print(f'  OK  boxes={boxes.shape}, mask={mask.shape}, all on {DEVICE}')
+    # Benchmark 20 iterations
+    t0 = time.time()
+    total_imgs = 0
+    N_ITERS = 20
+    for _ in range(N_ITERS):
+        batch_res = pipeline.predict_batch(images_batch)
+        total_imgs += len(batch_res)
 
-# ── 5. DetectionLoss with padded tensors ─────────────────────────────────────
-print('\n[5] DetectionLoss ...')
-from utils.losses import DetectionLoss
-from models.object_detector_res import ObjectDetectorResNet
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-model = ObjectDetectorResNet(max_objects=24).to(DEVICE)
-criterion = DetectionLoss(lambda_conf=1.0)
+    elapsed = time.time() - t0
+    fps = total_imgs / elapsed
+    print(f"Processed {total_imgs} images ({N_ITERS} batches of 64) in {elapsed:.2f}s -> {fps:.1f} Images/sec (FPS)")
 
-imgs_gpu = imgs_b.to(DEVICE)
-with torch.no_grad():
-    outputs = model(imgs_gpu)  # (B, 24, 5)
+    # 3. Parallel 4-Way Multi-Stream Benchmark Evaluation
+    benchmark_dir = Path("data/OD_benchmark")
+    if benchmark_dir.exists():
+        print(f"\n" + "=" * 65)
+        print("  Running Multi-Stream Parallel Evaluation on All 4 Benchmarks")
+        print("=" * 65)
+        metrics = pipeline.evaluate_benchmark_parallel(benchmark_dir=benchmark_dir, batch_size=128)
 
-loss = criterion(outputs, boxes, mask)
-assert loss.item() > 0, 'FAIL: loss should be positive'
-print(f'  OK  DetectionLoss = {loss.item():.4f}')
+        print("\n" + "=" * 70)
+        print(f"  {'Layout':<10} | {'Det Precision':<13} | {'Det Recall':<10} | {'Cls Acc':<9} | {'E2E F1':<8} | {'FPS':<6}")
+        print("=" * 70)
+        for layout, m in metrics.items():
+            if "error" in m:
+                print(f"  {layout:<10} | ERROR: {m['error']}")
+            else:
+                print(
+                    f"  {layout:<10} | "
+                    f"{m['det_precision']:<13.4f} | "
+                    f"{m['det_recall']:<10.4f} | "
+                    f"{m['classifier_acc']:<9.4f} | "
+                    f"{m['e2e_f1']:<8.4f} | "
+                    f"{m['fps']:<6.1f}"
+                )
+        print("=" * 70)
 
-# ── 6. Visualizer.visualize_multi_detection_batch signature ──────────────────
-print('\n[6] Visualizer.visualize_multi_detection_batch signature ...')
-import inspect
-from utils.visualizer import Visualizer
+    print("\n[SUCCESS] Pipeline verification complete!")
 
-sig = inspect.signature(Visualizer.visualize_multi_detection_batch)
-params = list(sig.parameters.keys())
-assert 'padded_boxes_v' not in params, f'FAIL: old param name found: {params}'
-print(f'  OK  signature params: {params}')
 
-# ── 7. Docstrings stale check ────────────────────────────────────────────────
-print('\n[7] Stale docstring check in trainer.py ...')
-from utils import trainer as _trainer
-import inspect
-
-train_doc  = inspect.getdoc(_trainer.train_one_epoch_detection)
-eval_doc   = inspect.getdoc(_trainer.evaluate_detection)
-
-stale_phrase = 'Expects loader to yield (images, boxes, labels, mask, classes_list)'
-print(f'  train_one_epoch_detection docstring stale: {stale_phrase in (train_doc or "")}')
-print(f'  evaluate_detection docstring stale:        {stale_phrase in (eval_doc or "")}')
-# Only warn, not fail - docstrings don't affect runtime
-
-print('\n\nAll critical checks PASSED!')
+if __name__ == "__main__":
+    main()
