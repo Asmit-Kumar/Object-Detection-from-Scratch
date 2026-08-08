@@ -258,3 +258,13 @@ To run the pipeline smoke test:
 ```bash
 python scripts/verify_pipeline.py
 ```
+
+---
+
+## Architectural Insights & Future Roadmap
+
+### 🔬 Loss Engineering vs. Architectural Spatial Grounding
+- **Loss Engineering Success**: Joint loss optimization (`L_box + L_conf + L_cls`) and `pos_weight` tuning successfully resolved multi-object recall degradation (recovering detection recall to **95.80%** on Large).
+- **Global Pooling Bottleneck**: The current single-stage architecture passes feature maps through `AdaptiveAvgPool2d((2,2))` before head projection. This discards spatial coordinates before slots evaluate predictions. Confidence scores are **statistically correlated** with target assignments through Hungarian loss, but not **architecturally grounded** in local feature receptive fields.
+- **Post-Processing Filtering**: Optimal size-specific confidence thresholds (`conf=0.60–0.70`) combined with a secondary class confidence gate (`cls_conf ≥ 0.30`) effectively suppress ungrounded false positives in post-processing.
+- **🚀 Stage 6 Roadmap (Grid-Based Spatial Detector)**: Future iterations will transition to an anchor-free Fully Convolutional Spatial Grid Detector ($S \times S \times C$ feature map without global pooling), ensuring every prediction cell is strictly grounded in its local spatial receptive field by construction.

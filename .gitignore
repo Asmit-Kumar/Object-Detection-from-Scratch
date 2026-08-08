@@ -43,6 +43,10 @@ scripts/compare_matching_modes.py
 result/large.png
 archive/
 
+# Benchmark result caches & JSON logs
+*.json
+*.jsonl
+
 # Private experiment log
 INSIGHTS.md
 insights/
