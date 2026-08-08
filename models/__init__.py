@@ -37,9 +37,10 @@ def get_detector(size: str = "s", max_objects: int = 24, **kwargs) -> ObjectDete
 
     Size presets
     ------------
-    n  — nano   : channels [32,  64,  64,  128]  ~1.1M params
-    s  — small  : channels [64,  128, 128, 256]  ~3.0M params  (default / v1)
-    m  — medium : channels [128, 256, 256, 512]  ~9.2M params
+    n  — nano   : channels [32,  64,  64,  128]  ~0.71M params
+    s  — small  : channels [64,  128, 128, 256]  ~2.52M params (default / recommended)
+    m  — medium : channels [128, 256, 256, 512]  ~9.42M params
+    l  — large  : channels [128, 256, 384, 512]  ~19.99M params (best accuracy)
 
     Any kwarg accepted by ObjectDetectorResNet can override the preset, e.g.::
 
@@ -47,7 +48,7 @@ def get_detector(size: str = "s", max_objects: int = 24, **kwargs) -> ObjectDete
         get_detector("s", channels=[64, 64, 128, 128])   # custom channels
 
     Args:
-        size:        One of ``"n"``, ``"s"``, ``"m"``. Case-insensitive.
+        size:        One of ``"n"``, ``"s"``, ``"m"``, ``"l"``. Case-insensitive.
         max_objects: Maximum predicted slots. Default 24.
         **kwargs:    Forwarded to ObjectDetectorResNet.
                      Notable: ``channels=[...]`` to override preset widths,
@@ -86,7 +87,7 @@ def load_detector(path: str, device, size: str = "m", max_objects: int = 24, **k
     Args:
         path:        Path to a ``.pth`` state-dict file.
         device:      ``torch.device`` to map weights onto.
-        size:        Size preset used when the model was trained. Default ``"m"``.
+        size:        Size preset used when the model was trained ("n", "s", "m", "l"). Default ``"m"``.
         max_objects: Must match the value used during training.
         **kwargs:    Forwarded to ``get_detector``.
     """

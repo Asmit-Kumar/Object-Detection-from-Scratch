@@ -426,23 +426,24 @@ def train_one_epoch_detection(
 def evaluate_detection(
     model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
-    """Evaluate a detection model on a single pass.
+    """Evaluate a detection model on a single validation or test pass.
 
-    Computes detection, classification, and end-to-end metrics using the same
-    confidence-sorted greedy IoU matching.
+    Computes detection, classification, and end-to-end metrics using confidence-sorted
+    greedy IoU matching against ground-truth annotations.
 
-    Detection metrics  ("detection" key): localization-only P/R/F1 — a TP is
-    any predicted box whose best-matching GT IoU >= iou_threshold, regardless
-    of predicted class.
+    Returns:
+        dict: Hierarchical metrics evaluation dictionary containing:
+            - ``"loss"`` (float): Average validation loss over all batches.
+            - ``"detection"`` (dict): Localization-only metrics (P/R/F1/IoU/TP/FP/FN).
+              A TP is any predicted box whose best-matching GT IoU >= iou_threshold.
+            - ``"classification"`` (dict): Secondary metrics on matched detections
+              (``accuracy``, ``correct``, ``total``, ``confusion_matrix``, and
+              ``per_class`` breakdown).
+            - ``"end_to_end"`` (dict): Combined metrics (``precision``, ``recall``, ``f1``,
+              ``tp``, ``fp``, ``fn``) requiring both box localization IoU >= iou_threshold
+              AND correct character class prediction.
 
-    Classification metrics ("classification" key): accuracy on matched
-    detections, full confusion matrix, and per-class accuracy.
-
-    End-to-end metrics ("end_to_end" and per_class[k]["e2e_*"]): box matches
-    AND correct class prediction.  Per-class E2E lets you pinpoint which
-    classes are hardest to both locate and classify together.
-
-    For full P/R/F1 threshold analysis use evaluate_detection_sweep().
+    For full P/R/F1 threshold sweeps, use ``evaluate_detection_sweep()``.
     Expects loader to yield (images, boxes, labels, mask).
     """
     model.eval()

@@ -1,13 +1,15 @@
 """
 ResNet Object Detector Architecture.
 
-Provides the Stage 1 ObjectDetectorResNet model for multi-object bounding box localization
-and confidence prediction (N=24 fixed output slots).
+Provides the Stage 5 Single-Stage Unified ObjectDetectorResNet model for simultaneous
+multi-object bounding box localization, objectness scoring, and class recognition
+using a tri-head design (N=24 fixed output slots).
 
 Supported Presets:
-  - Nano  ('n'): 0.57M parameters (565,784)
-  - Small ('s'): 2.23M parameters (2,227,128) [Recommended]
-  - Medium('m'): 8.84M parameters (8,836,856) [Best Accuracy]
+  - Nano  ('n'): 0.71M parameters (711,296)
+  - Small ('s'): 2.52M parameters (2,517,024) [Recommended]
+  - Medium('m'): 9.42M parameters (9,415,520)
+  - Large ('l'): 19.99M parameters (19,989,088) [Best Accuracy]
 """
 import torch
 from torch import nn
@@ -48,10 +50,11 @@ class SimpleResBlock(nn.Module):
 
 class ObjectDetectorResNet(nn.Module):
     """
-    ResNet-style Object Detector for multi-object localization and presence scoring.
+    Single-Stage Unified ResNet Detector for multi-object localization, objectness scoring,
+    and character classification in a single forward pass.
 
-    Outputs (B, max_objects, 5 + num_classes) tensor containing box coordinates,
-    confidence, and class logits for each slot.
+    Outputs (B, max_objects, 5 + num_classes) tensor containing box coordinates [x, y, w, h],
+    objectness logit [obj], and class logits [cls_0 ... cls_N] for each output slot.
 
     Args:
         max_objects (int): Maximum number of predicted slots per scene. Default: 24.
@@ -61,15 +64,12 @@ class ObjectDetectorResNet(nn.Module):
         blocks (list[int] | None): Number of residual blocks in each layer.
     """
 
-    # Named size presets: (stem_out, [layer1..4 channels], [block1..4]. default_pool_size)
-    # Currently the pool size is 2 for all the model classes; for the further experimentation it can be changed to
-    # an incremental approach as per the model size for which the width of the models will be reduced to some extent
-    # in order to keep them comparable and also to avoid the bloating.
+    # Named size presets: (stem_out, [layer1..4 channels], [block1..4], default_pool_size)
     CONFIGS = {
-        "n": (32, [32,  64,  64,  128], [1,1,1,1], 2),   # Nano   ~0.57M params
-        "s": (64, [64,  128, 128, 256], [1,1,1,1], 2),   # Small  ~2.23M params (default)
-        "m": (64, [128, 256, 256, 512], [1,1,1,1], 2),   # Medium ~8.84M params
-        "l": (64, [128,256,384,512], [2,2,2,2], 2),
+        "n": (32, [32,  64,  64,  128], [1,1,1,1], 2),   # Nano   ~0.71M params
+        "s": (64, [64,  128, 128, 256], [1,1,1,1], 2),   # Small  ~2.52M params (default)
+        "m": (64, [128, 256, 256, 512], [1,1,1,1], 2),   # Medium ~9.42M params
+        "l": (64, [128, 256, 384, 512], [2,2,2,2], 2),   # Large  ~19.99M params
     }
 
     def __init__(

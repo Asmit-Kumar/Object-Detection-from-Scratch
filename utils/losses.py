@@ -66,33 +66,31 @@ def mean_iou(pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> float:
 # ── Detection Loss ────────────────────────────────────────────────────────────
 
 class DetectionLoss(nn.Module):
-    """Confidence-aware detection loss for multi-object localisation.
+    """Unified tri-head detection loss for multi-object localization, objectness scoring,
+    and character classification.
 
     For each image in the batch:
       1. **Hungarian match** — assign each GT box to the predicted slot that
-         minimises the overall IoU cost (via ``scipy.optimize.linear_sum_assignment``).
+         minimizes the joint cost combining IoU distance and classification score
+         (via ``scipy.optimize.linear_sum_assignment``).
       2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) pairs.
-      3. **Conf loss (BCE)** — ``BCEWithLogitsLoss`` on all slots; matched slots
-         get target ``1.0``, background slots get ``0.0``.
+      3. **Objectness loss (BCE)** — ``BCEWithLogitsLoss`` on all slots; matched slots
+         get target ``1.0``, background slots get ``0.0``, scaled by ``pos_weight``.
+      4. **Class loss (CE)** — ``CrossEntropyLoss`` computed exclusively on matched slots.
 
-    Total loss = box_loss + ``lambda_conf`` * conf_loss + ``lambda_class`` * class_loss
+    Total loss = box_loss + ``lambda_conf`` * obj_loss + ``lambda_class`` * class_loss
 
     Args:
-        lambda_conf : Weight for the confidence loss term. Default ``1.0``.
-        delta       : Huber loss delta (transition point). Default ``1.0``.
-        lambda_class : Weight for the classification loss. Default ``1.0``.
+        lambda_conf  : Weight for the objectness confidence loss term. Default ``1.0``.
+        delta        : Huber loss delta (transition point). Default ``1.0``.
+        lambda_class : Weight for the classification loss term. Default ``1.0``.
+        pos_weight   : Positive class weight scalar for objectness BCE loss. Default ``2.0``.
 
     Inputs:
         outputs : ``Tensor (B, MAX_OBJECTS, 5 + num_classes)``
                   Last dim: ``[x, y, w, h, conf_logit, class_logits...]``.
         boxes   : ``list[Tensor(N_gt, 4)]`` — GT boxes per image in ``[x, y, w, h]``.
         labels  : ``Tensor (B, max_gt)`` — GT class ids aligned with ``boxes``.
-
-    Note:
-        - ``conf_logit`` is a raw logit; apply ``sigmoid`` at inference to get
-          a probability and filter with a confidence threshold.
-        - If confidence collapses to all-zeros, try increasing ``lambda_conf``
-          or setting ``pos_weight`` in ``BCEWithLogitsLoss``.
     """
 
     def __init__(
