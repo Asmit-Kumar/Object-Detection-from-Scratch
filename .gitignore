@@ -38,7 +38,11 @@ extract_nb_images.py
 scripts/eval_diagnostics.py
 scripts/extract_nb_image.py
 scripts/extract_run_metrics.py
+scripts/check_crop_alignment.py
+scripts/compare_matching_modes.py
+result/large.png
 archive/
 
 # Private experiment log
 INSIGHTS.md
+insights/
