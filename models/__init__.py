@@ -6,7 +6,7 @@ Usage
 # Named size preset (recommended)
 from models import get_detector, get_classifier
 
-detector   = get_detector(size="m", max_objects=24)
+detector   = get_detector(size="s")
 classifier = get_classifier(num_classes=62)
 
 # Direct class import (still works)
@@ -26,45 +26,42 @@ __all__ = [
     "load_detector",
     "load_classifier",
 ]
-
+S = 14
 
 # ---------------------------------------------------------------------------
 # Getter functions
 # ---------------------------------------------------------------------------
 
-def get_detector(size: str = "s", max_objects: int = 24, **kwargs) -> ObjectDetectorResNet:
+def get_detector(size: str = "s", **kwargs) -> ObjectDetectorResNet:
     """Return an ObjectDetectorResNet for the given size preset.
 
     Size presets
     ------------
-    n  — nano   : channels [32,  64,  64,  128]  ~0.71M params
-    s  — small  : channels [64,  128, 128, 256]  ~2.52M params (default / recommended)
-    m  — medium : channels [128, 256, 256, 512]  ~9.42M params
-    l  — large  : channels [128, 256, 384, 512]  ~19.99M params (best accuracy)
+    n  — nano   : channels [32,  64,  64,  128]  ~0.39M params
+    s  — small  : channels [64,  128, 128, 256]  ~1.55M params (default / recommended)
+    m  — medium : channels [128, 256, 256, 512]  ~6.18M params
+    l  — large  : channels [128, 256, 384, 512]  ~16.75M params
 
     Any kwarg accepted by ObjectDetectorResNet can override the preset, e.g.::
 
-        get_detector("n", max_objects=32)
+        get_detector("n")
         get_detector("s", channels=[64, 64, 128, 128])   # custom channels
 
     Args:
         size:        One of ``"n"``, ``"s"``, ``"m"``, ``"l"``. Case-insensitive.
-        max_objects: Maximum predicted slots. Default 24.
         **kwargs:    Forwarded to ObjectDetectorResNet.
-                     Notable: ``channels=[...]`` to override preset widths,
-                     ``pool_size=1`` or ``pool_size=2`` (default) to control
-                     the AdaptiveAvgPool2d size before the FC head.
+                     Notable: ``channels=[...]`` to override preset widths.
     """
     size = size.lower()
     if size not in ObjectDetectorResNet.CONFIGS:
         raise ValueError(f"Unknown size '{size}'. Choose from: {list(ObjectDetectorResNet.CONFIGS)}")
 
-    _, preset_channels, preset_blocks, preset_pool_size = ObjectDetectorResNet.CONFIGS[size]
+    _, preset_channels, preset_blocks, _ = ObjectDetectorResNet.CONFIGS[size]
     channels = kwargs.pop("channels", preset_channels)   # caller can override
     blocks = kwargs.pop("blocks", preset_blocks)         # caller can override
-    kwargs.setdefault("pool_size", preset_pool_size)
+    kwargs.pop("pool_size", None)
 
-    return ObjectDetectorResNet(max_objects=max_objects, channels=channels, blocks=blocks, **kwargs)
+    return ObjectDetectorResNet(channels=channels, blocks=blocks, **kwargs)
 
 
 def get_classifier(num_classes: int = 62, **kwargs) -> CharacterClassifierResNet:
@@ -81,17 +78,16 @@ def get_classifier(num_classes: int = 62, **kwargs) -> CharacterClassifierResNet
 # Weight loaders (convenience — load weights from disk)
 # ---------------------------------------------------------------------------
 
-def load_detector(path: str, device, size: str = "m", max_objects: int = 24, **kwargs) -> ObjectDetectorResNet:
+def load_detector(path: str, device, size: str = "m", **kwargs) -> ObjectDetectorResNet:
     """Instantiate and load ObjectDetectorResNet weights from *path*.
 
     Args:
         path:        Path to a ``.pth`` state-dict file.
         device:      ``torch.device`` to map weights onto.
         size:        Size preset used when the model was trained ("n", "s", "m", "l"). Default ``"m"``.
-        max_objects: Must match the value used during training.
         **kwargs:    Forwarded to ``get_detector``.
     """
-    model = get_detector(size=size, max_objects=max_objects, **kwargs).to(device)
+    model = get_detector(size=size, **kwargs).to(device)
     state_dict = torch.load(path, map_location=device, weights_only=True)
     state_dict = state_dict.get('model_state_dict', state_dict) if isinstance(state_dict, dict) else state_dict
     model.load_state_dict(state_dict, strict=False)

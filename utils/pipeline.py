@@ -203,7 +203,7 @@ class DetectionPipeline:
         """
         Run end-to-end pipeline on a single image.
 
-        1. Stage 1: Detector output (24 slots) -> filter confidence >= conf_threshold.
+        1. Stage 1: Detector output -> filter confidence >= conf_threshold.
         2. Stage 2: Parallel crop extraction -> single-pass batched classifier pass.
         3. Returns List[DetectionResult].
         """
@@ -213,8 +213,9 @@ class DetectionPipeline:
         img_tensor = self._preprocess_image_input(image_input)  # (1, 1, 224, 224)
 
         # Stage 1: Detector
-        det_output = self.detector(img_tensor)  # (1, N, 5)
-        det_output = det_output.squeeze(0)  # (N, 5)
+        det_output = self.detector(img_tensor)  # (1, N, 5) or (1, S, S, 5+C)
+        det_output = det_output.squeeze(0)
+        det_output = det_output.reshape(-1, det_output.shape[-1])  # (N, 5+C)
 
         boxes = det_output[:, :4]  # (N, 4)
         logits = det_output[:, 4]  # (N,)
@@ -282,14 +283,14 @@ class DetectionPipeline:
         B = images_tensor.shape[0]
 
         # Stage 1: Detector Batch Forward Pass
-        det_outputs = self.detector(images_tensor)  # (B, N, 5)
+        det_outputs = self.detector(images_tensor)  # (B, N, 5) or (B, S, S, 5+C)
 
         batch_crops = []
         batch_crop_metadata = []  # (batch_idx, bbox, det_conf)
 
         for b in range(B):
             img_single = images_tensor[b]
-            det_output = det_outputs[b]  # (N, 5)
+            det_output = det_outputs[b].reshape(-1, det_outputs.shape[-1])  # (N, 5+C)
 
             boxes = det_output[:, :4]
             confs = torch.sigmoid(det_output[:, 4])
@@ -347,14 +348,7 @@ class DetectionPipeline:
         matching_mode: str = "hungarian",
     ) -> Dict[str, float]:
         """
-        Evaluate end-to-end detection and classification metrics on a DataLoader:
-          - Detector Precision, Recall, F1
-          - Character Classifier Accuracy (on correctly localized IoU >= 0.50 boxes)
-          - End-to-End Precision, Recall, F1 (requires BOTH box IoU >= 0.50 AND correct character label)
-
-        matching_mode:
-          - 'hungarian': Hungarian bipartite matching via scipy.optimize.linear_sum_assignment (matches detector training loss).
-          - 'greedy': Confidence-sorted greedy IoU matching (standard COCO / VOC evaluation protocol).
+        Evaluate end-to-end detection and classification metrics on a DataLoader.
         """
         if conf_threshold is None:
             conf_threshold = self.conf_threshold
@@ -366,14 +360,22 @@ class DetectionPipeline:
         correct_chars_on_matched_boxes = 0
 
         t0 = time.time()
-        for images, gt_boxes_batch, gt_labels_batch, gt_mask_batch in loader:
+        for batch in loader:
+            images = batch[0]
             batch_results = self.predict_batch(images, conf_threshold=conf_threshold)
 
             for b in range(len(batch_results)):
                 preds = batch_results[b]
-                mask = gt_mask_batch[b]
-                gt_boxes = gt_boxes_batch[b][mask].cpu().numpy()  # (M, 4)
-                gt_labels = gt_labels_batch[b][mask].cpu().numpy()  # (M,)
+                if len(batch) == 4:
+                    gt_boxes_batch, gt_labels_batch, gt_mask_batch = batch[1], batch[2], batch[3]
+                    mask = gt_mask_batch[b]
+                    gt_boxes = gt_boxes_batch[b][mask].cpu().numpy()  # (M, 4)
+                    gt_labels = gt_labels_batch[b][mask].cpu().numpy()  # (M,)
+                else:  # (images, targets, labels) grid format
+                    targets_batch, gt_labels_grid = batch[1], batch[2]
+                    gt_obj = targets_batch[b, ..., 4].bool()
+                    gt_boxes = targets_batch[b, ..., :4][gt_obj].cpu().numpy()
+                    gt_labels = gt_labels_grid[b][gt_obj].cpu().numpy()
 
                 n_gt = len(gt_boxes)
                 total_gt_boxes += n_gt

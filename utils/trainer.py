@@ -337,7 +337,7 @@ def train_one_epoch_detection(
             t_start = time.perf_counter()
 
         try:
-            images, boxes, labels, mask = next(loader_iter)
+            images, targets, labels = next(loader_iter)
         except StopIteration:
             break
 
@@ -346,9 +346,8 @@ def train_one_epoch_detection(
             t_data = time.perf_counter()
 
         images = images.to(device, non_blocking=True)
-        boxes = boxes.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
 
         if is_timing:
             torch.cuda.synchronize()
@@ -362,7 +361,7 @@ def train_one_epoch_detection(
         with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
             outputs = model(images)
             if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
-            loss = criterion(outputs, boxes, mask, labels)
+            loss = criterion(outputs, targets, labels)
             if is_timing: torch.cuda.synchronize(); t2 = time.perf_counter()
 
         prev_scale = scaler.get_scale() if scaler is not None else None
@@ -381,16 +380,12 @@ def train_one_epoch_detection(
             if clip_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
             optimizer.step()
-            
-        epoch_match_ratio += getattr(criterion, 'last_matched_ratio', 1.0)
 
         if is_timing:
             torch.cuda.synchronize()
             t4 = time.perf_counter()
             print(
                 f"Batch {n_batches+1:2d} | "
-                f"match={getattr(criterion, 'last_matched_ratio', 1.0):.2f} "
-                f"hungar={getattr(criterion, 'last_hungarian_time', 0.0):.1f}ms "
                 f"data={(t_data-t_start)*1000:.1f}ms "
                 f"pad={(t_pad-t_data)*1000:.1f}ms "
                 f"forward={(t1-t0)*1000:.1f}ms "
@@ -412,13 +407,9 @@ def train_one_epoch_detection(
         if wandb is not None and wandb.run is not None:
             wandb.log({
                 "train/batch_loss": loss.item(),
-                "train/match_ratio": getattr(criterion, 'last_matched_ratio', 1.0)
             })
 
         n_batches += 1
-
-    if hasattr(criterion, 'last_matched_ratio'):
-        print(f"  --> Epoch Average Match Ratio: {epoch_match_ratio / n_batches:.4f}")
 
     return epoch_loss / n_batches
 
@@ -444,7 +435,7 @@ def evaluate_detection(
               AND correct character class prediction.
 
     For full P/R/F1 threshold sweeps, use ``evaluate_detection_sweep()``.
-    Expects loader to yield (images, boxes, labels, mask).
+    Expects loader to yield (images, targets, labels).
     """
     model.eval()
     total_loss = 0.0
@@ -460,43 +451,41 @@ def evaluate_detection(
     use_amp = device.type == "cuda"
 
     with torch.no_grad():
-        for images, boxes, labels, mask in loader:
+        for images, targets, labels in loader:
             images = images.to(device, non_blocking=True)
-            boxes = boxes.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
                     outputs = model(images)
-                    loss = criterion(outputs, boxes, mask, labels)
+                    loss = criterion(outputs, targets, labels)
             else:
                 outputs = model(images)
-                loss = criterion(outputs, boxes, mask, labels)
+                loss = criterion(outputs, targets, labels)
 
             total_loss += loss.item()
 
-            pred_boxes = outputs[..., :4].float()
-            pred_conf = torch.sigmoid(outputs[..., 4].float())
-            pred_class = outputs[..., 5:]
-            if pred_class.size(-1) == 0:
+            gt_obj = targets[..., 4].bool()
+            gt_bxs = targets[..., :4]
+            pred_conf_grid = torch.sigmoid(outputs[..., 4].float())
+            pred_boxes_grid = outputs[..., :4].float()
+            pred_class_grid = outputs[..., 5:].float()
+            if pred_class_grid.size(-1) == 0:
                 raise ValueError(
                     "evaluate_detection requires model outputs with class logits."
                 )
-            pred_labels = pred_class.float().argmax(dim=-1)
+            pred_labels_grid = pred_class_grid.argmax(dim=-1)
 
-            iou = _pairwise_iou(pred_boxes, boxes)  # (B, N_pred, max_gt)
-            iou_masked = iou.masked_fill(~mask.unsqueeze(1), -1.0)
-            matched_iou = iou_masked.max(dim=1).values  # (B, max_gt)
-
-            conf_np = pred_conf.cpu().numpy()
-            iou_np = iou.cpu().numpy()
-            mask_np = mask.cpu().numpy()
-            labels_np = labels.cpu().numpy()
-            pred_labels_np = pred_labels.cpu().numpy()
+            pred_conf_np = pred_conf_grid.cpu().numpy()
+            pred_boxes_np = pred_boxes_grid.cpu().numpy()
+            pred_labels_np = pred_labels_grid.cpu().numpy()
+            gt_obj_np = gt_obj.cpu().numpy()
+            gt_bxs_np = gt_bxs.cpu().numpy()
+            gt_labels_np = labels.cpu().numpy()
 
             if confusion_matrix is None:
-                num_classes = pred_class.size(-1)
+                num_classes = pred_class_grid.size(-1)
                 confusion_matrix = np.zeros(
                     (num_classes, num_classes), dtype=np.int64
                 )
@@ -505,40 +494,50 @@ def evaluate_detection(
                 per_class_e2e_fn = np.zeros(num_classes, dtype=np.int64)
 
             for b in range(images.size(0)):
-                b_mask = mask_np[b]
-                n_gt = int(b_mask.sum())
-                valid_gt_indices = np.flatnonzero(b_mask)
-                if n_gt > 0:
-                    total_iou += matched_iou[b, mask[b]].mean().item()
-                    n_images += 1
+                pos_mask_b = gt_obj_np[b]
+                n_gt = int(pos_mask_b.sum())
+                gt_boxes_b = gt_bxs_np[b][pos_mask_b]
+                gt_labels_b = gt_labels_np[b][pos_mask_b]
 
-                pr_idx = np.where(conf_np[b] > conf_threshold)[0]
+                conf_flat = pred_conf_np[b].flatten()
+                boxes_flat = pred_boxes_np[b].reshape(-1, 4)
+                pred_lbl_flat = pred_labels_np[b].flatten()
+
+                if n_gt > 0:
+                    iou_np_b = _pairwise_iou(
+                        torch.from_numpy(boxes_flat),
+                        torch.from_numpy(gt_boxes_b)
+                    ).numpy()
+                    total_iou += float(iou_np_b.max(axis=0).mean())
+                    n_images += 1
+                else:
+                    iou_np_b = np.zeros((len(conf_flat), 0), dtype=np.float32)
+
+                pr_idx = np.where(conf_flat > conf_threshold)[0]
                 if len(pr_idx) == 0:
                     fn += n_gt
                     e2e_fn += n_gt
-                    for gi in valid_gt_indices:
-                        per_class_e2e_fn[int(labels_np[b, gi])] += 1
+                    for gi in range(n_gt):
+                        per_class_e2e_fn[int(gt_labels_b[gi])] += 1
                     continue
 
-                order = pr_idx[np.argsort(-conf_np[b][pr_idx])]
-                sub_iou = iou_np[b][:, valid_gt_indices]
+                order = pr_idx[np.argsort(-conf_flat[pr_idx])]
                 matched = set()
 
                 for i in order:
                     if n_gt == 0:
                         fp += 1
                         e2e_fp += 1
-                        per_class_e2e_fp[int(pred_labels_np[b, i])] += 1
+                        per_class_e2e_fp[int(pred_lbl_flat[i])] += 1
                         continue
 
-                    j = int(np.argmax(sub_iou[i]))
-                    if sub_iou[i, j] >= iou_threshold and j not in matched:
+                    j = int(np.argmax(iou_np_b[i]))
+                    if iou_np_b[i, j] >= iou_threshold and j not in matched:
                         matched.add(j)
                         tp += 1
 
-                        gt_index = valid_gt_indices[j]
-                        gt_label = int(labels_np[b, gt_index])
-                        pred_label = int(pred_labels_np[b, i])
+                        gt_label = int(gt_labels_b[j])
+                        pred_label = int(pred_lbl_flat[i])
                         if not 0 <= gt_label < confusion_matrix.shape[0]:
                             raise ValueError(
                                 f"Ground-truth class {gt_label} is outside the "
@@ -559,33 +558,32 @@ def evaluate_detection(
                     else:
                         fp += 1
                         e2e_fp += 1
-                        per_class_e2e_fp[int(pred_labels_np[b, i])] += 1
+                        per_class_e2e_fp[int(pred_lbl_flat[i])] += 1
 
                 fn += n_gt - len(matched)
                 e2e_fn += n_gt - len(matched)
                 for local_j in set(range(n_gt)) - matched:
-                    gi = valid_gt_indices[local_j]
-                    per_class_e2e_fn[int(labels_np[b, gi])] += 1
+                    per_class_e2e_fn[int(gt_labels_b[local_j])] += 1
 
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = (
+    precision = float(tp / (tp + fp)) if (tp + fp) else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) else 0.0
+    f1 = float(
         2 * precision * recall / (precision + recall)
         if (precision + recall)
         else 0.0
     )
-    e2e_precision = (
+    e2e_precision = float(
         e2e_tp / (e2e_tp + e2e_fp) if (e2e_tp + e2e_fp) else 0.0
     )
-    e2e_recall = e2e_tp / (e2e_tp + e2e_fn) if (e2e_tp + e2e_fn) else 0.0
-    e2e_f1 = (
+    e2e_recall = float(e2e_tp / (e2e_tp + e2e_fn)) if (e2e_tp + e2e_fn) else 0.0
+    e2e_f1 = float(
         2 * e2e_precision * e2e_recall / (e2e_precision + e2e_recall)
         if (e2e_precision + e2e_recall)
         else 0.0
     )
 
-    avg_loss = total_loss / len(loader)
-    mean_iou = total_iou / max(n_images, 1)
+    avg_loss = float(total_loss / len(loader))
+    mean_iou = float(total_iou / max(n_images, 1))
 
     per_class = {}
     if confusion_matrix is not None:
@@ -604,15 +602,15 @@ def evaluate_detection(
             )
 
             class_metrics = {
-                "accuracy": class_hits / class_count if class_count else 0.0,
+                "accuracy": float(class_hits / class_count) if class_count else 0.0,
                 "correct":  class_hits,
                 "total":    class_count,
                 "e2e_tp":        e2e_tp_k,
                 "e2e_fp":        e2e_fp_k,
                 "e2e_fn":        e2e_fn_k,
-                "e2e_precision": round(e2e_p_k,  4),
-                "e2e_recall":    round(e2e_r_k,  4),
-                "e2e_f1":        round(e2e_f1_k, 4),
+                "e2e_precision": round(float(e2e_p_k),  4),
+                "e2e_recall":    round(float(e2e_r_k),  4),
+                "e2e_f1":        round(float(e2e_f1_k), 4),
             }
             if class_names is not None and class_idx < len(class_names):
                 class_metrics["name"] = class_names[class_idx]
@@ -625,12 +623,12 @@ def evaluate_detection(
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
         },
         "classification": {
-            "accuracy": class_correct / class_total if class_total else 0.0,
+            "accuracy": float(class_correct / class_total) if class_total else 0.0,
             "per_class": per_class,
             "confusion_matrix": (
                 confusion_matrix.tolist() if confusion_matrix is not None else []
@@ -640,9 +638,9 @@ def evaluate_detection(
             "precision": e2e_precision,
             "recall": e2e_recall,
             "f1": e2e_f1,
-            "tp": e2e_tp,
-            "fp": e2e_fp,
-            "fn": e2e_fn,
+            "tp": int(e2e_tp),
+            "fp": int(e2e_fp),
+            "fn": int(e2e_fn),
         },
     }
 
@@ -668,7 +666,7 @@ def evaluate_detection_sweep(
 
     Args:
         model:             Trained detection model.
-        loader:            Test DataLoader (yields images, boxes, labels, mask).
+        loader:            Test DataLoader (yields images, targets, labels).
         device:            torch.device.
         conf_thresholds:   Iterable of confidence thresholds to sweep.
         iou_threshold:     IoU threshold for a TP match.
@@ -689,11 +687,10 @@ def evaluate_detection_sweep(
     num_classes = None
 
     with torch.no_grad():
-        for images, boxes, labels, mask in loader:
+        for images, targets, labels in loader:
             images = images.to(device, non_blocking=True)
-            boxes  = boxes.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            mask   = mask.to(device, non_blocking=True)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
@@ -701,31 +698,44 @@ def evaluate_detection_sweep(
             else:
                 outputs = model(images)
 
-            pred_boxes  = outputs[..., :4].float()
-            pred_conf   = torch.sigmoid(outputs[..., 4].float())
-            pred_class  = outputs[..., 5:]
-            pred_labels = pred_class.float().argmax(dim=-1)
-            iou         = _pairwise_iou(pred_boxes, boxes)
+            pred_conf_grid   = torch.sigmoid(outputs[..., 4].float())
+            pred_boxes_grid  = outputs[..., :4].float()
+            pred_class_grid  = outputs[..., 5:].float()
+            pred_labels_grid = pred_class_grid.argmax(dim=-1)
+            gt_obj = targets[..., 4].bool()
+            gt_bxs = targets[..., :4]
 
             if num_classes is None:
-                num_classes = pred_class.size(-1)
+                num_classes = pred_class_grid.size(-1)
 
-            pred_conf_np   = pred_conf.cpu().numpy()
-            iou_np         = iou.cpu().numpy()
-            mask_np        = mask.cpu().numpy()
-            labels_np      = labels.cpu().numpy()
-            pred_labels_np = pred_labels.cpu().numpy()
+            pred_conf_np   = pred_conf_grid.cpu().numpy()
+            pred_boxes_np  = pred_boxes_grid.cpu().numpy()
+            pred_labels_np = pred_labels_grid.cpu().numpy()
+            gt_obj_np      = gt_obj.cpu().numpy()
+            gt_bxs_np      = gt_bxs.cpu().numpy()
+            gt_labels_np   = labels.cpu().numpy()
 
             for b in range(images.size(0)):
-                gt_valid = mask_np[b]
-                n_gt = int(gt_valid.sum())
+                pos_b = gt_obj_np[b]
+                n_gt = int(pos_b.sum())
                 if n_gt == 0:
                     continue
-                gt_labels_b  = labels_np[b][gt_valid]
+                gt_boxes_b  = gt_bxs_np[b][pos_b]
+                gt_labels_b = gt_labels_np[b][pos_b]
+
+                conf_flat   = pred_conf_np[b].flatten()
+                boxes_flat  = pred_boxes_np[b].reshape(-1, 4)
+                lbl_flat    = pred_labels_np[b].flatten()
+
+                iou_b = _pairwise_iou(
+                    torch.from_numpy(boxes_flat),
+                    torch.from_numpy(gt_boxes_b)
+                ).numpy()
+
                 records.append((
-                    pred_conf_np[b],
-                    iou_np[b][:, gt_valid],
-                    pred_labels_np[b],
+                    conf_flat,
+                    iou_b,
+                    lbl_flat,
                     gt_labels_b,
                     n_gt,
                 ))
@@ -831,10 +841,9 @@ def evaluate_density_sweep(
     records = []
     
     with torch.no_grad():
-        for images, boxes, labels, mask in loader:
+        for images, targets, labels in loader:
             images = images.to(device, non_blocking=True)
-            boxes  = boxes.to(device, non_blocking=True)
-            mask   = mask.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
@@ -842,22 +851,33 @@ def evaluate_density_sweep(
             else:
                 outputs = model(images)
 
-            pred_boxes = outputs[..., :4].float()
-            pred_conf  = torch.sigmoid(outputs[..., 4].float())
-            iou        = _pairwise_iou(pred_boxes, boxes)
-            
-            pred_conf_np = pred_conf.cpu().numpy()
-            iou_np       = iou.cpu().numpy()
-            mask_np      = mask.cpu().numpy()
+            pred_boxes_grid = outputs[..., :4].float()
+            pred_conf_grid  = torch.sigmoid(outputs[..., 4].float())
+            gt_obj = targets[..., 4].bool()
+            gt_bxs = targets[..., :4]
+
+            pred_conf_np  = pred_conf_grid.cpu().numpy()
+            pred_boxes_np = pred_boxes_grid.cpu().numpy()
+            gt_obj_np     = gt_obj.cpu().numpy()
+            gt_bxs_np     = gt_bxs.cpu().numpy()
 
             for b in range(images.size(0)):
-                gt_valid = mask_np[b]
-                n_gt = int(gt_valid.sum())
+                pos_b = gt_obj_np[b]
+                n_gt = int(pos_b.sum())
                 if n_gt == 0:
                     continue
+                gt_boxes_b = gt_bxs_np[b][pos_b]
+                conf_flat  = pred_conf_np[b].flatten()
+                boxes_flat = pred_boxes_np[b].reshape(-1, 4)
+
+                iou_b = _pairwise_iou(
+                    torch.from_numpy(boxes_flat),
+                    torch.from_numpy(gt_boxes_b)
+                ).numpy()
+
                 records.append((
-                    pred_conf_np[b],
-                    iou_np[b][:, gt_valid],
+                    conf_flat,
+                    iou_b,
                     n_gt
                 ))
 

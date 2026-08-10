@@ -29,6 +29,7 @@ except ImportError:
     _TORCHVISION_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).resolve().parent.parent / 'data' / 'OD'
+S = 14 # Grid size for grid based detection
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -322,22 +323,27 @@ class DetectionDataset(Dataset):
     @staticmethod
     def collate_fn(batch):
         images = torch.stack([r.image for r in batch])
-        max_gt = max((r.boxes.size(0) for r in batch), default=0)
         B = len(batch)
-        
-        boxes = torch.zeros((B, max_gt, 4), dtype=torch.float32)
-        labels = torch.zeros((B, max_gt), dtype=torch.int64)
-        mask = torch.zeros((B, max_gt), dtype=torch.bool)
-        
-        for i, r in enumerate(batch):
-            n = r.boxes.size(0)
-            if n > 0:
-                boxes[i, :n] = r.boxes
-                labels[i, :n] = r.labels
-                mask[i, :n] = True
-                
-        return images, boxes, labels, mask
 
+        targets = torch.zeros(B, S, S, 5, dtype=torch.float32)
+        labels = torch.zeros(B, S, S, dtype=torch.int64)
+        _, h, w = batch[0].image.shape
+        cell_w = w / S
+        cell_h = h / S
+
+        for i, r in enumerate(batch):
+            for b, l in zip(r.boxes, r.labels):
+                cx = b[0] + b[2] / 2
+                cy = b[1] + b[3] / 2
+
+                gx = int(cx // cell_w)
+                gy = int(cy // cell_h)
+
+                targets[i, gy, gx, :4] = b
+                targets[i, gy, gx, 4] = 1.0
+                labels[i, gy, gx] = l
+
+        return images, targets, labels
 
 
 def get_detection_loaders(

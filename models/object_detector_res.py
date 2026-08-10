@@ -1,15 +1,15 @@
 """
 ResNet Object Detector Architecture.
 
-Provides the Stage 5 Single-Stage Unified ObjectDetectorResNet model for simultaneous
+Provides the Stage 6 Single-Stage Unified ObjectDetectorResNet model for simultaneous
 multi-object bounding box localization, objectness scoring, and class recognition
-using a tri-head design (N=24 fixed output slots).
+using an anchor-free $14 \times 14$ spatial grid head.
 
 Supported Presets:
-  - Nano  ('n'): 0.71M parameters (711,296)
-  - Small ('s'): 2.52M parameters (2,517,024) [Recommended]
-  - Medium('m'): 9.42M parameters (9,415,520)
-  - Large ('l'): 19.99M parameters (19,989,088) [Best Accuracy]
+  - Nano  ('n'): 0.39M parameters (392,788)
+  - Small ('s'): 1.55M parameters (1,553,524) [Recommended]
+  - Medium('m'): 6.18M parameters (6,178,996)
+  - Large ('l'): 16.75M parameters (16,752,564)
 """
 import torch
 from torch import nn
@@ -53,28 +53,26 @@ class ObjectDetectorResNet(nn.Module):
     Single-Stage Unified ResNet Detector for multi-object localization, objectness scoring,
     and character classification in a single forward pass.
 
-    Outputs (B, max_objects, 5 + num_classes) tensor containing box coordinates [x, y, w, h],
-    objectness logit [obj], and class logits [cls_0 ... cls_N] for each output slot.
+    Outputs (B, 14, 14, 5 + num_classes) spatial tensor containing box coordinates [x, y, w, h],
+    objectness logit [obj], and class logits [cls_0 ... cls_N] for each spatial cell.
 
     Args:
-        max_objects (int): Maximum number of predicted slots per scene. Default: 24.
         channels (list[int] | None): Channel width list for the 4 residual layers.
-        pool_size (int): Adaptive average pooling grid size before FC head. Default: 2 (2x2 grid).
         num_classes (int): Number of class logits per slot. Default: 47.
         blocks (list[int] | None): Number of residual blocks in each layer.
     """
 
     # Named size presets: (stem_out, [layer1..4 channels], [block1..4], default_pool_size)
     CONFIGS = {
-        "n": (32, [32,  64,  64,  128], [1,1,1,1], 2),   # Nano   ~0.71M params
-        "s": (64, [64,  128, 128, 256], [1,1,1,1], 2),   # Small  ~2.52M params (default)
-        "m": (64, [128, 256, 256, 512], [1,1,1,1], 2),   # Medium ~9.42M params
-        "l": (64, [128, 256, 384, 512], [2,2,2,2], 2),   # Large  ~19.99M params
+        "n": (32, [32,  64,  64,  128], [1,1,1,1], 14),   # Nano   ~0.39M params
+        "s": (64, [64,  128, 128, 256], [1,1,1,1], 14),   # Small  ~1.55M params (default)
+        "m": (64, [128, 256, 256, 512], [1,1,1,1], 14),   # Medium ~6.18M params
+        "l": (64, [128, 256, 384, 512], [2,2,2,2], 14),   # Large  ~16.75M params
     }
 
     def __init__(
-            self, max_objects: int = 24, channels: list[int] | None = None,
-            pool_size: int = 2, num_classes: int = 47, blocks: list[int] | None = None
+            self, channels: list[int] | None = None,
+            num_classes: int = 47, blocks: list[int] | None = None
     ):
         super().__init__()
         if channels is None:
@@ -90,7 +88,6 @@ class ObjectDetectorResNet(nn.Module):
         assert len(blocks) == 4, "blocks must have exactly 4 entries (one per res-layer)"
         assert all(n >= 1 for n in blocks), "each res-layer must contain at least one block"
 
-        self.max_objects = max_objects
         self.num_classes = num_classes
 
         # Stem
@@ -103,25 +100,9 @@ class ObjectDetectorResNet(nn.Module):
         self.layer1 = self._make_layer(SimpleResBlock, c[0], blocks[0], stride=2)
         self.layer2 = self._make_layer(SimpleResBlock, c[1], blocks[1], stride=2)
         self.layer3 = self._make_layer(SimpleResBlock, c[2], blocks[2], stride=2)
-        self.layer4 = self._make_layer(SimpleResBlock, c[3], blocks[3], stride=2)
+        self.layer4 = self._make_layer(SimpleResBlock, c[3], blocks[3], stride=1)
 
-        self.avgpool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
-
-        # Shared FC head
-        shared_dim = c[3] * 2
-        head_dim   = shared_dim // 2
-        fc_in      = c[3] * pool_size * pool_size
-        self.shared_fc = nn.Sequential(
-            nn.Linear(fc_in, shared_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(shared_dim, head_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        # Branch heads
-        self.box_head = nn.Linear(head_dim, max_objects * 4)   # [x, y, w, h]
-        self.obj_head = nn.Linear(head_dim, max_objects * 1)   # confidence logit
-        self.class_head = nn.Linear(head_dim, max_objects * num_classes)
+        self.grid_head = nn.Conv2d(c[3], num_classes + 5, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -139,17 +120,10 @@ class ObjectDetectorResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        x = self.grid_head(x)
+        x = x.permute(0, 2, 3, 1)
 
-        shared = self.shared_fc(x)
-
-        boxes = self.box_head(shared).view(-1, self.max_objects, 4)
-        objectness = self.obj_head(shared).view(-1, self.max_objects, 1)
-
-        classes = self.class_head(shared).view(-1, self.max_objects, self.num_classes)
-
-        return torch.cat([boxes, objectness, classes], dim=-1)
+        return x
 
     def _make_layer(self, block, planes, blocks, stride=1):
         """Build one residual stage from the configured block count."""
@@ -163,8 +137,22 @@ class ObjectDetectorResNet(nn.Module):
 
 
 if __name__ == "__main__":
+    print("=== Model Configuration and Parameter Count ===")
     for size in ("n", "s", "m", "l"):
-        stem, ch, blocks, pool = ObjectDetectorResNet.CONFIGS[size]
-        m = ObjectDetectorResNet(channels=ch, blocks=blocks, pool_size=pool)
+        stem, ch, blocks, _ = ObjectDetectorResNet.CONFIGS[size]
+        m = ObjectDetectorResNet(channels=ch, blocks=blocks)
         n = sum(p.numel() for p in m.parameters())
-        print(f"  {size}  channels={ch}  params={n:,}   blocks={blocks}  pool={pool}")
+        print(f"  {size}  channels={ch}  params={n:,}   blocks={blocks}")
+
+        batch_size = 2
+        input_tensor = torch.randn(batch_size, 1, 224, 224)
+
+        print(f"Input shape: {input_tensor.shape}")
+        output = m(input_tensor)
+        print(f"Output shape: {output.shape}")
+        print(f"Expected shape: (B, H, W, {5 + m.num_classes}) - grid-based detection")
+
+        # Verify output shape correctness (grid-based: B, H, W, num_classes + 5)
+        assert output.shape[0] == batch_size, f"Batch size mismatch! Got {output.shape[0]}, expected {batch_size}"
+        assert output.shape[-1] == (5 + m.num_classes), f"Last dimension should be {5 + m.num_classes}, got {output.shape[-1]}"
+        print("✓ Forward pass test passed!\n")

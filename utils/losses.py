@@ -62,6 +62,39 @@ def mean_iou(pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> float:
     iou_mat = pairwise_iou(pred_boxes, target_boxes)  # (N, N)
     return iou_mat.diagonal().mean().item()
 
+def aligned_iou(
+    pred_boxes: torch.Tensor,
+    target_boxes: torch.Tensor,
+) -> torch.Tensor:
+    """Compute IoU for corresponding boxes in two equally shaped tensors.
+
+    Args:
+        pred_boxes: Tensor ``(..., 4)`` in ``[x, y, w, h]`` format.
+        target_boxes: Tensor ``(..., 4)`` in ``[x, y, w, h]`` format.
+
+    Returns:
+        Tensor ``(...)`` containing the IoU for each corresponding pair.
+    """
+    px1, py1 = pred_boxes[..., 0], pred_boxes[..., 1]
+    px2 = px1 + pred_boxes[..., 2]
+    py2 = py1 + pred_boxes[..., 3]
+
+    tx1, ty1 = target_boxes[..., 0], target_boxes[..., 1]
+    tx2 = tx1 + target_boxes[..., 2]
+    ty2 = ty1 + target_boxes[..., 3]
+
+    ix1 = torch.maximum(px1, tx1)
+    iy1 = torch.maximum(py1, ty1)
+    ix2 = torch.minimum(px2, tx2)
+    iy2 = torch.minimum(py2, ty2)
+
+    inter = torch.clamp(ix2 - ix1, min=0) * torch.clamp(iy2 - iy1, min=0)
+    pred_area = pred_boxes[..., 2] * pred_boxes[..., 3]
+    target_area = target_boxes[..., 2] * target_boxes[..., 3]
+    union = pred_area + target_area - inter
+
+    return inter / torch.clamp(union, min=1e-6)
+
 
 # ── Detection Loss ────────────────────────────────────────────────────────────
 
@@ -70,11 +103,10 @@ class DetectionLoss(nn.Module):
     and character classification.
 
     For each image in the batch:
-      1. **Hungarian match** — assign each GT box to the predicted slot that
-         minimizes the joint cost combining IoU distance and classification score
-         (via ``scipy.optimize.linear_sum_assignment``).
+      1. **Spatial Target Mapping** — assigns each GT box to the corresponding 
+         $14 \times 14$ grid cell based on its center coordinates during collate_fn.
       2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) pairs.
-      3. **Objectness loss (BCE)** — ``BCEWithLogitsLoss`` on all slots; matched slots
+      3. **Objectness loss (BCE)** — ``BCEWithLogitsLoss`` on all spatial slots; matched slots
          get target ``1.0``, background slots get ``0.0``, scaled by ``pos_weight``.
       4. **Class loss (CE)** — ``CrossEntropyLoss`` computed exclusively on matched slots.
 
@@ -87,7 +119,7 @@ class DetectionLoss(nn.Module):
         pos_weight   : Positive class weight scalar for objectness BCE loss. Default ``2.0``.
 
     Inputs:
-        outputs : ``Tensor (B, MAX_OBJECTS, 5 + num_classes)``
+        outputs : ``Tensor (B, 14, 14, 5 + num_classes)``
                   Last dim: ``[x, y, w, h, conf_logit, class_logits...]``.
         boxes   : ``list[Tensor(N_gt, 4)]`` — GT boxes per image in ``[x, y, w, h]``.
         labels  : ``Tensor (B, max_gt)`` — GT class ids aligned with ``boxes``.
@@ -99,110 +131,106 @@ class DetectionLoss(nn.Module):
         delta: float = 1.0,
         use_pos_weight: bool = False,
         lambda_class: float = 1.0,
+        lambda_iou: float = 1.0,
     ):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_class = lambda_class
+        self.lambda_iou = lambda_iou
         self.use_pos_weight = use_pos_weight
         self.huber = nn.HuberLoss(reduction='mean', delta=delta)
         self.bce   = nn.BCEWithLogitsLoss(reduction='mean')
         self.ce = nn.CrossEntropyLoss(reduction='mean')
 
     def forward(
-        self,
-        outputs: torch.Tensor,
-        padded_gt: torch.Tensor,
-        mask: torch.Tensor,
-        labels: torch.Tensor | None = None,
+            self,
+            outputs: torch.Tensor,
+            target_gt: torch.Tensor,
+            labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B = outputs.size(0)
-        device = outputs.device
-        
+
         pred_boxes = outputs[..., :4]
-        pred_conf  = outputs[..., 4]
+        pred_conf = outputs[..., 4]
         pred_class = outputs[..., 5:]
 
-        max_gt = padded_gt.size(1)
-        if max_gt == 0:
-            # Edge case: No objects in any image in the batch
-            obj_target = torch.zeros_like(pred_conf)
-            return self.lambda_conf * self.bce(pred_conf, obj_target)
+        gt_boxes = target_gt[..., :4]
+        gt_objectness = target_gt[..., 4]
 
-        # 2. Compute IoU for the whole batch -> (B, MAX_OBJECTS, max_gt)
-        iou = pairwise_iou(pred_boxes.detach(), padded_gt)
-        
-        # Mask out invalid GT slots so they don't get matched
-        iou.masked_fill_(~mask.unsqueeze(1), -1.0)
-        
-        # 3. Hungarian match: for each GT box, find the optimal predicted slot
-        # matched_idx: (B, max_gt)
-        iou_np = -iou.detach().cpu().numpy()
-        mask_np = mask.cpu().numpy()
-        matched_idx_np = np.zeros((B, max_gt), dtype=np.int64)
+        positive = gt_objectness.bool()
 
-        t0_hungarian = time.perf_counter()
-        for b in range(B):
-            valid = mask_np[b]
-            n_valid = valid.sum()
-            if n_valid == 0:
-                continue
-            valid_pos = valid.nonzero()[0]
-            if n_valid == 1:
-                matched_idx_np[b, valid_pos[0]] = iou_np[b][:, valid].argmin()
-                continue
-            cost = iou_np[b][:, valid]
-            pred_idx, gt_idx = linear_sum_assignment(cost)
-            matched_idx_np[b, valid_pos[gt_idx]] = pred_idx
-        t1_hungarian = time.perf_counter()
-        self.last_hungarian_time = (t1_hungarian - t0_hungarian) * 1000
+        if self.use_pos_weight:
+            n_pos = positive.sum()
+            n_cells = positive.numel()
 
-        matched_idx = torch.from_numpy(matched_idx_np).to(device)
-
-        if mask_np.any():
-            total_unique = sum(
-                len(np.unique(matched_idx_np[b][mask_np[b]]))
-                for b in range(B) if mask_np[b].any()
-            )
-            total_gt = mask_np.sum()
-            self.last_matched_ratio = total_unique / total_gt if total_gt > 0 else 1.0
+            if n_pos > 0:
+                pw = (n_cells - n_pos) / n_pos
+                pos_weight = torch.tensor(
+                    [pw],
+                    dtype=pred_conf.dtype,
+                    device=pred_conf.device,
+                )
+            else:
+                pos_weight = None
         else:
-            self.last_matched_ratio = 1.0
+            pos_weight = None
 
-        # 4. Box Loss (Huber)
-        # Gather the matched predicted boxes: (B, max_gt, 4)
-        gathered_boxes = torch.gather(pred_boxes, 1, matched_idx.unsqueeze(-1).expand(-1, -1, 4))
-        
-        if mask.any():
-            box_loss = self.huber(gathered_boxes[mask], padded_gt[mask])
+        conf_loss = F.binary_cross_entropy_with_logits(
+            pred_conf,
+            gt_objectness,
+            pos_weight=pos_weight,
+        )
+
+        if positive.any():
+            box_loss = self.huber(
+                pred_boxes[positive],
+                gt_boxes[positive],
+            )
         else:
             box_loss = outputs.new_tensor(0.0)
 
-        # 5. Confidence Loss (BCE)
-        obj_target = torch.zeros_like(pred_conf)
-        b_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, max_gt)
-        
-        # Scatter 1.0 into targets where GT exists
-        obj_target[b_idx[mask], matched_idx[mask]] = 1.0
+        iou = aligned_iou(pred_boxes, gt_boxes)
+        iou_loss = 1.0 - iou.mean()
 
-        if self.use_pos_weight:
-            n_pos = mask.sum()
-            n_slots = obj_target.numel()
-            if n_pos > 0:
-                pw = (n_slots - n_pos) / n_pos
-                pos_weight = torch.tensor([pw], dtype=pred_conf.dtype, device=device)
-            else:
-                pos_weight = None
-            conf_loss = F.binary_cross_entropy_with_logits(pred_conf, obj_target, pos_weight=pos_weight)
-        else:
-            conf_loss = self.bce(pred_conf, obj_target)
-
-        class_loss = outputs.new_tensor(0.0)
-        if labels is not None and mask.any():
-            gathered_class_logits = torch.gather(
-                pred_class,
-                1,
-                matched_idx.unsqueeze(-1).expand(-1, -1, pred_class.size(-1)),
+        if labels is not None and positive.any():
+            class_loss = self.ce(
+                pred_class[positive],
+                labels[positive],
             )
-            class_loss = self.ce(gathered_class_logits[mask], labels[mask].long())
+        else:
+            class_loss = outputs.new_tensor(0.0)
 
-        return box_loss + self.lambda_conf * conf_loss + self.lambda_class * class_loss
+        return (
+                (box_loss + self.lambda_iou * iou_loss)
+                + self.lambda_conf * conf_loss
+                + self.lambda_class * class_loss
+        )
+
+
+if __name__ == "__main__":
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LAMBDA_CONF = 1.0
+    NUM_CLASSES = 10
+    B = 2
+    
+    criterion = DetectionLoss(lambda_conf=LAMBDA_CONF, delta=1.0, use_pos_weight=True)
+    print('DetectionLoss ready.')
+
+    S = 14
+    NUM_CLASSES = 47
+    print(f"Creating sample inputs for batch of {B}...")
+
+    # dummy_out: (B, S, S, 5 + NUM_CLASSES)
+    dummy_out = torch.randn(B, S, S, 5 + NUM_CLASSES, device=DEVICE)
+    # target_gt: (B, S, S, 5) where last dim is [x, y, w, h, objectness]
+    target_gt = torch.zeros(B, S, S, 5, device=DEVICE)
+    # populate some random ground truth objects
+    target_gt[:, 3, 3, 4] = 1.0  # object at cell (3,3)
+    target_gt[:, 5, 5, 4] = 1.0  # object at cell (5,5)
+
+    # labels_v: (B, S, S)
+    labels_v = torch.randint(0, NUM_CLASSES, (B, S, S), device=DEVICE)
+
+    with torch.no_grad():
+        loss_val = criterion(dummy_out, target_gt, labels_v)
+    print(f'Smoke-test loss: {loss_val.item():.4f}')
