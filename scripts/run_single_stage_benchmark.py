@@ -32,18 +32,16 @@ from utils.dataset import get_detection_loaders
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
-SIZES = ['n', 's', 'm', 'l']
+SIZES = ['n', 's', 'm']
 SIZE_LABELS = {
-    'n': 'Nano (0.71M)',
-    's': 'Small (2.52M)',
-    'm': 'Medium (9.42M)',
-    'l': 'Large (19.99M)',
+    'n': 'Grid Nano (0.39M)',
+    's': 'Grid Small (1.55M)',
+    'm': 'Grid Medium (6.18M)',
 }
 OPTIMAL_CONFS = {
-    'n': 0.70,
-    's': 0.65,
-    'm': 0.65,
-    'l': 0.60,
+    'n': 0.90,
+    's': 0.90,
+    'm': 0.90,
 }
 
 
@@ -58,9 +56,9 @@ class SingleStagePipeline:
         self.conf_threshold = conf_threshold
 
         stem, ch, blocks, pool = ObjectDetectorResNet.CONFIGS[self.size]
-        self.model = ObjectDetectorResNet(channels=ch, blocks=blocks, pool_size=pool).to(device)
+        self.model = ObjectDetectorResNet(channels=ch, blocks=blocks).to(device)
 
-        path = ckpt_path or f'checkpoint/s_detector_{self.size}_best.pth'
+        path = ckpt_path or f'checkpoint/grid_detector_{self.size}_best.pth'
         sd = torch.load(path, map_location=device)
         sd_state = sd.get('model_state_dict', sd) if isinstance(sd, dict) else sd
         self.model.load_state_dict(sd_state)
@@ -76,9 +74,10 @@ class SingleStagePipeline:
         correct_cls = 0
 
         t0 = time.time()
-        for images, gt_boxes_batch, gt_labels_batch, gt_mask_batch in loader:
+        for images, targets_batch, labels_batch in loader:
             images = images.to(self.device)
-            outputs = self.model(images)  # (B, 24, 5 + 47)
+            outputs = self.model(images)  # (B, 14, 14, 5 + 47)
+            outputs = outputs.view(images.shape[0], -1, 52)
             total_images += images.shape[0]
 
             for b in range(images.shape[0]):
@@ -94,9 +93,12 @@ class SingleStagePipeline:
                 preds_confs = confs[mask].cpu().numpy()
                 preds_classes = cls_preds[mask].cpu().numpy()
 
-                gt_mask = gt_mask_batch[b]
-                gt_boxes = gt_boxes_batch[b][gt_mask].cpu().numpy()
-                gt_labels = gt_labels_batch[b][gt_mask].cpu().numpy()
+                gt_targets = targets_batch[b].view(-1, 5)
+                gt_labels_flat = labels_batch[b].view(-1)
+                gt_mask = gt_targets[:, 4] == 1.0
+
+                gt_boxes = gt_targets[gt_mask, :4].cpu().numpy()
+                gt_labels = gt_labels_flat[gt_mask].cpu().numpy()
 
                 n_gt = len(gt_boxes)
                 n_pred = len(preds_boxes)
@@ -186,7 +188,7 @@ def run_benchmark():
             print(f"{SIZE_LABELS[sz]:<16} {conf_t:<6.2f} {p:<8} {r['det_precision']:<8.4f} {r['det_recall']:<8.4f} {r['classifier_acc']:<10.4f} {r['e2e_f1']:<9.4f} {r['fps']:<8.1f}")
     print("=" * 80)
 
-    out_file = Path('benchmark/single_stage_results.json')
+    out_file = Path('benchmark/grid_stage_results.json')
     out_file.parent.mkdir(parents=True, exist_ok=True)
     with open(out_file, 'w') as f:
         json.dump(all_results, f, indent=2)

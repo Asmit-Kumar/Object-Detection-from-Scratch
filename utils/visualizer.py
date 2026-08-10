@@ -93,35 +93,49 @@ class Visualizer:
 
     @staticmethod
     def visualize_multi_detection_batch(
-        imgs_v, preds, boxes_v, mask_v, conf_thresh=0.65, class_names=None
+        imgs_v, preds, boxes_v=None, mask_v=None, conf_thresh=0.65, class_name='bymerge', gt_grid=None, class_names=None
     ):
-
         """
         Visualize up to 10 images from a batch with GT boxes and annotated
         predicted boxes (confidence + predicted class if available).
 
-        Args:
-            imgs_v: (B, 1, H, W) image tensor (CPU).
-            preds:  (B, MAX_OBJ, 5+C) raw model output
-                    [x, y, w, h, conf_logit, cls_logit₀ … cls_logitₙ].
-                    A pure-localisation output (C=0) is also accepted.
-            boxes_v: (B, MAX_OBJ, 4) GT boxes.
-            mask_v:  (B, MAX_OBJ) boolean GT mask.
-            conf_thresh: sigmoid confidence threshold to filter slots.
-            class_names: optional list[str] mapping class index → label.
-                If None, raw class indices are shown.
+        Supports both slot-based (B, N, 5+C) and grid-based (B, S, S, 5+C) predictions
+        and ground truth targets.
         """
+        from generator.dataset import EMNIST_CLASS_NAMES
+        if class_names is None:
+            if isinstance(class_name, str) and class_name in EMNIST_CLASS_NAMES:
+                class_names = EMNIST_CLASS_NAMES[class_name]
+            elif isinstance(class_name, (list, tuple)):
+                class_names = class_name
+        import torchvision
         N_SHOW = min(10, imgs_v.size(0))
         fig, axes = plt.subplots(2, 5, figsize=(20, 8))
         has_classes = preds.shape[-1] > 5   # unified model output
 
         for i, ax in enumerate(axes.flat[:N_SHOW]):
-            img        = imgs_v[i].squeeze().numpy()
-            slots      = preds[i]                        # (MAX_OBJ, 5+C)
-            gt_boxes   = boxes_v[i][mask_v[i]]
+            img = imgs_v[i].squeeze().cpu().numpy()
 
-            conf_scores = torch.sigmoid(slots[:, 4])    # (MAX_OBJ,)
-            keep_mask   = conf_scores >= conf_thresh      # boolean mask
+            # Reshape grid predictions (B, S, S, 5+C) -> (S*S, 5+C) if needed
+            slots = preds[i]
+            if slots.dim() == 3:
+                slots = slots.reshape(-1, slots.shape[-1])
+            slots = slots.cpu()
+
+            # Handle GT boxes (either from gt_grid, boxes_v + mask_v, or boxes_v as grid)
+            if gt_grid is not None:
+                gt_obj = gt_grid[i, ..., 4].bool()
+                gt_boxes = gt_grid[i, ..., :4][gt_obj].cpu()
+            elif boxes_v is not None and boxes_v.dim() == 4:  # (B, S, S, 5)
+                gt_obj = boxes_v[i, ..., 4].bool()
+                gt_boxes = boxes_v[i, ..., :4][gt_obj].cpu()
+            elif boxes_v is not None and mask_v is not None:
+                gt_boxes = boxes_v[i][mask_v[i]].cpu()
+            else:
+                gt_boxes = []
+
+            conf_scores = torch.sigmoid(slots[:, 4])    # (N,)
+            keep_mask   = conf_scores >= conf_thresh    # boolean mask
             kept_boxes  = slots[keep_mask, :4]          # (K, 4)
             kept_conf   = conf_scores[keep_mask]        # (K,)
 
@@ -152,7 +166,6 @@ class Visualizer:
                     (x, y), w, h, linewidth=1.5, edgecolor='lime',
                     facecolor='none'))
 
-
             # ── Predicted boxes (red, dashed) + annotation ────────────────
             for k in range(len(kept_boxes)):
                 x, y, w, h = kept_boxes[k].tolist()
@@ -180,7 +193,7 @@ class Visualizer:
 
             # GT count / pred count as subtitle
             ax.set_title(
-                f'GT:{int(mask_v[i].sum())}  Pred:{len(kept_boxes)}',
+                f'GT:{len(gt_boxes)}  Pred:{len(kept_boxes)}',
                 fontsize=7, color='white', pad=2,
             )
             ax.axis('off')

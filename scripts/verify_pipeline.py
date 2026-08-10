@@ -60,8 +60,8 @@ def main():
         num_workers=0,
     )
 
-    images_batch, targets_batch, _, _ = next(iter(test_loader))
-    images_batch = images_batch.to(device)
+    batch = next(iter(test_loader))
+    images_batch = batch[0].to(device)
 
     # Warmup
     _ = pipeline.predict_batch(images_batch)

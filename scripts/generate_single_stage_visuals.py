@@ -25,9 +25,9 @@ from generator.dataset import EMNIST_CLASS_NAMES
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
-SIZES = ['n', 's', 'm', 'l']
-SIZE_LABELS = {'n': 'Nano (0.71M)', 's': 'Small (2.52M)', 'm': 'Medium (9.42M)', 'l': 'Large (19.99M)'}
-OPTIMAL_CONFS = {'n': 0.70, 's': 0.65, 'm': 0.65, 'l': 0.60}
+SIZES = ['n', 's', 'm']
+SIZE_LABELS = {'n': 'Grid Nano (0.39M)', 's': 'Grid Small (1.55M)', 'm': 'Grid Medium (6.18M)'}
+OPTIMAL_CONFS = {'n': 0.90, 's': 0.90, 'm': 0.90}
 CLASS_NAMES = EMNIST_CLASS_NAMES["bymerge"]
 
 SAMPLE_MAP = {
@@ -53,15 +53,15 @@ def generate_visuals():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     for size in SIZES:
-        out_dir = Path('result/benchmark/single_stage') / size
+        out_dir = Path('result/benchmark/grid_stage') / size
         out_dir.mkdir(parents=True, exist_ok=True)
         conf_thresh = OPTIMAL_CONFS[size]
 
         print(f"\n[{SIZE_LABELS[size]}] Loading model (optimal conf threshold: {conf_thresh:.2f})...")
         stem, ch, blocks, pool = ObjectDetectorResNet.CONFIGS[size]
-        model = ObjectDetectorResNet(channels=ch, blocks=blocks, pool_size=pool).to(device)
+        model = ObjectDetectorResNet(channels=ch, blocks=blocks).to(device)
 
-        ckpt_path = f'checkpoint/s_detector_{size}_best.pth'
+        ckpt_path = f'checkpoint/grid_detector_{size}_best.pth'
         sd = torch.load(ckpt_path, map_location=device)
         sd_state = sd.get('model_state_dict', sd) if isinstance(sd, dict) else sd
         model.load_state_dict(sd_state)
@@ -79,7 +79,8 @@ def generate_visuals():
                 img_tensor = (img_tensor - 0.1307) / 0.3081
 
                 with torch.no_grad():
-                    output = model(img_tensor).squeeze(0)  # (24, 52)
+                    output = model(img_tensor).squeeze(0)  # (14, 14, 52)
+                    output = output.view(-1, 52)
                     boxes = output[:, :4]
                     confs = torch.sigmoid(output[:, 4])
                     cls_logits = output[:, 5:]

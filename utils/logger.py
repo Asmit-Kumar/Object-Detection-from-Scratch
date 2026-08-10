@@ -355,5 +355,10 @@ class RunLogger:
 
     def _save_run(self) -> None:
         """Write this run to its own dedicated JSON file."""
+        def _default(obj):
+            if hasattr(obj, "item"):
+                return obj.item()
+            return str(obj)
+
         with open(self._run_file, "w", encoding="utf-8") as f:
-            json.dump(self._run, f, indent=2)
+            json.dump(self._run, f, indent=2, default=_default)
