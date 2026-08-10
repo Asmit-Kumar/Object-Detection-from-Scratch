@@ -18,6 +18,10 @@ This document maintains the master comparison index across 10,000 placement-stra
 | **Single-Stage Unified** | Small (`s`) | 2.52M | 0.65 ⭐ | 0.9192 | 0.9101 | 71.44% | 0.6535 | 608 img/s | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
 | **Single-Stage Unified** | Medium (`m`) | 9.42M | 0.65 ⭐ | 0.9513 | 0.9490 | 83.22% | 0.7907 | **589 img/s** 🚀 | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
 | **Single-Stage Unified** | Large (`l`) | 19.99M | 0.60 ⭐ | 0.9458 | **0.9580** | **87.34%** | **0.8320** | **533 img/s** 🚀 | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Grid Spatial Head** | Nano (`n`) | **0.39M** ⚡ | 0.90 | 0.5705 | 0.5756 | **86.59%** 🚀 | 0.4985 | 414 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial Head** | Small (`s`) | **1.55M** ⚡ | 0.90 | 0.5815 | 0.5874 | **87.14%** 🚀 | 0.5121 | 463 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial Head** | Medium (`m`) | **6.18M** ⚡ | 0.90 | 0.5870 | 0.5911 | **85.61%** 🚀 | 0.5103 | 448 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
 
 ---
 
@@ -60,14 +64,17 @@ This document maintains the master comparison index across 10,000 placement-stra
 
 Evaluates detection recall drop-off as object density increases per canvas image ($n_{gt}$):
 
-| Density Bucket ($n_{gt}$) | Test Images | Two-Stage Small | Single-Stage Small | Two-Stage Medium | Single-Stage Medium | Single-Stage Large |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1 – 4 objects** | 236 | 96.05% | **96.79%** | 93.58% | 94.94% | 89.01% |
-| **5 – 8 objects** | 1,244 | 96.57% | 94.43% | 95.86% | **96.89%** | 95.06% |
-| **9 – 12 objects** | 850 | 95.35% | 90.37% | 95.84% | 94.85% | **95.56%** |
-| **13 – 16 objects** | 170 | 89.16% | 84.41% | **92.88%** | 88.73% | 88.10% |
+| Density Bucket ($n_{gt}$) | Test Images | Two-Stage Small | Single-Stage Small | Two-Stage Medium | Single-Stage Medium | Single-Stage Large | Grid Spatial Small | Grid Spatial Medium |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 236 | 96.05% | 96.79% | 93.58% | 94.94% | 89.01% | **99.01%** | 98.89% |
+| **5 – 8 objects** | 1,244 | 96.57% | 94.43% | 95.86% | 96.89% | 95.06% | **99.80%** | 99.76% |
+| **9 – 12 objects** | 850 | 95.35% | 90.37% | 95.84% | 94.85% | 95.56% | 99.87% | **99.90%** |
+| **13 – 16 objects** | 170 | 89.16% | 84.41% | 92.88% | 88.73% | 88.10% | **99.92%** | 99.83% |
 
 > **Key Observation**: Single-Stage Medium (`m`) holds **96.89% Recall** on 5–8 object canvases and **94.85% Recall** on 9–12 object canvases, demonstrating strong scale resilience as canvas clutter increases.
+>
+> > [!WARNING]
+> > **Scope Caveat**: Grid Spatial results in the Density Sweep are evaluated exclusively on the `random` layout test set. While spatial grounding perfectly resolves slot competition for sparsely scattered overlapping objects (>99.7% recall), performance collapses significantly on dense, structured layouts like `grid`, `words`, and `line` due to visual crowding (receptive field interference).
 
 ---
 
@@ -94,3 +101,4 @@ Evaluates detection recall drop-off as object density increases per canvas image
 
 - **[`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md)** — **Stage 4 Two-Stage ResNet Detection Pipeline**
 - **[`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md)** — **Stage 5 Single-Stage Unified ResNet Detector**
+- **[`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md)** — **Stage 6 Grid-Based Spatial ResNet Detector**
