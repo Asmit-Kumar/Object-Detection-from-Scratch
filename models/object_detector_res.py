@@ -14,6 +14,7 @@ Supported Presets:
 import torch
 from torch import nn
 from torch.nn import functional as F
+from utils.dataset import K
 
 
 class SimpleResBlock(nn.Module):
@@ -72,7 +73,8 @@ class ObjectDetectorResNet(nn.Module):
 
     def __init__(
             self, channels: list[int] | None = None,
-            num_classes: int = 47, blocks: list[int] | None = None
+            num_classes: int = 47, blocks: list[int] | None = None,
+            num_anchors: int = K,
     ):
         super().__init__()
         if channels is None:
@@ -89,6 +91,7 @@ class ObjectDetectorResNet(nn.Module):
         assert all(n >= 1 for n in blocks), "each res-layer must contain at least one block"
 
         self.num_classes = num_classes
+        self.num_anchors = num_anchors
 
         # Stem
         self.conv1 = nn.Conv2d(1, stem_out, kernel_size=3, stride=2, bias=False)
@@ -102,7 +105,7 @@ class ObjectDetectorResNet(nn.Module):
         self.layer3 = self._make_layer(SimpleResBlock, c[2], blocks[2], stride=2)
         self.layer4 = self._make_layer(SimpleResBlock, c[3], blocks[3], stride=1)
 
-        self.grid_head = nn.Conv2d(c[3], num_classes + 5, kernel_size=1)
+        self.grid_head = nn.Conv2d(c[3], num_anchors * (num_classes + 5), kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -112,7 +115,7 @@ class ObjectDetectorResNet(nn.Module):
             x (torch.Tensor): Input grayscale image tensor of shape (B, 1, 224, 224).
 
         Returns:
-            torch.Tensor: Tensor of shape (B, max_objects, 5 + num_classes) where the last
+            torch.Tensor: Tensor of shape (B, 14, 14, K, 5 + num_classes) where the last
                 dimension is [x, y, w, h, objectness_logit, class_logits...].
         """
         x = F.relu(self.bn1(self.conv1(x)))
@@ -122,6 +125,8 @@ class ObjectDetectorResNet(nn.Module):
         x = self.layer4(x)
         x = self.grid_head(x)
         x = x.permute(0, 2, 3, 1)
+        B, H, W, _ = x.shape
+        x = x.reshape(B, H, W, self.num_anchors, 5 + self.num_classes)
 
         return x
 
@@ -137,22 +142,55 @@ class ObjectDetectorResNet(nn.Module):
 
 
 if __name__ == "__main__":
-    print("=== Model Configuration and Parameter Count ===")
+    print("=" * 80)
+    print("ResNet Object Detector - Forward Pass Validation")
+    print("=" * 80)
+    
     for size in ("n", "s", "m", "l"):
-        stem, ch, blocks, _ = ObjectDetectorResNet.CONFIGS[size]
-        m = ObjectDetectorResNet(channels=ch, blocks=blocks)
-        n = sum(p.numel() for p in m.parameters())
-        print(f"  {size}  channels={ch}  params={n:,}   blocks={blocks}")
-
-        batch_size = 2
-        input_tensor = torch.randn(batch_size, 1, 224, 224)
-
-        print(f"Input shape: {input_tensor.shape}")
-        output = m(input_tensor)
-        print(f"Output shape: {output.shape}")
-        print(f"Expected shape: (B, H, W, {5 + m.num_classes}) - grid-based detection")
-
-        # Verify output shape correctness (grid-based: B, H, W, num_classes + 5)
-        assert output.shape[0] == batch_size, f"Batch size mismatch! Got {output.shape[0]}, expected {batch_size}"
-        assert output.shape[-1] == (5 + m.num_classes), f"Last dimension should be {5 + m.num_classes}, got {output.shape[-1]}"
-        print("✓ Forward pass test passed!\n")
+        print(f"\n{'─' * 80}")
+        print(f"Model Size: {size.upper()} (Config: {['Nano', 'Small', 'Medium', 'Large'][['n', 's', 'm', 'l'].index(size)]})")
+        print(f"{'─' * 80}")
+        
+        stem, ch, blocks, grid_size = ObjectDetectorResNet.CONFIGS[size]
+        model = ObjectDetectorResNet(channels=ch, blocks=blocks)
+        param_count = sum(p.numel() for p in model.parameters())
+        
+        print(f"Architecture:")
+        print(f"  Stem output channels:   {stem}")
+        print(f"  Layer channels:         {ch}")
+        print(f"  Blocks per layer:       {blocks}")
+        print(f"  Output grid size:       {grid_size}×{grid_size}")
+        print(f"  Total parameters:       {param_count:,}")
+        print(f"  Number of classes:      {model.num_classes}")
+        print(f"  Number of anchors:      {model.num_anchors}")
+        
+        # Forward pass testing with different batch sizes
+        for batch_size in [1, 2, 4]:
+            print(f"\n  Batch size: {batch_size}")
+            input_tensor = torch.randn(batch_size, 1, 224, 224)
+            
+            print(f"    Input shape:  {tuple(input_tensor.shape)}")
+            output = model(input_tensor)
+            print(f"    Output shape: {tuple(output.shape)}")
+            
+            actual_k = output.shape[3]
+            actual_out_dim = output.shape[4]
+            print(f"    Anchors (K):  {actual_k}")
+            print(f"    Output dim:   {actual_out_dim} (= 5 + {model.num_classes})")
+            
+            # Validate shape: (B, grid_size, grid_size, K, 5+num_classes)
+            expected_shape = (batch_size, grid_size, grid_size, model.num_anchors, 5 + model.num_classes)
+            assert output.shape == expected_shape, \
+                f"Shape mismatch! Got {tuple(output.shape)}, expected {expected_shape}"
+            
+            # Validate output value ranges
+            assert not torch.isnan(output).any(), "Output contains NaN values!"
+            assert not torch.isinf(output).any(), "Output contains Inf values!"
+            
+            print(f"    ✓ Forward pass validated")
+        
+        print(f"\n  ✓ All forward pass tests passed for size '{size}'!")
+    
+    print(f"\n{'=' * 80}")
+    print("✓ All models validated successfully!")
+    print("=" * 80)

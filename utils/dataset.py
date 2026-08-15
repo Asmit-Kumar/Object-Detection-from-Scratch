@@ -29,7 +29,8 @@ except ImportError:
     _TORCHVISION_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).resolve().parent.parent / 'data' / 'OD'
-S = 14 # Grid size for grid based detection
+S = 14  # Grid size for grid based detection
+K = 3  # Set once per training run; anchors are fitted from the training split.
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -47,6 +48,84 @@ def _auto_workers() -> int:
 def _auto_detection_workers() -> int:
     """Return the measured-fast default for this detection pipeline."""
     return _auto_workers()
+
+
+def _wh_iou(box_wh: torch.Tensor, anchors_wh: torch.Tensor) -> torch.Tensor:
+    """Return IoU between one ``[w, h]`` box shape and every anchor shape."""
+    box_wh = box_wh.reshape(1, 2)
+    intersection = torch.minimum(box_wh, anchors_wh).prod(dim=-1)
+    union = box_wh.prod(dim=-1) + anchors_wh.prod(dim=-1) - intersection
+    return intersection / union.clamp_min(1e-6)
+
+
+def _pairwise_wh_iou(boxes_wh: torch.Tensor, anchors_wh: torch.Tensor) -> torch.Tensor:
+    """Return width/height IoU for every box/anchor pair."""
+    boxes = boxes_wh[:, None, :]
+    anchors = anchors_wh[None, :, :]
+    intersection = torch.minimum(boxes, anchors).prod(dim=-1)
+    union = boxes.prod(dim=-1) + anchors.prod(dim=-1) - intersection
+    return intersection / union.clamp_min(1e-6)
+
+
+def fit_anchors_wh(
+        boxes_wh: torch.Tensor,
+        k: int,
+        max_iterations: int = 100,
+        seed: int = 42,
+) -> torch.Tensor:
+    """Fit ``k`` width/height anchors with IoU-distance k-means.
+
+    The medoid-style update uses the per-dimension median, as is conventional
+    for anchor fitting. Inputs and outputs are in the source box coordinate
+    system, currently pixels.
+    """
+    if boxes_wh.ndim != 2 or boxes_wh.size(1) != 2:
+        raise ValueError("boxes_wh must have shape (N, 2)")
+    if k < 1 or k > len(boxes_wh):
+        raise ValueError(f"k must be in [1, {len(boxes_wh)}], got {k}")
+
+    boxes_wh = boxes_wh.to(dtype=torch.float32, device="cpu")
+    valid = (boxes_wh > 0).all(dim=1)
+    boxes_wh = boxes_wh[valid]
+    if len(boxes_wh) < k:
+        raise ValueError("Not enough positive-width/height boxes to fit anchors")
+
+    generator = torch.Generator().manual_seed(seed)
+    initial = torch.randperm(len(boxes_wh), generator=generator)[:k]
+    anchors_wh = boxes_wh[initial].clone()
+
+    for _ in range(max_iterations):
+        assignments = _pairwise_wh_iou(boxes_wh, anchors_wh).argmax(dim=1)
+        updated = anchors_wh.clone()
+
+        for anchor_idx in range(k):
+            members = boxes_wh[assignments == anchor_idx]
+            if len(members):
+                updated[anchor_idx] = members.median(dim=0).values
+            else:
+                replacement = int(torch.randint(
+                    len(boxes_wh), (1,), generator=generator
+                ).item())
+                updated[anchor_idx] = boxes_wh[replacement]
+
+        if torch.equal(updated, anchors_wh):
+            break
+        anchors_wh = updated
+
+    return anchors_wh[anchors_wh.prod(dim=1).argsort()]
+
+
+def _collect_box_wh(reader: DataReader, indices: torch.Tensor) -> torch.Tensor:
+    """Collect box widths/heights from metadata without loading image files."""
+    boxes_wh = []
+    for idx in indices.tolist():
+        boxes = torch.from_numpy(reader.records[idx].boxes)
+        if len(boxes):
+            boxes_wh.append(boxes[:, 2:4])
+
+    if not boxes_wh:
+        raise ValueError("Cannot fit anchors: the training split has no boxes")
+    return torch.cat(boxes_wh, dim=0)
 
 
 # ── Tensor-backed Dataset ─────────────────────────────────────────────────────
@@ -291,12 +370,19 @@ class DetectionDataset(Dataset):
     def __init__(
             self, reader: DataReader | None = None,
             transform: DetectionAugment | None = None,
-            normalize_boxes=False, indices=None
+            normalize_boxes=False, indices=None,
+            anchors_wh: torch.Tensor | None = None,
     ):
+        if anchors_wh is None:
+            raise ValueError("DetectionDataset requires anchors_wh fitted from the training split")
+        if anchors_wh.ndim != 2 or anchors_wh.size(1) != 2:
+            raise ValueError("anchors_wh must have shape (K, 2)")
+
         self.reader = reader if reader is not None else DataReader(root=ROOT_DIR / "train")
         self.transform = transform
         self.normalize_boxes = normalize_boxes
         self.indices = indices
+        self.anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu").contiguous()
 
     def __len__(self):
         return len(self.indices) if self.indices is not None else len(self.reader)
@@ -320,28 +406,54 @@ class DetectionDataset(Dataset):
 
         return record
 
-    @staticmethod
-    def collate_fn(batch):
+    def collate_fn(self, batch):
         images = torch.stack([r.image for r in batch])
         B = len(batch)
+        K = self.anchors_wh.size(0)
 
-        targets = torch.zeros(B, S, S, 5, dtype=torch.float32)
-        labels = torch.zeros(B, S, S, dtype=torch.int64)
+        targets = torch.zeros(B, S, S, K, 5, dtype=torch.float32)
+        labels = torch.zeros(B, S, S, K, dtype=torch.int64)
+        matched_ious = torch.full((B, S, S, K), -1.0, dtype=torch.float32)
         _, h, w = batch[0].image.shape
         cell_w = w / S
         cell_h = h / S
 
         for i, r in enumerate(batch):
-            for b, l in zip(r.boxes, r.labels):
+            if r.boxes.numel() == 0:
+                continue
+
+            box_wh = r.boxes[:, 2:4]
+            inter = torch.minimum(box_wh.unsqueeze(1), self.anchors_wh.unsqueeze(0)).prod(dim=-1)
+            union = box_wh.prod(dim=-1, keepdim=True) + self.anchors_wh.prod(dim=-1, keepdim=True).T - inter
+            all_anchor_ious = inter / union.clamp_min(1e-6)
+
+            for box_idx, (b, l) in enumerate(zip(r.boxes, r.labels)):
                 cx = b[0] + b[2] / 2
                 cy = b[1] + b[3] / 2
 
-                gx = int(cx // cell_w)
-                gy = int(cy // cell_h)
+                gx = min(S - 1, max(0, int(cx // cell_w)))
+                gy = min(S - 1, max(0, int(cy // cell_h)))
 
-                targets[i, gy, gx, :4] = b
-                targets[i, gy, gx, 4] = 1.0
-                labels[i, gy, gx] = l
+                anchor_ious = all_anchor_ious[box_idx]
+                anchor_order = anchor_ious.argsort(descending=True)
+
+                occupied = targets[i, gy, gx, :, 4].bool()
+                free_in_order = anchor_order[~occupied[anchor_order]]
+
+                if free_in_order.numel() > 0:
+                    anchor_idx = free_in_order[0].item()
+                    targets[i, gy, gx, anchor_idx, :4] = b
+                    targets[i, gy, gx, anchor_idx, 4] = 1.0
+                    labels[i, gy, gx, anchor_idx] = l
+                    matched_ious[i, gy, gx, anchor_idx] = anchor_ious[anchor_idx]
+                else:
+                    improvement = anchor_ious - matched_ious[i, gy, gx]
+                    replacement_idx = int(improvement.argmax().item())
+                    if improvement[replacement_idx].item() > 0.0:
+                        targets[i, gy, gx, replacement_idx, :4] = b
+                        targets[i, gy, gx, replacement_idx, 4] = 1.0
+                        labels[i, gy, gx, replacement_idx] = l
+                        matched_ious[i, gy, gx, replacement_idx] = anchor_ious[replacement_idx]
 
         return images, targets, labels
 
@@ -360,6 +472,8 @@ def get_detection_loaders(
         normalize_boxes: bool = False,
         seed: int = 42,
         prefetch_factor: int = 2,
+        num_anchors: int = K,
+        anchors_wh: torch.Tensor | None = None,
 ) -> tuple | DataLoader:
     if num_workers is None:
         num_workers = _auto_detection_workers()
@@ -375,13 +489,14 @@ def get_detection_loaders(
             transform=transform,
             normalize_boxes=normalize_boxes,
             indices=indices,
+            anchors_wh=anchors_wh,
         )
 
         loader_kwargs = dict(
             dataset=dataset,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            collate_fn=DetectionDataset.collate_fn,
+            collate_fn=dataset.collate_fn,
             persistent_workers=num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             batch_size=batch_size,
@@ -392,6 +507,11 @@ def get_detection_loaders(
 
     # Fast path: load ONLY the test set without reading train set metadata
     if test_only:
+        if anchors_wh is None:
+            raise ValueError(
+                "test_only requires anchors_wh fitted during training; "
+                "load the tensor saved with the matching checkpoint."
+            )
         test_root = Path(data_root) / "test"
         if not test_root.exists():
             raise FileNotFoundError(f"Test directory not found at: {test_root}")
@@ -424,6 +544,19 @@ def get_detection_loaders(
     loaders = []
 
     train_idx = indices[:train_len]
+    if anchors_wh is None:
+        anchors_wh = fit_anchors_wh(
+            _collect_box_wh(train_reader, train_idx),
+            k=num_anchors,
+            seed=seed,
+        )
+    else:
+        anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu")
+        if anchors_wh.ndim != 2 or anchors_wh.shape != (num_anchors, 2):
+            raise ValueError(
+                f"anchors_wh must have shape ({num_anchors}, 2), got {tuple(anchors_wh.shape)}"
+            )
+
     loaders.append(_get_loader(
         train_reader,
         transform,

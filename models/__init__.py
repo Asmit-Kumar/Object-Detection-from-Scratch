@@ -88,8 +88,10 @@ def load_detector(path: str, device, size: str = "m", **kwargs) -> ObjectDetecto
         **kwargs:    Forwarded to ``get_detector``.
     """
     model = get_detector(size=size, **kwargs).to(device)
-    state_dict = torch.load(path, map_location=device, weights_only=True)
-    state_dict = state_dict.get('model_state_dict', state_dict) if isinstance(state_dict, dict) else state_dict
+    raw = torch.load(path, map_location=device, weights_only=False)
+    state_dict = raw.get('model_state_dict', raw) if isinstance(raw, dict) else raw
+    if isinstance(raw, dict) and 'anchors_wh' in raw:
+        model.anchors_wh = raw['anchors_wh']
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 import numpy as np
 import time
+from torchvision.ops import sigmoid_focal_loss
 
 
 # ── IoU Helpers ───────────────────────────────────────────────────────────────
@@ -100,29 +101,32 @@ def aligned_iou(
 
 class DetectionLoss(nn.Module):
     """Unified tri-head detection loss for multi-object localization, objectness scoring,
-    and character classification.
+    and character classification across K anchor slots per spatial cell.
 
     For each image in the batch:
-      1. **Spatial Target Mapping** — assigns each GT box to the corresponding 
-         $14 \times 14$ grid cell based on its center coordinates during collate_fn.
-      2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) pairs.
-      3. **Objectness loss (BCE)** — ``BCEWithLogitsLoss`` on all spatial slots; matched slots
-         get target ``1.0``, background slots get ``0.0``, scaled by ``pos_weight``.
-      4. **Class loss (CE)** — ``CrossEntropyLoss`` computed exclusively on matched slots.
+      1. **Spatial Target Mapping** — assigns GT boxes to corresponding $14 \times 14 \times K$
+         grid-anchor slots during collate_fn.
+      2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) positive slots.
+      3. **IoU loss** — ``1.0 - mean(aligned_iou)`` on matched positive slots.
+      4. **Objectness loss (BCE)** — ``BCEWithLogitsLoss`` on all spatial/anchor slots; matched slots
+         get target ``1.0``, background slots get ``0.0``, optional ``pos_weight``.
+      5. **Class loss (CE)** — ``CrossEntropyLoss`` computed exclusively on matched slots.
 
-    Total loss = box_loss + ``lambda_conf`` * obj_loss + ``lambda_class`` * class_loss
+    Total loss = (box_loss + lambda_iou * iou_loss) + lambda_conf * conf_loss + lambda_class * class_loss
 
     Args:
         lambda_conf  : Weight for the objectness confidence loss term. Default ``1.0``.
         delta        : Huber loss delta (transition point). Default ``1.0``.
+        use_pos_weight : Whether to compute positive class weight dynamically. Default ``False``.
         lambda_class : Weight for the classification loss term. Default ``1.0``.
-        pos_weight   : Positive class weight scalar for objectness BCE loss. Default ``2.0``.
+        lambda_iou   : Weight for the IoU loss term. Default ``1.0``.
 
     Inputs:
-        outputs : ``Tensor (B, 14, 14, 5 + num_classes)``
-                  Last dim: ``[x, y, w, h, conf_logit, class_logits...]``.
-        boxes   : ``list[Tensor(N_gt, 4)]`` — GT boxes per image in ``[x, y, w, h]``.
-        labels  : ``Tensor (B, max_gt)`` — GT class ids aligned with ``boxes``.
+        outputs   : ``Tensor (B, 14, 14, K, 5 + num_classes)``
+                    Last dim: ``[x, y, w, h, conf_logit, class_logits...]``.
+        target_gt : ``Tensor (B, 14, 14, K, 5)``
+                    Last dim: ``[x, y, w, h, objectness]``.
+        labels    : ``Tensor (B, 14, 14, K)`` — GT class ids aligned with ``target_gt``.
     """
 
     def __init__(
@@ -132,12 +136,20 @@ class DetectionLoss(nn.Module):
         use_pos_weight: bool = False,
         lambda_class: float = 1.0,
         lambda_iou: float = 1.0,
+        use_focal_loss: bool = True,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        pos_weight_cap: float = 15.0,
     ):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_class = lambda_class
         self.lambda_iou = lambda_iou
         self.use_pos_weight = use_pos_weight
+        self.use_focal_loss = use_focal_loss
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.pos_weight_cap = pos_weight_cap
         self.huber = nn.HuberLoss(reduction='mean', delta=delta)
         self.bce   = nn.BCEWithLogitsLoss(reduction='mean')
         self.ce = nn.CrossEntropyLoss(reduction='mean')
@@ -158,12 +170,13 @@ class DetectionLoss(nn.Module):
 
         positive = gt_objectness.bool()
 
-        if self.use_pos_weight:
+        if self.use_pos_weight and not self.use_focal_loss:
             n_pos = positive.sum()
             n_cells = positive.numel()
 
             if n_pos > 0:
                 pw = (n_cells - n_pos) / n_pos
+                pw = torch.clamp(pw, max=self.pos_weight_cap)
                 pos_weight = torch.tensor(
                     [pw],
                     dtype=pred_conf.dtype,
@@ -174,22 +187,31 @@ class DetectionLoss(nn.Module):
         else:
             pos_weight = None
 
-        conf_loss = F.binary_cross_entropy_with_logits(
-            pred_conf,
-            gt_objectness,
-            pos_weight=pos_weight,
-        )
+        if self.use_focal_loss:
+            conf_loss = sigmoid_focal_loss(
+                pred_conf,
+                gt_objectness,
+                alpha=self.focal_alpha,
+                gamma=self.focal_gamma,
+                reduction="mean",
+            )
+        else:
+            conf_loss = F.binary_cross_entropy_with_logits(
+                pred_conf,
+                gt_objectness,
+                pos_weight=pos_weight,
+            )
 
         if positive.any():
             box_loss = self.huber(
                 pred_boxes[positive],
                 gt_boxes[positive],
             )
+            iou = aligned_iou(pred_boxes[positive], gt_boxes[positive])
+            iou_loss = 1.0 - iou.mean()
         else:
             box_loss = outputs.new_tensor(0.0)
-
-        iou = aligned_iou(pred_boxes, gt_boxes)
-        iou_loss = 1.0 - iou.mean()
+            iou_loss = outputs.new_tensor(0.0)
 
         if labels is not None and positive.any():
             class_loss = self.ce(
@@ -212,24 +234,25 @@ if __name__ == "__main__":
     LAMBDA_CONF = 1.0
     NUM_CLASSES = 10
     B = 2
+    K_ANCHORS = 3
     
-    criterion = DetectionLoss(lambda_conf=LAMBDA_CONF, delta=1.0, use_pos_weight=True)
+    criterion = DetectionLoss(lambda_conf=LAMBDA_CONF, delta=1.0, use_pos_weight=True, use_focal_loss=True)
     print('DetectionLoss ready.')
 
     S = 14
     NUM_CLASSES = 47
     print(f"Creating sample inputs for batch of {B}...")
 
-    # dummy_out: (B, S, S, 5 + NUM_CLASSES)
-    dummy_out = torch.randn(B, S, S, 5 + NUM_CLASSES, device=DEVICE)
-    # target_gt: (B, S, S, 5) where last dim is [x, y, w, h, objectness]
-    target_gt = torch.zeros(B, S, S, 5, device=DEVICE)
+    # dummy_out: (B, S, S, K, 5 + NUM_CLASSES)
+    dummy_out = torch.randn(B, S, S, K_ANCHORS, 5 + NUM_CLASSES, device=DEVICE)
+    # target_gt: (B, S, S, K, 5) where last dim is [x, y, w, h, objectness]
+    target_gt = torch.zeros(B, S, S, K_ANCHORS, 5, device=DEVICE)
     # populate some random ground truth objects
-    target_gt[:, 3, 3, 4] = 1.0  # object at cell (3,3)
-    target_gt[:, 5, 5, 4] = 1.0  # object at cell (5,5)
+    target_gt[:, 3, 3, 0, 4] = 1.0  # object at cell (3,3), anchor 0
+    target_gt[:, 5, 5, 1, 4] = 1.0  # object at cell (5,5), anchor 1
 
-    # labels_v: (B, S, S)
-    labels_v = torch.randint(0, NUM_CLASSES, (B, S, S), device=DEVICE)
+    # labels_v: (B, S, S, K)
+    labels_v = torch.randint(0, NUM_CLASSES, (B, S, S, K_ANCHORS), device=DEVICE)
 
     with torch.no_grad():
         loss_val = criterion(dummy_out, target_gt, labels_v)

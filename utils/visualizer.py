@@ -118,7 +118,7 @@ class Visualizer:
 
             # Reshape grid predictions (B, S, S, 5+C) -> (S*S, 5+C) if needed
             slots = preds[i]
-            if slots.dim() == 3:
+            if slots.dim() >= 2:
                 slots = slots.reshape(-1, slots.shape[-1])
             slots = slots.cpu()
 

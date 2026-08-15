@@ -50,3 +50,8 @@ archive/
 # Private experiment log
 INSIGHTS.md
 insights/
+
+# Agent workspace config
+.agents/
+AGENT.md
+.gemini/

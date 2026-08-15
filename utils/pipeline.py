@@ -95,6 +95,14 @@ class DetectionPipeline:
         from models import load_detector
         path = weights_path or DETECTOR_MODEL_PATH[self.detector_size.lower()]
         print(f"[DetectionPipeline] Loading Detector ('{self.detector_size}') from '{path}'...")
+        if Path(path).exists():
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            if isinstance(ckpt, dict) and "anchors_wh" in ckpt:
+                self.anchors_wh = ckpt["anchors_wh"]
+            else:
+                self.anchors_wh = None
+        else:
+            self.anchors_wh = None
         return load_detector(path=path, device=self.device, size=self.detector_size)
 
     def _load_classifier(self, weights_path: str = None, num_classes: int = 47):
@@ -102,6 +110,7 @@ class DetectionPipeline:
         path = weights_path or CLASSIFIER_MODEL_PATH
         print(f"[DetectionPipeline] Loading Classifier from '{path}'...")
         return load_classifier(path=path, device=self.device, num_classes=num_classes)
+
 
     def _preprocess_image_input(self, image_input: Any) -> torch.Tensor:
         """
@@ -484,6 +493,7 @@ class DetectionPipeline:
                 batch_size=batch_size,
                 num_workers=0,
                 test_only=True,
+                anchors_wh=getattr(self, "anchors_wh", None),
             )
 
             # Assign a dedicated CUDA Stream for concurrent GPU execution

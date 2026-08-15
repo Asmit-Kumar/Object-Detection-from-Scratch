@@ -325,7 +325,6 @@ def train_one_epoch_detection(
     """
     model.train()
     epoch_loss = 0.0
-    epoch_match_ratio = 0.0
     n_batches  = 0
     use_amp    = device.type == "cuda"
 
@@ -412,6 +411,8 @@ def train_one_epoch_detection(
         n_batches += 1
 
     return epoch_loss / n_batches
+
+
 
 
 def evaluate_detection(
@@ -503,17 +504,10 @@ def evaluate_detection(
                 boxes_flat = pred_boxes_np[b].reshape(-1, 4)
                 pred_lbl_flat = pred_labels_np[b].flatten()
 
-                if n_gt > 0:
-                    iou_np_b = _pairwise_iou(
-                        torch.from_numpy(boxes_flat),
-                        torch.from_numpy(gt_boxes_b)
-                    ).numpy()
-                    total_iou += float(iou_np_b.max(axis=0).mean())
-                    n_images += 1
-                else:
-                    iou_np_b = np.zeros((len(conf_flat), 0), dtype=np.float32)
-
+                # Filter predictions passing confidence threshold first
                 pr_idx = np.where(conf_flat > conf_threshold)[0]
+
+                # Fast path: no predictions meet confidence threshold
                 if len(pr_idx) == 0:
                     fn += n_gt
                     e2e_fn += n_gt
@@ -522,22 +516,37 @@ def evaluate_detection(
                     continue
 
                 order = pr_idx[np.argsort(-conf_flat[pr_idx])]
+
+                # Fast path: no GT objects — count all active preds as FP
+                if n_gt == 0:
+                    n_preds = len(order)
+                    fp += n_preds
+                    e2e_fp += n_preds
+                    counts = np.bincount(pred_lbl_flat[order], minlength=confusion_matrix.shape[0])
+                    per_class_e2e_fp += counts
+                    continue
+
+                # Compute pairwise IoU ONLY between active predictions and GT boxes
+                boxes_active = boxes_flat[order]
+                pred_lbl_active = pred_lbl_flat[order]
+                iou_active_b = _pairwise_iou(
+                    torch.from_numpy(boxes_active),
+                    torch.from_numpy(gt_boxes_b)
+                ).numpy()
+
+                # Track coverage IoU metric using the active-prediction matrix
+                total_iou += float(iou_active_b.max(axis=0).mean())
+                n_images += 1
+
                 matched = set()
-
-                for i in order:
-                    if n_gt == 0:
-                        fp += 1
-                        e2e_fp += 1
-                        per_class_e2e_fp[int(pred_lbl_flat[i])] += 1
-                        continue
-
-                    j = int(np.argmax(iou_np_b[i]))
-                    if iou_np_b[i, j] >= iou_threshold and j not in matched:
+                for idx_act in range(len(order)):
+                    j = int(np.argmax(iou_active_b[idx_act]))
+                    if iou_active_b[idx_act, j] >= iou_threshold and j not in matched:
                         matched.add(j)
                         tp += 1
 
                         gt_label = int(gt_labels_b[j])
-                        pred_label = int(pred_lbl_flat[i])
+                        pred_label = int(pred_lbl_active[idx_act])
                         if not 0 <= gt_label < confusion_matrix.shape[0]:
                             raise ValueError(
                                 f"Ground-truth class {gt_label} is outside the "
@@ -558,7 +567,7 @@ def evaluate_detection(
                     else:
                         fp += 1
                         e2e_fp += 1
-                        per_class_e2e_fp[int(pred_lbl_flat[i])] += 1
+                        per_class_e2e_fp[int(pred_lbl_active[idx_act])] += 1
 
                 fn += n_gt - len(matched)
                 e2e_fn += n_gt - len(matched)
@@ -943,6 +952,7 @@ def fit(
     verbose: int = 1,
     model_label: str = None,
     resume: bool = False,
+    anchors_wh: torch.Tensor | None = None,
 ):
     """
     Full training loop with per-epoch logging, validation, and optional checkpointing.
@@ -979,18 +989,10 @@ def fit(
         verbose (int): 0 = silent, 1 = log on new best (default), 2 = every epoch.
         model_label (str | None): Optional label added to the run config.
         resume (bool): If True, resume from the last checkpoint. Defaults to False.
+        anchors_wh (Tensor | None): Fitted width/height anchor dimensions (K, 2).
 
     Returns:
         tuple: (history, logger)
-            - history (dict): per-epoch metric lists with keys:
-              'train_loss', 'val_loss', 'val_metric',
-              'val_iou', 'val_f1', 'val_precision', 'val_recall',
-              'val_cls_acc' (classification accuracy on matched detections),
-              'val_e2e_f1', 'val_e2e_precision', 'val_e2e_recall'
-              (end-to-end: correct localisation + correct class)
-            - logger (RunLogger | None): the logger instance when log=True,
-              otherwise None. Use it after fit() to call e.g.
-              logger.log_test_results(sweep_results).
     """
 
     history = {
@@ -1006,6 +1008,9 @@ def fit(
         'val_e2e_precision': [],
         'val_e2e_recall':   [],
     }
+
+    if anchors_wh is None and hasattr(trainloader, "dataset"):
+        anchors_wh = getattr(trainloader.dataset, "anchors_wh", None)
 
     amp_info = "bf16 autocast" if device.type == "cuda" else "fp32 (CPU)"
     print(f"Training with {amp_info} | Epochs: {epochs}")
@@ -1036,7 +1041,9 @@ def fit(
 
     if resume and checkpoint is not None:
         try:
-            start_epoch = checkpoint.resume_training(optimizer, scheduler, scaler)
+            start_epoch, loaded_anchors = checkpoint.resume_training(optimizer, scheduler, scaler)
+            if loaded_anchors is not None:
+                anchors_wh = loaded_anchors
             print(f"Resuming training from epoch {start_epoch}")
         except FileNotFoundError as e:
             print(f"Could not resume training: {e}")
@@ -1074,7 +1081,7 @@ def fit(
         val_e2e_f1        = e2e["f1"]
         val_e2e_precision = e2e["precision"]
         val_e2e_recall    = e2e["recall"]
-        val_metric        = val_f1
+        val_metric        = val_e2e_f1
 
         history['val_loss'].append(avg_val_loss)
         history['val_iou'].append(val_iou)
@@ -1113,7 +1120,8 @@ def fit(
                     "val_e2e_f1": val_e2e_f1,
                     "val_e2e_precision": val_e2e_precision,
                     "val_e2e_recall": val_e2e_recall,
-                }
+                },
+                anchors_wh=anchors_wh,
             )
         else:
             is_best = val_metric > best_val_metric

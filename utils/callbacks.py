@@ -41,7 +41,16 @@ class ModelCheckpoint:
         else:
             raise ValueError("mode must be 'min' or 'max'")
 
-    def __call__(self, current_score: float, epoch: int = 0, optimizer=None, scheduler=None, scaler=None, metrics: dict = None) -> bool:
+    def __call__(
+        self,
+        current_score: float,
+        epoch: int = 0,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        metrics: dict = None,
+        anchors_wh: torch.Tensor | None = None,
+    ) -> bool:
         """
         Save the latest checkpoint and conditionally update the best model.
 
@@ -52,6 +61,7 @@ class ModelCheckpoint:
             scheduler: The LR scheduler (state saved for crash protection).
             scaler: The AMP GradScaler (state saved for crash protection).
             metrics: Optional dictionary of additional metrics to store.
+            anchors_wh: Optional Tensor of fitted width/height anchor dimensions (K, 2).
 
         Returns:
             True if a new best was found.
@@ -63,6 +73,8 @@ class ModelCheckpoint:
             'best_score': self.best_score,
             'current_score': current_score,
         }
+        if anchors_wh is not None:
+            checkpoint['anchors_wh'] = anchors_wh
         if self.config is not None:
             checkpoint['config'] = self.config
         if metrics is not None:
@@ -84,7 +96,11 @@ class ModelCheckpoint:
 
         if is_best:
             self.best_score = current_score
-            torch.save(self.model.state_dict(), self.best_model_path)
+            save_payload = {
+                'model_state_dict': self.model.state_dict(),
+                'anchors_wh': anchors_wh,
+            } if anchors_wh is not None else self.model.state_dict()
+            torch.save(save_payload, self.best_model_path)
             if self.verbose:
                 print(f"[ModelCheckpoint] New best ({self.mode}): {current_score:.4f} — saved to {self.best_model_path}")
 
@@ -98,18 +114,18 @@ class ModelCheckpoint:
                 "Make sure training has run at least one epoch."
             )
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.load_state_dict(
-            torch.load(self.best_model_path, map_location=device, weights_only=True)
-        )
+        state = torch.load(self.best_model_path, map_location=device, weights_only=False)
+        model_state = state.get('model_state_dict', state) if isinstance(state, dict) else state
+        self.model.load_state_dict(model_state)
         if self.verbose:
             print(f"[ModelCheckpoint] Restored best weights from {self.best_model_path} (score={self.best_score:.4f})")
 
-    def resume_training(self, optimizer=None, scheduler=None, scaler=None) -> int:
+    def resume_training(self, optimizer=None, scheduler=None, scaler=None) -> tuple[int, torch.Tensor | None]:
         """
         Load the latest checkpoint to resume training after a crash.
 
         Returns:
-            The epoch number to resume from (next epoch after the saved one).
+            Tuple of (resume_epoch, anchors_wh).
         """
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
@@ -130,9 +146,10 @@ class ModelCheckpoint:
         if 'best_score' in ckpt:
             self.best_score = ckpt['best_score']
 
+        anchors_wh = ckpt.get('anchors_wh', None)
         resume_epoch = ckpt['epoch'] + 1
         if self.verbose:
             print(f"[ModelCheckpoint] Resumed from epoch {ckpt['epoch'] + 1}, starting at epoch {resume_epoch + 1}")
             if 'best_score' in ckpt:
                 print(f"[ModelCheckpoint] Restored previous best score: {self.best_score:.4f}")
-        return resume_epoch
+        return resume_epoch, anchors_wh
