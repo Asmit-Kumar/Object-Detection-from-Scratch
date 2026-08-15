@@ -8,11 +8,12 @@ Trained on a custom synthetic dataset generated from EMNIST, running on an **RTX
 
 ## 🏛️ Pipeline Evolution & Architecture
 
-The project evolved through three major architectural stages:
+The project evolved through multiple major architectural stages:
 
 1. **Stage 4: Two-Stage Pipeline** — Separate ResNet detector predicting bounding boxes followed by crop-slicing and passing to an independent 47-class character classifier.
 2. **Stage 5: Single-Stage Unified Detector (FC Tri-Head)** — Integrated bounding box regression, objectness scoring, and class recognition into a single network with global average pooling and Hungarian (bipartite) matching.
-3. **Stage 6: Grid-Based Spatial ResNet Detector (YOLO-style)** *(Current SOTA)* — Fully convolutional, anchor-free architecture operating directly on a $14 \times 14$ spatial feature grid, eliminating global pooling and FC projection overhead.
+3. **Stage 6: Grid-Based Spatial ResNet Detector (YOLO-style)** *(Current SOTA)* — Fully convolutional, anchor-free architecture operating directly on a $14 \times 14$ spatial feature grid with Focal Loss / BCE objectness, eliminating global pooling and FC projection overhead.
+4. **Stage 7: Multi-Anchor ($K=3$) Spatial ResNet** *(Empirically Retired)* — Evaluated $k$-means box anchor priors ($K=3$). Confirmed that anchor slot competition creates candidate ambiguity on uniform square characters without improving recall density, establishing $K=1$ as the optimal architecture.
 
 ### Stage 6 Grid-Based Spatial Detector Architecture
 
@@ -31,11 +32,11 @@ The project evolved through three major architectural stages:
        ┌─────────────────────────┴─────────────────────────┐
        │                                                   │
  ──────── Training ────────                         ──────── Inference ────────
-    Direct Spatial Target Mapping                       Optimal Conf Threshold (0.90)
+    Direct Spatial Target Mapping                       Optimal Conf Threshold (0.40–0.50)
     (targets[gy, gx] = box, obj, cls)                               │
             │                                               NMS (IoU ≥ 0.35)
     Direct GPU Tensor Loss                                          │
- (Huber + BCE + Aligned-IoU + CE)                              Final Detections
+ (Huber + Focal/BCE + Aligned-IoU + CE)                        Final Detections
                                                    (Boxes + Scores + Classes)
 ```
 
@@ -45,11 +46,11 @@ The project evolved through three major architectural stages:
 
 By transitioning from heavy FC heads to a lightweight $1 \times 1$ spatial convolution head, the Stage 6 Grid Spatial Detector significantly reduced parameter count while dramatically increasing classification accuracy.
 
-| Size Preset | Backbone Channels | Detector Params | Optimal `conf` | Output Tensor Shape | Full Benchmark Report |
-|:---|:---|:---:|:---:|:---:|:---|
-| **Nano (`n`)** | `[32, 64, 64, 128]` | **0.39M** (392,788) | `0.90` | `(B, 14, 14, 52)` | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| **Small (`s`)** | `[64, 128, 128, 256]` | **1.55M** (1,553,524) | `0.90` | `(B, 14, 14, 52)` | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| **Medium (`m`)** | `[128, 256, 256, 512]` | **6.18M** (6,178,996) | `0.90` | `(B, 14, 14, 52)` | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| Size Preset | Backbone Channels | Detector Params | Optimal `conf` | Loss Formulation | Output Tensor Shape | Full Benchmark Report |
+|:---|:---|:---:|:---:|:---:|:---:|:---|
+| **Nano (`n`)** | `[32, 64, 64, 128]` | **0.39M** (392,044) | `0.95` | Original BCE | `(B, 14, 14, 52)` | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Small (`s`)** | `[64, 128, 128, 256]` | **1.55M** (1,552,652) | `0.50` | Focal Loss | `(B, 14, 14, 52)` | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Medium (`m`)** | `[128, 256, 256, 512]` | **6.18M** (6,183,948) | `0.40` | Focal Loss | `(B, 14, 14, 52)` | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
 
 ---
 
@@ -63,6 +64,9 @@ By transitioning from heavy FC heads to a lightweight $1 \times 1$ spatial convo
 * **Sparse / Random Layouts**: On `random` placement, Stage 6 models achieve near-perfect performance: **>99.7% Recall even up to 13–16 objects**, completely resolving slot competition for scattered objects.
 * **Structured / Dense Layouts (`grid`, `words`, `line`)**: Detection Precision/Recall drops sharply down to **~40–50%**.
 * **Root Cause (Visual Crowding)**: Detailed instrumentation of the `collate_fn` dataset mapping confirmed **exactly 0 grid-cell collisions** across all layouts (target centers never overwrite one another within the same $16 \times 16$ grid cell). Instead, the model's collapse on structured text is caused by **receptive field interference (visual crowding)**. In layouts like `grid`, `words`, and `line`, characters are packed densely next to one another. The ResNet's local receptive field blends these dense visual features together, causing the bounding box and classification heads to fail to disentangle adjacent targets, even though they technically occupy distinct logical grid cells.
+
+### 3. Multi-Anchor ($K=3$) Retirement
+* Introducing multiple aspect-ratio anchors ($K=3$) added intra-cell candidate competition that degraded precision without improving recall density, confirming single-slot ($K=1$) spatial grids as canonical for uniform glyph characters.
 
 ---
 
@@ -97,7 +101,8 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 - **[`BENCHMARK.md`](./BENCHMARK.md)** — **Master Benchmark Hub & Cross-Stage Comparison**
 - **[`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md)** — **Stage 4 Two-Stage ResNet Detection Pipeline**
 - **[`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md)** — **Stage 5 Single-Stage Unified ResNet Detector**
-- **[`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md)** — **Stage 6 Grid-Based Spatial ResNet Detector**
+- **[`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md)** — **Stage 6 Grid-Based Spatial ResNet Detector (Focal & BCE)**
+- **[`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md)** — **Stage 7 Multi-Anchor Spatial ResNet (Retirement Report)**
 
 ---
 
@@ -107,12 +112,22 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 pip install -r requirements.txt
 ```
 
+To run the full benchmark evaluation suite:
+```bash
+python scripts/run_single_stage_benchmark.py
+```
+
+To run the object density sweep:
+```bash
+python scripts/run_density_sweep.py
+```
+
+To generate visual benchmark detection grids:
+```bash
+python scripts/generate_single_stage_visuals.py
+```
+
 To regenerate the synthetic dataset from scratch:
 ```bash
 python -c "from generator.generator import DatasetGenerator; DatasetGenerator().generate()"
-```
-
-To run the pipeline verification test:
-```bash
-python scripts/verify_pipeline.py
 ```
