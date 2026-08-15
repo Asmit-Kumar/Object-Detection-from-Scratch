@@ -35,55 +35,91 @@ In contrast to the Stage 5 FC-based tri-head model, the Stage 6 Grid Detector el
 
 ## Model Parameter Audit
 
-| Size Preset | Model Name | Total Parameters | Optimal `conf` | Checkpoint Weight File | Output Tensor Shape |
-|:---|:---|:---:|:---:|:---|:---:|
-| **Nano (`n`)** | `ObjectDetectorResNet` (v3 Nano) | **392,044** (0.39M) | `0.90` | `checkpoint/grid_detector_n_best.pth` | `(B, 14, 14, 52)` |
-| **Small (`s`)** | `ObjectDetectorResNet` (v3 Small) | **1,552,652** (1.55M) | `0.90` | `checkpoint/grid_detector_s_best.pth` | `(B, 14, 14, 52)` |
-| **Medium (`m`)** | `ObjectDetectorResNet` (v3 Medium) | **6,183,948** (6.18M) | `0.90` | `checkpoint/grid_detector_m_best.pth` | `(B, 14, 14, 52)` |
+| Size Preset | Model Name | Total Parameters | Focal Loss Checkpoint | Original BCE Checkpoint | Output Tensor Shape |
+|:---|:---|:---:|:---|:---|:---:|
+| **Nano (`n`)** | `ObjectDetectorResNet` (v3 Nano) | **392,044** (0.39M) | `weights/1_grid_detector_n_best.pth` | `weights/grid_detector_n_best.pth` | `(B, 14, 14, 52)` |
+| **Small (`s`)** | `ObjectDetectorResNet` (v3 Small) | **1,552,652** (1.55M) | `weights/1_grid_detector_s_best.pth` | `weights/grid_detector_s_best.pth` | `(B, 14, 14, 52)` |
+| **Medium (`m`)** | `ObjectDetectorResNet` (v3 Medium) | **6,183,948** (6.18M) | `weights/1_grid_detector_m_best.pth` | `weights/grid_detector_m_best.pth` | `(B, 14, 14, 52)` |
 
-**Configuration**: `nms_iou=0.35`, `device=cuda`, `S=14` spatial resolution.  
-*(Note: Large `l` preset intentionally dropped from Stage 6 evaluation).*
-
----
-
-## Evaluation Results (10,000 Test Images across 4 Layouts)
-
-### 🔬 Nano — 0.39M Params (`conf = 0.90`)
-
-| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
-|:---|:---:|:---:|:---:|:---:|:---:|
-| 🎲 Random | 0.9966 | 0.9976 | **88.30%** | **0.8804** | 400.8 img/s |
-| 📐 Grid   | 0.4832 | 0.4922 | 85.32% | 0.4161 | 423.7 img/s |
-| 📝 Words  | 0.4072 | 0.4130 | 87.09% | 0.3571 | 426.2 img/s |
-| 📏 Line   | 0.3949 | 0.3995 | 85.66% | 0.3402 | 406.2 img/s |
-
-### ⚡ Small — 1.55M Params (`conf = 0.90`)
-
-| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
-|:---|:---:|:---:|:---:|:---:|:---:|
-| 🎲 Random | 0.9971 | 0.9983 | **89.62%** | **0.8941** | 465.9 img/s |
-| 📐 Grid   | 0.4954 | 0.5037 | 86.40% | 0.4315 | 467.7 img/s |
-| 📝 Words  | 0.4178 | 0.4228 | 87.38% | 0.3673 | 456.7 img/s |
-| 📏 Line   | 0.4156 | 0.4196 | 85.17% | 0.3556 | 463.4 img/s |
-
-### 🎯 Medium — 6.18M Params (`conf = 0.90`)
-
-| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
-|:---|:---:|:---:|:---:|:---:|:---:|
-| 🎲 Random | 0.9969 | 0.9980 | **89.77%** | **0.8953** | 446.8 img/s |
-| 📐 Grid   | 0.4972 | 0.5041 | 85.97% | 0.4304 | 449.3 img/s |
-| 📝 Words  | 0.4322 | 0.4364 | 84.31% | 0.3661 | 450.0 img/s |
-| 📏 Line   | 0.4218 | 0.4257 | 82.40% | 0.3492 | 447.9 img/s |
+**Configuration**: `nms_iou=0.35`, `device=cuda`, `S=14` spatial resolution.
 
 ---
 
-## Grid-Based Spatial Model Comparison Summary (Optimal `conf = 0.90`)
+## Evaluation Results: Focal Loss ($K=1$, `1_grid_detector_*`)
 
-| Model Variant | Total Parameters | Optimal `conf` | Avg Det Precision | Avg Det Recall | Avg Classifier Acc | Avg End-to-End F1 | Avg Throughput (Image FPS) |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Nano (`n`)** | **0.39M** (392,044) | `0.90` | 0.5705 | 0.5756 | 86.59% | 0.4985 | **414.2 img/s** |
-| **Small (`s`)** | **1.55M** (1,552,652) | `0.90` | 0.5815 | 0.5874 | 87.14% | 0.5121 | **463.4 img/s** |
-| **Medium (`m`)** | **6.18M** (6,183,948) | `0.90` | 0.5870 | 0.5911 | 85.61% | 0.5103 | **448.5 img/s** |
+### 🔬 Focal Nano — 0.39M Params (`conf = 0.50`)
+> [!NOTE]
+> When trained with pure Focal Loss without pos_weight boosting, the 0.39M parameter Nano model lacked the capacity for simultaneous box regression and classification across dense layouts. Small (1.55M) and Medium (6.18M) scaled robustly.
+
+| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| 🎲 Random | 0.0984 | 0.0945 | 14.98% | 0.0144 | 397.1 img/s |
+| 📐 Grid   | 0.0566 | 0.0624 | 10.62% | 0.0063 | 413.1 img/s |
+| 📝 Words  | 0.0684 | 0.0774 | 27.21% | 0.0198 | 408.9 img/s |
+| 📏 Line   | 0.0711 | 0.0806 | 27.07% | 0.0205 | 401.3 img/s |
+
+### ⚡ Focal Small — 1.55M Params (`conf = 0.50`)
+
+| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| 🎲 Random | **0.9983** | **0.9978** | **89.27%** | **0.8909** | 396.4 img/s |
+| 📐 Grid   | 0.4968 | 0.4820 | 85.92% | 0.4204 | 400.1 img/s |
+| 📝 Words  | 0.4169 | 0.4078 | 87.61% | 0.3613 | 404.4 img/s |
+| 📏 Line   | 0.4089 | 0.4018 | 85.43% | 0.3463 | 396.1 img/s |
+
+### 🎯 Focal Medium — 6.18M Params (`conf = 0.40`)
+
+| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| 🎲 Random | **0.9972** | **0.9974** | **89.63%** | **0.8939** | 367.1 img/s |
+| 📐 Grid   | 0.4932 | 0.5010 | 86.05% | 0.4277 | 380.0 img/s |
+| 📝 Words  | 0.4309 | 0.4354 | 85.06% | 0.3684 | 380.2 img/s |
+| 📏 Line   | 0.4191 | 0.4237 | 82.90% | 0.3493 | 380.6 img/s |
+
+---
+
+## Evaluation Results: Original BCE ($K=1$, `grid_detector_*`)
+
+### 🔬 BCE Nano — 0.39M Params (`conf = 0.95`)
+
+| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| 🎲 Random | 0.9972 | 0.9975 | 88.30% | 0.8806 | 410.4 img/s |
+| 📐 Grid   | 0.4893 | 0.4843 | 85.37% | 0.4156 | 408.4 img/s |
+| 📝 Words  | 0.4102 | 0.4076 | 87.06% | 0.3559 | 419.0 img/s |
+| 📏 Line   | 0.3978 | 0.3955 | 85.63% | 0.3397 | 414.7 img/s |
+
+### ⚡ BCE Small — 1.55M Params (`conf = 0.95`)
+
+| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| 🎲 Random | 0.9976 | 0.9982 | 89.62% | 0.8943 | 401.9 img/s |
+| 📐 Grid   | 0.5004 | 0.5005 | 86.48% | 0.4328 | 402.2 img/s |
+| 📝 Words  | 0.4201 | 0.4202 | 87.39% | 0.3671 | 399.4 img/s |
+| 📏 Line   | 0.4179 | 0.4180 | 85.20% | 0.3561 | 399.0 img/s |
+
+### 🎯 BCE Medium — 6.18M Params (`conf = 0.95`)
+
+| Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| 🎲 Random | 0.9973 | 0.9979 | 89.77% | 0.8955 | 383.6 img/s |
+| 📐 Grid   | 0.5011 | 0.5002 | 85.99% | 0.4305 | 378.7 img/s |
+| 📝 Words  | 0.4346 | 0.4344 | 84.31% | 0.3663 | 381.7 img/s |
+| 📏 Line   | 0.4241 | 0.4239 | 82.43% | 0.3496 | 375.2 img/s |
+
+---
+
+## Grid-Based Spatial ($K=1$) Summary Comparison
+
+| Model Variant | Loss Formulation | Total Params | Optimal `conf` | Avg Det Precision | Avg Det Recall | Avg Classifier Acc | Avg End-to-End F1 | Avg Throughput (Image FPS) |
+|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Nano (`n`)** | Focal Loss | 0.39M | `0.50` | 0.0736 ⚠️ | 0.0787 ⚠️ | 19.97% | 0.0153 | 405.1 img/s |
+| **Small (`s`)** | Focal Loss | 1.55M | `0.50` | 0.5802 | 0.5724 | 87.06% | 0.5047 | 399.3 img/s |
+| **Medium (`m`)** | Focal Loss | 6.18M | `0.40` | 0.5851 | 0.5894 | 85.91% | 0.5098 | 377.0 img/s |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Nano (`n`)** | Original BCE | 0.39M | `0.95` | 0.5736 | 0.5712 | 86.59% | 0.4980 | **413.1 img/s** |
+| **Small (`s`)** | Original BCE | 1.55M | `0.95` | 0.5840 | 0.5842 | **87.17%** | **0.5126** | **400.6 img/s** |
+| **Medium (`m`)** | Original BCE | 6.18M | `0.95` | **0.5893** | **0.5891** | 85.63% | **0.5105** | **379.8 img/s** |
 
 ---
 
