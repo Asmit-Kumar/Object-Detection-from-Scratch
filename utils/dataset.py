@@ -366,6 +366,19 @@ class DetectionAugment:
 
 
 class DetectionDataset(Dataset):
+    """
+    Dataset wrapping DataReader records for single-stage and multi-anchor spatial detection.
+
+    Applies on-the-fly geometric augmentations (crop, pad, jitter, rotation) and maps
+    ground-truth annotations into spatial grid targets via `collate_fn`.
+
+    Args:
+        reader (DataReader | None): Underlying record reader.
+        transform (DetectionAugment | None): Geometric/photometric augmentation callable.
+        normalize_boxes (bool): Whether to normalize bounding box coordinates to [0, 1].
+        indices (Sequence | None): Subset sample indices to use.
+        anchors_wh (torch.Tensor): Fitted anchor dimensions of shape (K, 2) in pixels.
+    """
 
     def __init__(
             self, reader: DataReader | None = None,
@@ -407,6 +420,20 @@ class DetectionDataset(Dataset):
         return record
 
     def collate_fn(self, batch):
+        """
+        Collate batch of records into model input and spatial grid target tensors.
+
+        For each image:
+          1. Computes cell coordinates (gx, gy) on the S x S grid from box centers (cx, cy).
+          2. Computes shape IoU between each box and all K anchors.
+          3. Assigns the box to the highest-IoU free anchor slot in that cell, or replaces
+             an occupied slot if the new box yields a higher IoU improvement.
+
+        Returns:
+            images (torch.Tensor): Image tensor of shape (B, C, H, W).
+            targets (torch.Tensor): Grid targets of shape (B, S, S, K, 5) where last dim is [x, y, w, h, obj].
+            labels (torch.Tensor): Class index tensor of shape (B, S, S, K).
+        """
         images = torch.stack([r.image for r in batch])
         B = len(batch)
         K = self.anchors_wh.size(0)
@@ -475,6 +502,27 @@ def get_detection_loaders(
         num_anchors: int = K,
         anchors_wh: torch.Tensor | None = None,
 ) -> tuple | DataLoader:
+    """
+    Factory function to construct train, val, or test DataLoaders for spatial grid detection.
+
+    Args:
+        data_root (Path): Root directory containing train/ and test/ image/label folders.
+        batch_size (int): Mini-batch size. Default: 128.
+        shuffle (bool): Whether to shuffle the training set. Default: True.
+        test (bool): Whether to include the test set in returned loaders.
+        test_only (bool): If True, loads only the test DataLoader (requires pre-fitted anchors_wh).
+        image_size (tuple): Canvas image dimensions (H, W). Default: (224, 224).
+        val_size (float | int): Validation split size (fraction or integer count).
+        num_workers (int | None): Number of worker subprocesses for data loading.
+        pin_memory (bool): Whether to pin host memory for faster CUDA transfer.
+        transform (DetectionAugment | None): Data augmentation pipeline for training.
+        normalize_boxes (bool): Whether to normalize box coordinates. Default: False.
+        seed (int): Random seed for reproducible splits and anchor initialization. Default: 42.
+        prefetch_factor (int): Number of batches preloaded per worker. Default: 2.
+        num_anchors (int): Number of anchor slots (K) per cell. Default: from utils.dataset.K.
+        anchors_wh (torch.Tensor | None): Pre-fitted anchor dimensions of shape (K, 2). If None,
+            anchors are automatically fitted from the training split via k-means.
+    """
     if num_workers is None:
         num_workers = _auto_detection_workers()
 

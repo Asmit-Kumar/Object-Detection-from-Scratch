@@ -1,15 +1,15 @@
 """
 ResNet Object Detector Architecture.
 
-Provides the Stage 6 Single-Stage Unified ObjectDetectorResNet model for simultaneous
+Provides the Stage 6 & Stage 7 Single-Stage Unified ObjectDetectorResNet model for simultaneous
 multi-object bounding box localization, objectness scoring, and class recognition
-using an anchor-free $14 \times 14$ spatial grid head.
+using a dense $14 \times 14$ spatial grid head with $K$ anchor slots.
 
 Supported Presets:
-  - Nano  ('n'): 0.39M parameters (392,788)
-  - Small ('s'): 1.55M parameters (1,553,524) [Recommended]
-  - Medium('m'): 6.18M parameters (6,178,996)
-  - Large ('l'): 16.75M parameters (16,752,564)
+  - Nano  ('n'): 0.39M parameters (392,044 for K=1, 392,788 for K=3)
+  - Small ('s'): 1.55M parameters (1,552,652 for K=1, 1,555,628 for K=3) [Recommended]
+  - Medium('m'): 6.18M parameters (6,183,948 for K=1, 6,189,900 for K=3)
+  - Large ('l'): 16.75M parameters (16,752,564 for K=1, 16,764,364 for K=3)
 """
 import torch
 from torch import nn
@@ -54,13 +54,14 @@ class ObjectDetectorResNet(nn.Module):
     Single-Stage Unified ResNet Detector for multi-object localization, objectness scoring,
     and character classification in a single forward pass.
 
-    Outputs (B, 14, 14, 5 + num_classes) spatial tensor containing box coordinates [x, y, w, h],
-    objectness logit [obj], and class logits [cls_0 ... cls_N] for each spatial cell.
+    Outputs (B, 14, 14, K, 5 + num_classes) spatial tensor containing box coordinates [x, y, w, h],
+    objectness logit [obj], and class logits [cls_0 ... cls_N] for each spatial cell and anchor slot.
 
     Args:
         channels (list[int] | None): Channel width list for the 4 residual layers.
         num_classes (int): Number of class logits per slot. Default: 47.
         blocks (list[int] | None): Number of residual blocks in each layer.
+        num_anchors (int): Number of anchor slots per grid cell (K). Default: from utils.dataset.K.
     """
 
     # Named size presets: (stem_out, [layer1..4 channels], [block1..4], default_pool_size)
@@ -147,9 +148,9 @@ if __name__ == "__main__":
     print("=" * 80)
     
     for size in ("n", "s", "m", "l"):
-        print(f"\n{'─' * 80}")
+        print(f"\n{'-' * 80}")
         print(f"Model Size: {size.upper()} (Config: {['Nano', 'Small', 'Medium', 'Large'][['n', 's', 'm', 'l'].index(size)]})")
-        print(f"{'─' * 80}")
+        print(f"{'-' * 80}")
         
         stem, ch, blocks, grid_size = ObjectDetectorResNet.CONFIGS[size]
         model = ObjectDetectorResNet(channels=ch, blocks=blocks)
@@ -159,7 +160,7 @@ if __name__ == "__main__":
         print(f"  Stem output channels:   {stem}")
         print(f"  Layer channels:         {ch}")
         print(f"  Blocks per layer:       {blocks}")
-        print(f"  Output grid size:       {grid_size}×{grid_size}")
+        print(f"  Output grid size:       {grid_size}x{grid_size}")
         print(f"  Total parameters:       {param_count:,}")
         print(f"  Number of classes:      {model.num_classes}")
         print(f"  Number of anchors:      {model.num_anchors}")
@@ -187,10 +188,10 @@ if __name__ == "__main__":
             assert not torch.isnan(output).any(), "Output contains NaN values!"
             assert not torch.isinf(output).any(), "Output contains Inf values!"
             
-            print(f"    ✓ Forward pass validated")
+            print(f"    [PASS] Forward pass validated")
         
-        print(f"\n  ✓ All forward pass tests passed for size '{size}'!")
+        print(f"\n  [PASS] All forward pass tests passed for size '{size}'!")
     
     print(f"\n{'=' * 80}")
-    print("✓ All models validated successfully!")
+    print("[PASS] All models validated successfully!")
     print("=" * 80)

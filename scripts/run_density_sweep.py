@@ -7,7 +7,10 @@ Evaluates recall drop-off across object density buckets:
   - Bucket 3: 9 - 12 objects/image (medium-high)
   - Bucket 4: 13 - 16 objects/image (dense)
 
-Runs across Two-Stage Pipeline models, Single-Stage Unified models, and Grid-Based Spatial models.
+Runs across all spatial grid variants:
+  - grid_focal_stage: 1_grid_detector_{n, s, m} (conf = 0.50)
+  - grid_bce_stage: grid_detector_{n, s, m} (conf = 0.90)
+  - multi_anchor_stage: 3_grid_detector_{n, s, m} (conf = 0.95)
 """
 import sys
 import json

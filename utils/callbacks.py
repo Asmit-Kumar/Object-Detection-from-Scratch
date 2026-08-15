@@ -5,7 +5,7 @@ from pathlib import Path
 class ModelCheckpoint:
     """
     Saves the best model weights and maintains a crash-protection checkpoint
-    that includes the full training state (optimizer, scheduler, scaler).
+    that includes the full training state (optimizer, scheduler, scaler, fitted anchors_wh).
 
     Args:
         model (torch.nn.Module): The model to checkpoint.
@@ -13,6 +13,7 @@ class ModelCheckpoint:
         best_model_path (str): Path for the best model weights.
         mode (str): 'min' for loss (lower is better), 'max' for accuracy (higher is better).
         verbose (bool): Print a message when a new best model is saved.
+        config (dict | None): Optional dictionary of training hyperparameters/settings to persist.
     """
     def __init__(
         self,

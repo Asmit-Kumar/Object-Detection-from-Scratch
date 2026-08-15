@@ -1,8 +1,13 @@
 """
-Generates visual benchmark detection grid images for Single-Stage Unified Detector models
-across all 4 sizes (Nano, Small, Medium, Large) × 4 placements × 2 samples.
-Uses the optimal confidence threshold per model size (Nano: 0.70, Small: 0.65, Medium: 0.65, Large: 0.60).
-Saves annotated detection outputs to result/benchmark/single_stage/<model>/<placement>_<idx>.png
+Generates visual benchmark detection grid images for Single-Stage Spatial Grid models
+across all sizes (Nano, Small, Medium) × 4 placements × 2 samples.
+
+Renders outputs for:
+  - grid_focal_stage: 1_grid_detector_{n, s, m}
+  - grid_stage: grid_detector_{n, s, m}
+  - 3_grid_stage: 3_grid_detector_{n, s, m}
+
+Saves annotated detection outputs to result/benchmark/<variant>/<size>/<placement>_<idx>.png.
 """
 import sys
 from pathlib import Path

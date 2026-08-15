@@ -1,7 +1,9 @@
 """
 Detection Loss Utilities.
 
-Contains IoU helpers and loss functions for the object detection pipeline.
+Contains IoU helpers, coordinate regression loss, classification loss,
+and objectness loss functions (BCE with dynamic positive weighting and Sigmoid Focal Loss)
+for the single-stage and multi-anchor spatial detection pipelines.
 """
 
 import torch
@@ -108,18 +110,22 @@ class DetectionLoss(nn.Module):
          grid-anchor slots during collate_fn.
       2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) positive slots.
       3. **IoU loss** — ``1.0 - mean(aligned_iou)`` on matched positive slots.
-      4. **Objectness loss (BCE)** — ``BCEWithLogitsLoss`` on all spatial/anchor slots; matched slots
-         get target ``1.0``, background slots get ``0.0``, optional ``pos_weight``.
+      4. **Objectness loss (Focal or BCE)** — ``sigmoid_focal_loss`` or ``BCEWithLogitsLoss``
+         on all spatial/anchor slots; matched slots get target ``1.0``, background slots get ``0.0``.
       5. **Class loss (CE)** — ``CrossEntropyLoss`` computed exclusively on matched slots.
 
     Total loss = (box_loss + lambda_iou * iou_loss) + lambda_conf * conf_loss + lambda_class * class_loss
 
     Args:
-        lambda_conf  : Weight for the objectness confidence loss term. Default ``1.0``.
-        delta        : Huber loss delta (transition point). Default ``1.0``.
-        use_pos_weight : Whether to compute positive class weight dynamically. Default ``False``.
-        lambda_class : Weight for the classification loss term. Default ``1.0``.
-        lambda_iou   : Weight for the IoU loss term. Default ``1.0``.
+        lambda_conf    : Weight for the objectness confidence loss term. Default ``1.0``.
+        delta          : Huber loss delta (transition point). Default ``1.0``.
+        use_pos_weight : Whether to compute positive class weight dynamically for BCE. Default ``False``.
+        lambda_class   : Weight for the classification loss term. Default ``1.0``.
+        lambda_iou     : Weight for the IoU loss term. Default ``1.0``.
+        use_focal_loss : Whether to use Sigmoid Focal Loss for objectness. Default ``True``.
+        focal_alpha    : Focal loss alpha balancing factor. Default ``0.25``.
+        focal_gamma    : Focal loss gamma focusing parameter. Default ``2.0``.
+        pos_weight_cap : Maximum cap for BCE dynamic positive weight. Default ``15.0``.
 
     Inputs:
         outputs   : ``Tensor (B, 14, 14, K, 5 + num_classes)``

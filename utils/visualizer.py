@@ -99,8 +99,8 @@ class Visualizer:
         Visualize up to 10 images from a batch with GT boxes and annotated
         predicted boxes (confidence + predicted class if available).
 
-        Supports both slot-based (B, N, 5+C) and grid-based (B, S, S, 5+C) predictions
-        and ground truth targets.
+        Supports slot-based (B, N, 5+C), single-slot grid (B, S, S, 5+C),
+        and multi-anchor grid (B, S, S, K, 5+C) predictions and ground truth targets.
         """
         from generator.dataset import EMNIST_CLASS_NAMES
         if class_names is None:

@@ -1,17 +1,14 @@
 """
-Single-Stage Unified Detector Benchmark Evaluation Script.
+Single-Stage & Multi-Anchor Spatial Detector Benchmark Evaluation Script.
 
-Evaluates all 4 Single-Stage Unified Detector sizes (Nano 'n', Small 's', Medium 'm', Large 'l')
-across all 4 benchmark placement layouts ('random', 'grid', 'words', 'line') in data/OD_benchmark/.
+Evaluates single-stage spatial grid models across all 4 placement layouts
+('random', 'grid', 'words', 'line') in data/OD_benchmark/:
+  1. Grid (K=1, Focal): 1_grid_detector_{n, s, m}
+  2. Grid (K=1, Original BCE): grid_detector_{n, s, m}
+  3. Multi-Anchor (K=3): 3_grid_detector_{n, s, m}
 
-Uses the optimal confidence threshold per size:
-  - Nano: conf = 0.70
-  - Small: conf = 0.65
-  - Medium: conf = 0.65
-  - Large: conf = 0.60
-
-Outputs detailed evaluation metrics (Precision, Recall, F1, Classifier Accuracy, End-to-End F1, Image FPS)
-and saves summary outputs for benchmark documentation.
+Features auto-tuned confidence threshold discovery to maximize End-to-End F1,
+and outputs 3-level evaluation metrics (Detection P/R/F1, Classifier Accuracy, E2E F1, Image FPS).
 """
 import sys
 import time

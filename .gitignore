@@ -19,7 +19,6 @@ csvs/
 data/
 
 # Model Files
-Models/
 checkpoint/
 *.h5
 *.keras
