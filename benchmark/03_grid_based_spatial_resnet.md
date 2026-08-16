@@ -47,16 +47,14 @@ In contrast to the Stage 5 FC-based tri-head model, the Stage 6 Grid Detector el
 
 ## Evaluation Results: Focal Loss ($K=1$, `1_grid_detector_*`)
 
-### 🔬 Focal Nano — 0.39M Params (`conf = 0.50`)
-> [!NOTE]
-> When trained with pure Focal Loss without pos_weight boosting, the 0.39M parameter Nano model lacked the capacity for simultaneous box regression and classification across dense layouts. Small (1.55M) and Medium (6.18M) scaled robustly.
+### 🔬 Focal Nano — 0.39M Params (`conf = 0.45`)
 
 | Layout | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput |
 |:---|:---:|:---:|:---:|:---:|:---:|
-| 🎲 Random | 0.0984 | 0.0945 | 14.98% | 0.0144 | 397.1 img/s |
-| 📐 Grid   | 0.0566 | 0.0624 | 10.62% | 0.0063 | 413.1 img/s |
-| 📝 Words  | 0.0684 | 0.0774 | 27.21% | 0.0198 | 408.9 img/s |
-| 📏 Line   | 0.0711 | 0.0806 | 27.07% | 0.0205 | 401.3 img/s |
+| 🎲 Random | **0.9974** | **0.9973** | **88.44%** | **0.8820** | 389.9 img/s |
+| 📐 Grid   | 0.4824 | 0.4752 | 85.60% | 0.4098 | 339.8 img/s |
+| 📝 Words  | 0.4009 | 0.3963 | 87.60% | 0.3492 | 324.0 img/s |
+| 📏 Line   | 0.3977 | 0.3947 | 85.92% | 0.3404 | 326.4 img/s |
 
 ### ⚡ Focal Small — 1.55M Params (`conf = 0.50`)
 
@@ -113,7 +111,7 @@ In contrast to the Stage 5 FC-based tri-head model, the Stage 6 Grid Detector el
 
 | Model Variant | Loss Formulation | Total Params | Optimal `conf` | Avg Det Precision | Avg Det Recall | Avg Classifier Acc | Avg End-to-End F1 | Avg Throughput (Image FPS) |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Nano (`n`)** | Focal Loss | 0.39M | `0.50` | 0.0736 ⚠️ | 0.0787 ⚠️ | 19.97% | 0.0153 | 405.1 img/s |
+| **Nano (`n`)** | Focal Loss | 0.39M | `0.45` | 0.5696 | 0.5659 | 86.89% | 0.4954 | 345.0 img/s |
 | **Small (`s`)** | Focal Loss | 1.55M | `0.50` | 0.5802 | 0.5724 | 87.06% | 0.5047 | 399.3 img/s |
 | **Medium (`m`)** | Focal Loss | 6.18M | `0.40` | 0.5851 | 0.5894 | 85.91% | 0.5098 | 377.0 img/s |
 | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
@@ -153,10 +151,18 @@ Evaluates detection recall performance across object density buckets on the `ran
   - **Small**: Reduced from **2.52M to 1.55M** (38% parameter reduction).
   - **Medium**: Reduced from **9.42M to 6.18M** (34% parameter reduction).
 
-### 3. The Layout Collapse Root Cause Explained
-* **Sparse / Random Layouts**: On `random` placement, Stage 6 models achieve near-perfect performance: **~99.7% Precision and Recall**, and **~0.88–0.89 E2E F1**, far surpassing Stage 4 and Stage 5 models.
-* **Structured / Dense Layouts (`grid`, `words`, `line`)**: Detection Precision/Recall drops sharply from ~99.7% down to **~40–50%**.
-* **Root Cause (Visual Crowding)**: Detailed instrumentation of the `collate_fn` dataset mapping confirmed **exactly 0 grid-cell collisions** across all layouts (target centers never overwrite one another within the same $16 \times 16$ grid cell). Instead, the model's collapse on structured text is caused by **receptive field interference (visual crowding)**. In layouts like `grid`, `words`, and `line`, characters are packed densely next to one another. The ResNet's local receptive field blends these dense visual features together, causing the bounding box and classification heads to fail to disentangle adjacent targets, even though they technically occupy distinct logical grid cells.
+### 3. The Layout Collapse Root Cause: Lattice Discretization & Spatial Crowding
+* **The Sparse `random` Lattice Illusion**:
+  - Detailed spatial instrumentation (`scripts/analyze_cell_coverage.py`) revealed that in `canvas.py`, `_bboxes_random` samples candidates from `range(0, 224-28, 28) = [0, 28, 56, 84, 112, 140, 168]` with zero offset jitter.
+  - When mapped to the $14 \times 14$ grid ($16\text{ px}$ per cell), box centers `(cx, cy)` map strictly to 7 grid coordinate indices `(0, 2, 4, 6, 7, 9, 11)`.
+  - Across the 2,500 `random` test images, **only 62 out of 196 cells (31.6% coverage)** ever receive a ground-truth target; **134 cells have exactly 0 hits** (Gini coefficient = 0.7558, Spatial Entropy = 0.7381).
+  - Consequently, every character in `random` is isolated by at least a 1-cell empty background buffer. The model achieves **~99.7% Precision and Recall** because adjacent grid cells are never active simultaneously.
+
+* **Structured Layout Realities (`grid`, `words`, `line`)**:
+  - In `grid`, `words`, and `line`, dynamic offsets and continuous horizontal/vertical placements spread targets across **all 196 cells (100% coverage, 0 zero-hit cells, Gini = 0.2932 for grid, 0.3868 for words)**.
+  - Instrumentation confirmed **0 grid-cell collisions** across all layouts (target centers never overwrite one another in `collate_fn`).
+  - **The Architectural Inference (Visual Crowding Hypothesis)**: In structured layouts, adjacent grid cells ($gx, gx+1$ or $gy, gy+1$) are simultaneously active with character physical gaps as narrow as $2\text{–}9\text{ px}$. The empirical collapse to **~40–50% Precision/Recall** specifically under adjacent-cell activation strongly points to **insufficient spatial separation in the convolutional feature representation / receptive field interference**, where neighboring visual features blend together before local $1 \times 1$ conv heads can cleanly isolate individual targets.
+  - Visual coverage heatmaps comparing all 4 spatial distributions are available at [`result/analysis/cell_coverage_heatmap.png`](../result/analysis/cell_coverage_heatmap.png).
 
 ---
 

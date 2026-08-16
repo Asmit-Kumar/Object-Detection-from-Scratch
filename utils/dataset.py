@@ -30,7 +30,7 @@ except ImportError:
 
 ROOT_DIR = Path(__file__).resolve().parent.parent / 'data' / 'OD'
 S = 14  # Grid size for grid based detection
-K = 3  # Set once per training run; anchors are fitted from the training split.
+K = 1  # Set once per training run; anchors are fitted from the training split.
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

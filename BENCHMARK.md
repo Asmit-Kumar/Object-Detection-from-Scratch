@@ -19,7 +19,7 @@ This document maintains the master comparison index across 10,000 placement-stra
 | **Single-Stage Unified** | Medium (`m`) | 9.42M | 0.65 ⭐ | 0.9513 | 0.9490 | 83.22% | 0.7907 | **589 img/s** 🚀 | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
 | **Single-Stage Unified** | Large (`l`) | 19.99M | 0.60 ⭐ | 0.9458 | **0.9580** | **87.34%** | **0.8320** | **533 img/s** 🚀 | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
 | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
-| **Grid Spatial ($K=1$, Focal)** | Nano (`n`) | **0.39M** ⚡ | 0.50 | 0.0736 ⚠️ | 0.0787 ⚠️ | 19.97% | 0.0153 | 405 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial ($K=1$, Focal)** | Nano (`n`) | **0.39M** ⚡ | 0.45 | 0.5696 | 0.5659 | 86.89% | 0.4954 | 345 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
 | **Grid Spatial ($K=1$, Focal)** | Small (`s`) | **1.55M** ⚡ | 0.50 | 0.5802 | 0.5724 | **87.06%** 🚀 | 0.5047 | 399 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
 | **Grid Spatial ($K=1$, Focal)** | Medium (`m`) | **6.18M** ⚡ | 0.40 | **0.5851** | **0.5894** | 85.91% | 0.5098 | 377 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
 | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
