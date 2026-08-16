@@ -42,6 +42,26 @@ class ModelCheckpoint:
         else:
             raise ValueError("mode must be 'min' or 'max'")
 
+        # Safely inspect existing checkpoint/best_model to set the comparison baseline
+        # without loading or touching any model weights or optimizer states.
+        self._peek_existing_best_score()
+
+    def _peek_existing_best_score(self) -> None:
+        """Safely peek at existing files to initialize best_score baseline."""
+        for path in (self.best_model_path, self.checkpoint_path):
+            if path.exists():
+                try:
+                    data = torch.load(path, map_location="cpu", weights_only=False)
+                    if isinstance(data, dict):
+                        score = data.get("best_score", data.get("best_metric", None))
+                        if score is not None and isinstance(score, (int, float)):
+                            self.best_score = float(score)
+                            if self.verbose:
+                                print(f"[ModelCheckpoint] Initialized best_score baseline: {self.best_score:.4f} from '{path.name}'")
+                            return
+                except Exception:
+                    pass
+
     def __call__(
         self,
         current_score: float,
@@ -99,8 +119,12 @@ class ModelCheckpoint:
             self.best_score = current_score
             save_payload = {
                 'model_state_dict': self.model.state_dict(),
-                'anchors_wh': anchors_wh,
-            } if anchors_wh is not None else self.model.state_dict()
+                'best_score': self.best_score,
+            }
+            if anchors_wh is not None:
+                save_payload['anchors_wh'] = anchors_wh
+            if self.config is not None:
+                save_payload['config'] = self.config
             torch.save(save_payload, self.best_model_path)
             if self.verbose:
                 print(f"[ModelCheckpoint] New best ({self.mode}): {current_score:.4f} — saved to {self.best_model_path}")
