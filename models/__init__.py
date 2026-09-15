@@ -17,6 +17,7 @@ import torch
 
 from .object_detector_res      import ObjectDetectorResNet
 from .character_classifier_resnet import CharacterClassifierResNet
+from utils.dataset import S
 
 __all__ = [
     "ObjectDetectorResNet",
@@ -26,7 +27,7 @@ __all__ = [
     "load_detector",
     "load_classifier",
 ]
-S = 14
+S = S
 
 # ---------------------------------------------------------------------------
 # Getter functions

@@ -3,7 +3,7 @@ ResNet Object Detector Architecture.
 
 Provides the Stage 6 & Stage 7 Single-Stage Unified ObjectDetectorResNet model for simultaneous
 multi-object bounding box localization, objectness scoring, and class recognition
-using a dense $14 \times 14$ spatial grid head with $K$ anchor slots.
+using a dense $28 \times 28$ spatial grid head with $K$ anchor slots.
 
 Supported Presets:
   - Nano  ('n'): 0.39M parameters (392,044 for K=1, 392,788 for K=3)
@@ -14,7 +14,7 @@ Supported Presets:
 import torch
 from torch import nn
 from torch.nn import functional as F
-from utils.dataset import K
+from utils.dataset import K, S
 
 
 class SimpleResBlock(nn.Module):
@@ -54,7 +54,7 @@ class ObjectDetectorResNet(nn.Module):
     Single-Stage Unified ResNet Detector for multi-object localization, objectness scoring,
     and character classification in a single forward pass.
 
-    Outputs (B, 14, 14, K, 5 + num_classes) spatial tensor containing box coordinates [x, y, w, h],
+    Outputs (B, 28, 28, K, 5 + num_classes) spatial tensor containing box coordinates [x, y, w, h],
     objectness logit [obj], and class logits [cls_0 ... cls_N] for each spatial cell and anchor slot.
 
     Args:
@@ -66,10 +66,10 @@ class ObjectDetectorResNet(nn.Module):
 
     # Named size presets: (stem_out, [layer1..4 channels], [block1..4], default_pool_size)
     CONFIGS = {
-        "n": (32, [32,  64,  64,  128], [1,1,1,1], 14),   # Nano   ~0.39M params
-        "s": (64, [64,  128, 128, 256], [1,1,1,1], 14),   # Small  ~1.55M params (default)
-        "m": (64, [128, 256, 256, 512], [1,1,1,1], 14),   # Medium ~6.18M params
-        "l": (64, [128, 256, 384, 512], [2,2,2,2], 14),   # Large  ~16.75M params
+        "n": (32, [32,  64,  64,  128], [1,1,1,1], S),   # Nano   ~0.39M params
+        "s": (64, [64,  128, 128, 256], [1,1,1,1], S),   # Small  ~1.55M params (default)
+        "m": (64, [128, 256, 256, 512], [1,1,1,1], S),   # Medium ~6.18M params
+        "l": (64, [128, 256, 384, 512], [2,2,2,2], S),   # Large  ~16.75M params
     }
 
     def __init__(
@@ -103,7 +103,7 @@ class ObjectDetectorResNet(nn.Module):
         self.in_channels = stem_out
         self.layer1 = self._make_layer(SimpleResBlock, c[0], blocks[0], stride=2)
         self.layer2 = self._make_layer(SimpleResBlock, c[1], blocks[1], stride=2)
-        self.layer3 = self._make_layer(SimpleResBlock, c[2], blocks[2], stride=2)
+        self.layer3 = self._make_layer(SimpleResBlock, c[2], blocks[2], stride=1)
         self.layer4 = self._make_layer(SimpleResBlock, c[3], blocks[3], stride=1)
 
         self.grid_head = nn.Conv2d(c[3], num_anchors * (num_classes + 5), kernel_size=1)
@@ -116,7 +116,7 @@ class ObjectDetectorResNet(nn.Module):
             x (torch.Tensor): Input grayscale image tensor of shape (B, 1, 224, 224).
 
         Returns:
-            torch.Tensor: Tensor of shape (B, 14, 14, K, 5 + num_classes) where the last
+                    torch.Tensor: Tensor of shape (B, 28, 28, K, 5 + num_classes) where the last
                 dimension is [x, y, w, h, objectness_logit, class_logits...].
         """
         x = F.relu(self.bn1(self.conv1(x)))
