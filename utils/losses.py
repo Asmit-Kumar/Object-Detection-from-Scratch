@@ -6,6 +6,8 @@ and objectness loss functions (BCE with dynamic positive weighting and Sigmoid F
 for the single-stage and multi-anchor spatial detection pipelines.
 """
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,11 +130,12 @@ class DetectionLoss(nn.Module):
         pos_weight_cap : Maximum cap for BCE dynamic positive weight. Default ``15.0``.
 
     Inputs:
-        outputs   : ``Tensor (B, 14, 14, K, 5 + num_classes)``
-                    Last dim: ``[x, y, w, h, conf_logit, class_logits...]``.
-        target_gt : ``Tensor (B, 14, 14, K, 5)``
-                    Last dim: ``[x, y, w, h, objectness]``.
-        labels    : ``Tensor (B, 14, 14, K)`` — GT class ids aligned with ``target_gt``.
+        outputs   : A single prediction tensor or a dictionary of prediction
+                    tensors keyed by grid size. Last dim is
+                    ``[x, y, w, h, conf_logit, class_logits...]``.
+        target_gt : Matching target tensor(s) with last dim
+                    ``[x, y, w, h, objectness]``.
+        labels    : Matching class-index tensor(s) aligned with ``target_gt``.
     """
 
     def __init__(
@@ -161,6 +164,34 @@ class DetectionLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(reduction='mean')
 
     def forward(
+            self,
+            outputs: torch.Tensor | Mapping[int, torch.Tensor],
+            target_gt: torch.Tensor | Mapping[int, torch.Tensor],
+            labels: torch.Tensor | Mapping[int, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if isinstance(outputs, Mapping):
+            if not isinstance(target_gt, Mapping):
+                raise TypeError("multi-scale outputs require multi-scale targets")
+            if set(outputs) != set(target_gt):
+                raise ValueError("output and target scales must match exactly")
+            if labels is not None and (not isinstance(labels, Mapping) or set(labels) != set(outputs)):
+                raise ValueError("multi-scale labels must match output scales exactly")
+
+            scale_losses = [
+                self._forward_single(
+                    outputs[grid_size],
+                    target_gt[grid_size],
+                    None if labels is None else labels[grid_size],
+                )
+                for grid_size in outputs
+            ]
+            return torch.stack(scale_losses).mean()
+
+        if isinstance(target_gt, Mapping) or isinstance(labels, Mapping):
+            raise TypeError("single-scale outputs require tensor targets and labels")
+        return self._forward_single(outputs, target_gt, labels)
+
+    def _forward_single(
             self,
             outputs: torch.Tensor,
             target_gt: torch.Tensor,

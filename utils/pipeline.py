@@ -41,6 +41,31 @@ def _apply_nms(boxes_xywh: torch.Tensor, confs: torch.Tensor, iou_thresh: float 
     boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
     return torchvision.ops.nms(boxes_xyxy, confs, iou_thresh)
 
+
+def _flatten_detection_outputs(outputs: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
+    """Flatten a one- or multi-scale detector result to ``(B, N, D)``."""
+    if isinstance(outputs, dict):
+        return torch.cat(
+            [output.reshape(output.size(0), -1, output.size(-1)) for output in outputs.values()],
+            dim=1,
+        )
+    return outputs.reshape(outputs.size(0), -1, outputs.size(-1))
+
+
+def _flatten_detection_targets(targets: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
+    """Flatten one- or multi-scale target grids to ``(B, N, 5)``."""
+    return _flatten_detection_outputs(targets)
+
+
+def _flatten_detection_labels(labels: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
+    """Flatten one- or multi-scale target label grids to ``(B, N)``."""
+    if isinstance(labels, dict):
+        return torch.cat(
+            [label.reshape(label.size(0), -1) for label in labels.values()],
+            dim=1,
+        )
+    return labels.reshape(labels.size(0), -1)
+
 CLASSIFIER_MODEL_PATH = 'weights/classifier_resent_bymerge_s_best.pth'
 DETECTOR_MODEL_PATH = {
     'n': 'weights/detector_n_new_best.pth',
@@ -80,19 +105,21 @@ class DetectionPipeline:
         conf_threshold: float = 0.70,
         iou_threshold: float = 0.50,
         num_classes: int = 47,
+        multi_scale_detector: bool = False,
     ):
         self.detector_size   = detector_size
         self.conf_threshold  = conf_threshold
         self.iou_threshold   = iou_threshold
         self.device          = device
         self.num_classes     = num_classes
+        self.multi_scale_detector = multi_scale_detector
 
         self.detector   = self._load_detector(detector_weights)
         self.classifier = self._load_classifier(classifier_weights, num_classes)
         self.class_names = EMNIST_CLASS_NAMES["bymerge"]
 
     def _load_detector(self, weights_path: str = None):
-        from models import load_detector
+        from models import load_detector, load_multiscale_detector
         path = weights_path or DETECTOR_MODEL_PATH[self.detector_size.lower()]
         print(f"[DetectionPipeline] Loading Detector ('{self.detector_size}') from '{path}'...")
         if Path(path).exists():
@@ -103,7 +130,8 @@ class DetectionPipeline:
                 self.anchors_wh = None
         else:
             self.anchors_wh = None
-        return load_detector(path=path, device=self.device, size=self.detector_size)
+        loader = load_multiscale_detector if self.multi_scale_detector else load_detector
+        return loader(path=path, device=self.device, size=self.detector_size)
 
     def _load_classifier(self, weights_path: str = None, num_classes: int = 47):
         from models import load_classifier
@@ -222,7 +250,7 @@ class DetectionPipeline:
         img_tensor = self._preprocess_image_input(image_input)  # (1, 1, 224, 224)
 
         # Stage 1: Detector
-        det_output = self.detector(img_tensor)  # (1, N, 5) or (1, S, S, 5+C)
+        det_output = _flatten_detection_outputs(self.detector(img_tensor))
         det_output = det_output.squeeze(0)
         det_output = det_output.reshape(-1, det_output.shape[-1])  # (N, 5+C)
 
@@ -292,7 +320,7 @@ class DetectionPipeline:
         B = images_tensor.shape[0]
 
         # Stage 1: Detector Batch Forward Pass
-        det_outputs = self.detector(images_tensor)  # (B, N, 5) or (B, S, S, 5+C)
+        det_outputs = _flatten_detection_outputs(self.detector(images_tensor))
 
         batch_crops = []
         batch_crop_metadata = []  # (batch_idx, bbox, det_conf)
@@ -381,7 +409,8 @@ class DetectionPipeline:
                     gt_boxes = gt_boxes_batch[b][mask].cpu().numpy()  # (M, 4)
                     gt_labels = gt_labels_batch[b][mask].cpu().numpy()  # (M,)
                 else:  # (images, targets, labels) grid format
-                    targets_batch, gt_labels_grid = batch[1], batch[2]
+                    targets_batch = _flatten_detection_targets(batch[1])
+                    gt_labels_grid = _flatten_detection_labels(batch[2])
                     gt_obj = targets_batch[b, ..., 4].bool()
                     gt_boxes = targets_batch[b, ..., :4][gt_obj].cpu().numpy()
                     gt_labels = gt_labels_grid[b][gt_obj].cpu().numpy()
@@ -494,6 +523,8 @@ class DetectionPipeline:
                 num_workers=0,
                 test_only=True,
                 anchors_wh=getattr(self, "anchors_wh", None),
+                grid_sizes=getattr(self.detector, "grid_sizes", (28,)),
+                anchors_per_scale=getattr(self.detector, "anchors_per_scale", None),
             )
 
             # Assign a dedicated CUDA Stream for concurrent GPU execution

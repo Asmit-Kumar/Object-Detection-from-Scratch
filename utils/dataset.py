@@ -31,6 +31,8 @@ except ImportError:
 ROOT_DIR = Path(__file__).resolve().parent.parent / 'data' / 'OD'
 S = 28  # Grid size for grid based detection
 K = 1  # Set once per training run; anchors are fitted from the training split.
+YOLO_GRID_SIZES = (28, 14)
+YOLO_ANCHORS_PER_SCALE = 3
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -385,17 +387,36 @@ class DetectionDataset(Dataset):
             transform: DetectionAugment | None = None,
             normalize_boxes=False, indices=None,
             anchors_wh: torch.Tensor | None = None,
+            grid_sizes: tuple[int, ...] = (S,),
+            anchors_per_scale: int | None = None,
     ):
         if anchors_wh is None:
             raise ValueError("DetectionDataset requires anchors_wh fitted from the training split")
         if anchors_wh.ndim != 2 or anchors_wh.size(1) != 2:
             raise ValueError("anchors_wh must have shape (K, 2)")
+        if not grid_sizes or any(grid_size < 1 for grid_size in grid_sizes):
+            raise ValueError("grid_sizes must contain one or more positive grid sizes")
+
+        if anchors_per_scale is None:
+            if anchors_wh.size(0) % len(grid_sizes) != 0:
+                raise ValueError(
+                    "anchors_wh cannot be divided evenly across the requested grid sizes"
+                )
+            anchors_per_scale = anchors_wh.size(0) // len(grid_sizes)
+        expected_anchors = len(grid_sizes) * anchors_per_scale
+        if anchors_wh.size(0) != expected_anchors:
+            raise ValueError(
+                "anchors_wh must contain anchors_per_scale anchors for every grid size; "
+                f"expected {expected_anchors}, got {anchors_wh.size(0)}"
+            )
 
         self.reader = reader if reader is not None else DataReader(root=ROOT_DIR / "train")
         self.transform = transform
         self.normalize_boxes = normalize_boxes
         self.indices = indices
         self.anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu").contiguous()
+        self.grid_sizes = tuple(grid_sizes)
+        self.anchors_per_scale = anchors_per_scale
 
     def __len__(self):
         return len(self.indices) if self.indices is not None else len(self.reader)
@@ -421,29 +442,42 @@ class DetectionDataset(Dataset):
 
     def collate_fn(self, batch):
         """
-        Collate batch of records into model input and spatial grid target tensors.
+        Collate records into single- or multi-scale spatial targets.
 
-        For each image:
-          1. Computes cell coordinates (gx, gy) on the S x S grid from box centers (cx, cy).
-          2. Computes shape IoU between each box and all K anchors.
-          3. Assigns the box to the highest-IoU free anchor slot in that cell, or replaces
-             an occupied slot if the new box yields a higher IoU improvement.
+        Multi-scale mode assigns each box to its best shape-IoU anchor across all
+        scale groups. Anchors are ordered from smallest to largest and therefore
+        map to fine-to-coarse grids in ``grid_sizes``.
 
         Returns:
             images (torch.Tensor): Image tensor of shape (B, C, H, W).
-            targets (torch.Tensor): Grid targets of shape (B, S, S, K, 5) where last dim is [x, y, w, h, obj].
-            labels (torch.Tensor): Class index tensor of shape (B, S, S, K).
+            targets: Tensor/labels tensors in legacy single-scale mode, otherwise
+                dictionaries keyed by grid size.
         """
         images = torch.stack([r.image for r in batch])
         B = len(batch)
-        K = self.anchors_wh.size(0)
-
-        targets = torch.zeros(B, S, S, K, 5, dtype=torch.float32)
-        labels = torch.zeros(B, S, S, K, dtype=torch.int64)
-        matched_ious = torch.full((B, S, S, K), -1.0, dtype=torch.float32)
+        targets_by_scale = {
+            grid_size: torch.zeros(
+                B, grid_size, grid_size, self.anchors_per_scale, 5,
+                dtype=torch.float32,
+            )
+            for grid_size in self.grid_sizes
+        }
+        labels_by_scale = {
+            grid_size: torch.zeros(
+                B, grid_size, grid_size, self.anchors_per_scale,
+                dtype=torch.int64,
+            )
+            for grid_size in self.grid_sizes
+        }
+        matched_ious_by_scale = {
+            grid_size: torch.full(
+                (B, grid_size, grid_size, self.anchors_per_scale),
+                -1.0,
+                dtype=torch.float32,
+            )
+            for grid_size in self.grid_sizes
+        }
         _, h, w = batch[0].image.shape
-        cell_w = w / S
-        cell_h = h / S
 
         for i, r in enumerate(batch):
             if r.boxes.numel() == 0:
@@ -455,34 +489,33 @@ class DetectionDataset(Dataset):
             all_anchor_ious = inter / union.clamp_min(1e-6)
 
             for box_idx, (b, l) in enumerate(zip(r.boxes, r.labels)):
+                anchor_ious = all_anchor_ious[box_idx]
+                global_anchor_idx = int(anchor_ious.argmax().item())
+                scale_idx, anchor_idx = divmod(
+                    global_anchor_idx,
+                    self.anchors_per_scale,
+                )
+                grid_size = self.grid_sizes[scale_idx]
+                cell_w = w / grid_size
+                cell_h = h / grid_size
                 cx = b[0] + b[2] / 2
                 cy = b[1] + b[3] / 2
+                gx = min(grid_size - 1, max(0, int(cx // cell_w)))
+                gy = min(grid_size - 1, max(0, int(cy // cell_h)))
 
-                gx = min(S - 1, max(0, int(cx // cell_w)))
-                gy = min(S - 1, max(0, int(cy // cell_h)))
-
-                anchor_ious = all_anchor_ious[box_idx]
-                anchor_order = anchor_ious.argsort(descending=True)
-
-                occupied = targets[i, gy, gx, :, 4].bool()
-                free_in_order = anchor_order[~occupied[anchor_order]]
-
-                if free_in_order.numel() > 0:
-                    anchor_idx = free_in_order[0].item()
+                matched_ious = matched_ious_by_scale[grid_size]
+                if anchor_ious[global_anchor_idx] > matched_ious[i, gy, gx, anchor_idx]:
+                    targets = targets_by_scale[grid_size]
+                    labels = labels_by_scale[grid_size]
                     targets[i, gy, gx, anchor_idx, :4] = b
                     targets[i, gy, gx, anchor_idx, 4] = 1.0
                     labels[i, gy, gx, anchor_idx] = l
-                    matched_ious[i, gy, gx, anchor_idx] = anchor_ious[anchor_idx]
-                else:
-                    improvement = anchor_ious - matched_ious[i, gy, gx]
-                    replacement_idx = int(improvement.argmax().item())
-                    if improvement[replacement_idx].item() > 0.0:
-                        targets[i, gy, gx, replacement_idx, :4] = b
-                        targets[i, gy, gx, replacement_idx, 4] = 1.0
-                        labels[i, gy, gx, replacement_idx] = l
-                        matched_ious[i, gy, gx, replacement_idx] = anchor_ious[replacement_idx]
+                    matched_ious[i, gy, gx, anchor_idx] = anchor_ious[global_anchor_idx]
 
-        return images, targets, labels
+        if len(self.grid_sizes) == 1:
+            grid_size = self.grid_sizes[0]
+            return images, targets_by_scale[grid_size], labels_by_scale[grid_size]
+        return images, targets_by_scale, labels_by_scale
 
 
 def get_detection_loaders(
@@ -501,6 +534,8 @@ def get_detection_loaders(
         prefetch_factor: int = 2,
         num_anchors: int = K,
         anchors_wh: torch.Tensor | None = None,
+        grid_sizes: tuple[int, ...] = (S,),
+        anchors_per_scale: int | None = None,
 ) -> tuple | DataLoader:
     """
     Factory function to construct train, val, or test DataLoaders for spatial grid detection.
@@ -519,12 +554,26 @@ def get_detection_loaders(
         normalize_boxes (bool): Whether to normalize box coordinates. Default: False.
         seed (int): Random seed for reproducible splits and anchor initialization. Default: 42.
         prefetch_factor (int): Number of batches preloaded per worker. Default: 2.
-        num_anchors (int): Number of anchor slots (K) per cell. Default: from utils.dataset.K.
-        anchors_wh (torch.Tensor | None): Pre-fitted anchor dimensions of shape (K, 2). If None,
+        num_anchors (int): Number of anchor slots (K) per cell in single-scale mode.
+        anchors_wh (torch.Tensor | None): Pre-fitted anchor dimensions. If None,
             anchors are automatically fitted from the training split via k-means.
+        grid_sizes (tuple[int, ...]): Output grid sizes, fine to coarse. The
+            default ``(28,)`` preserves the legacy loader contract.
+        anchors_per_scale (int | None): Anchors assigned to each scale. For the
+            two-scale ``(28, 14)`` configuration, defaults to three; otherwise
+            it defaults to ``num_anchors``.
     """
     if num_workers is None:
         num_workers = _auto_detection_workers()
+    if not grid_sizes or any(grid_size < 1 for grid_size in grid_sizes):
+        raise ValueError("grid_sizes must contain one or more positive grid sizes")
+    if anchors_per_scale is None:
+        anchors_per_scale = (
+            YOLO_ANCHORS_PER_SCALE
+            if tuple(grid_sizes) == YOLO_GRID_SIZES
+            else num_anchors
+        )
+    total_anchors = len(grid_sizes) * anchors_per_scale
 
     def _get_loader(
             reader,
@@ -538,6 +587,8 @@ def get_detection_loaders(
             normalize_boxes=normalize_boxes,
             indices=indices,
             anchors_wh=anchors_wh,
+            grid_sizes=grid_sizes,
+            anchors_per_scale=anchors_per_scale,
         )
 
         loader_kwargs = dict(
@@ -595,14 +646,14 @@ def get_detection_loaders(
     if anchors_wh is None:
         anchors_wh = fit_anchors_wh(
             _collect_box_wh(train_reader, train_idx),
-            k=num_anchors,
+            k=total_anchors,
             seed=seed,
         )
     else:
         anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu")
-        if anchors_wh.ndim != 2 or anchors_wh.shape != (num_anchors, 2):
+        if anchors_wh.ndim != 2 or anchors_wh.shape != (total_anchors, 2):
             raise ValueError(
-                f"anchors_wh must have shape ({num_anchors}, 2), got {tuple(anchors_wh.shape)}"
+                f"anchors_wh must have shape ({total_anchors}, 2), got {tuple(anchors_wh.shape)}"
             )
 
     loaders.append(_get_loader(

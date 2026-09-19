@@ -28,6 +28,36 @@ except ImportError:
 _AMP_DTYPE = torch.bfloat16
 
 
+def _move_detection_batch_to_device(value, device):
+    """Move a tensor or the keyed tensors of a multi-scale batch to ``device``."""
+    if isinstance(value, dict):
+        return {
+            grid_size: tensor.to(device, non_blocking=True)
+            for grid_size, tensor in value.items()
+        }
+    return value.to(device, non_blocking=True)
+
+
+def _flatten_detection_scales(value: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
+    """Flatten all grid/anchor locations while preserving batch and channel axes."""
+    if isinstance(value, dict):
+        return torch.cat(
+            [tensor.reshape(tensor.size(0), -1, tensor.size(-1)) for tensor in value.values()],
+            dim=1,
+        )
+    return value.reshape(value.size(0), -1, value.size(-1))
+
+
+def _flatten_detection_labels(value: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
+    """Flatten the label locations corresponding to ``_flatten_detection_scales``."""
+    if isinstance(value, dict):
+        return torch.cat(
+            [tensor.reshape(tensor.size(0), -1) for tensor in value.values()],
+            dim=1,
+        )
+    return value.reshape(value.size(0), -1)
+
+
 def train_one_epoch(
         model, loader, criterion, optimizer,
         device, scheduler=None, scaler=None,
@@ -320,8 +350,8 @@ def train_one_epoch_detection(
 ):
     """Training loop for multi-object detection.
 
-    Expects loader to yield (images, list[Record]).
-    Uses records_to_padded_tensors internally before loss computation.
+    Expects the detection loader to yield ``(images, targets, labels)``.
+    Targets and labels may be legacy tensors or dictionaries keyed by grid size.
     """
     model.train()
     epoch_loss = 0.0
@@ -345,8 +375,8 @@ def train_one_epoch_detection(
             t_data = time.perf_counter()
 
         images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        targets = _move_detection_batch_to_device(targets, device)
+        labels = _move_detection_batch_to_device(labels, device)
 
         if is_timing:
             torch.cuda.synchronize()
@@ -454,8 +484,8 @@ def evaluate_detection(
     with torch.no_grad():
         for images, targets, labels in loader:
             images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            targets = _move_detection_batch_to_device(targets, device)
+            labels = _move_detection_batch_to_device(labels, device)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
@@ -467,11 +497,14 @@ def evaluate_detection(
 
             total_loss += loss.item()
 
-            gt_obj = targets[..., 4].bool()
-            gt_bxs = targets[..., :4]
-            pred_conf_grid = torch.sigmoid(outputs[..., 4].float())
-            pred_boxes_grid = outputs[..., :4].float()
-            pred_class_grid = outputs[..., 5:].float()
+            flat_targets = _flatten_detection_scales(targets)
+            flat_labels = _flatten_detection_labels(labels)
+            flat_outputs = _flatten_detection_scales(outputs)
+            gt_obj = flat_targets[..., 4].bool()
+            gt_bxs = flat_targets[..., :4]
+            pred_conf_grid = torch.sigmoid(flat_outputs[..., 4].float())
+            pred_boxes_grid = flat_outputs[..., :4].float()
+            pred_class_grid = flat_outputs[..., 5:].float()
             if pred_class_grid.size(-1) == 0:
                 raise ValueError(
                     "evaluate_detection requires model outputs with class logits."
@@ -483,7 +516,7 @@ def evaluate_detection(
             pred_labels_np = pred_labels_grid.cpu().numpy()
             gt_obj_np = gt_obj.cpu().numpy()
             gt_bxs_np = gt_bxs.cpu().numpy()
-            gt_labels_np = labels.cpu().numpy()
+            gt_labels_np = flat_labels.cpu().numpy()
 
             if confusion_matrix is None:
                 num_classes = pred_class_grid.size(-1)
@@ -698,8 +731,8 @@ def evaluate_detection_sweep(
     with torch.no_grad():
         for images, targets, labels in loader:
             images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            targets = _move_detection_batch_to_device(targets, device)
+            labels = _move_detection_batch_to_device(labels, device)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
@@ -707,12 +740,15 @@ def evaluate_detection_sweep(
             else:
                 outputs = model(images)
 
-            pred_conf_grid   = torch.sigmoid(outputs[..., 4].float())
-            pred_boxes_grid  = outputs[..., :4].float()
-            pred_class_grid  = outputs[..., 5:].float()
+            flat_outputs = _flatten_detection_scales(outputs)
+            flat_targets = _flatten_detection_scales(targets)
+            flat_labels = _flatten_detection_labels(labels)
+            pred_conf_grid   = torch.sigmoid(flat_outputs[..., 4].float())
+            pred_boxes_grid  = flat_outputs[..., :4].float()
+            pred_class_grid  = flat_outputs[..., 5:].float()
             pred_labels_grid = pred_class_grid.argmax(dim=-1)
-            gt_obj = targets[..., 4].bool()
-            gt_bxs = targets[..., :4]
+            gt_obj = flat_targets[..., 4].bool()
+            gt_bxs = flat_targets[..., :4]
 
             if num_classes is None:
                 num_classes = pred_class_grid.size(-1)
@@ -722,7 +758,7 @@ def evaluate_detection_sweep(
             pred_labels_np = pred_labels_grid.cpu().numpy()
             gt_obj_np      = gt_obj.cpu().numpy()
             gt_bxs_np      = gt_bxs.cpu().numpy()
-            gt_labels_np   = labels.cpu().numpy()
+            gt_labels_np   = flat_labels.cpu().numpy()
 
             for b in range(images.size(0)):
                 pos_b = gt_obj_np[b]
@@ -852,7 +888,7 @@ def evaluate_density_sweep(
     with torch.no_grad():
         for images, targets, labels in loader:
             images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            targets = _move_detection_batch_to_device(targets, device)
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
@@ -860,10 +896,12 @@ def evaluate_density_sweep(
             else:
                 outputs = model(images)
 
-            pred_boxes_grid = outputs[..., :4].float()
-            pred_conf_grid  = torch.sigmoid(outputs[..., 4].float())
-            gt_obj = targets[..., 4].bool()
-            gt_bxs = targets[..., :4]
+            flat_outputs = _flatten_detection_scales(outputs)
+            flat_targets = _flatten_detection_scales(targets)
+            pred_boxes_grid = flat_outputs[..., :4].float()
+            pred_conf_grid  = torch.sigmoid(flat_outputs[..., 4].float())
+            gt_obj = flat_targets[..., 4].bool()
+            gt_bxs = flat_targets[..., :4]
 
             pred_conf_np  = pred_conf_grid.cpu().numpy()
             pred_boxes_np = pred_boxes_grid.cpu().numpy()

@@ -15,16 +15,19 @@ from models import ObjectDetectorResNet, CharacterClassifierResNet
 
 import torch
 
-from .object_detector_res      import ObjectDetectorResNet
+from .object_detector_res      import MultiScaleObjectDetectorResNet, ObjectDetectorResNet
 from .character_classifier_resnet import CharacterClassifierResNet
 from utils.dataset import S
 
 __all__ = [
     "ObjectDetectorResNet",
+    "MultiScaleObjectDetectorResNet",
     "CharacterClassifierResNet",
     "get_detector",
+    "get_multiscale_detector",
     "get_classifier",
     "load_detector",
+    "load_multiscale_detector",
     "load_classifier",
 ]
 S = S
@@ -65,6 +68,20 @@ def get_detector(size: str = "s", **kwargs) -> ObjectDetectorResNet:
     return ObjectDetectorResNet(channels=channels, blocks=blocks, **kwargs)
 
 
+def get_multiscale_detector(size: str = "s", **kwargs) -> MultiScaleObjectDetectorResNet:
+    """Return the two-scale FPN detector for the requested size preset."""
+    size = size.lower()
+    if size not in MultiScaleObjectDetectorResNet.CONFIGS:
+        raise ValueError(
+            f"Unknown size '{size}'. Choose from: {list(MultiScaleObjectDetectorResNet.CONFIGS)}"
+        )
+
+    _, preset_channels, preset_blocks, _ = MultiScaleObjectDetectorResNet.CONFIGS[size]
+    channels = kwargs.pop("channels", preset_channels)
+    blocks = kwargs.pop("blocks", preset_blocks)
+    return MultiScaleObjectDetectorResNet(channels=channels, blocks=blocks, **kwargs)
+
+
 def get_classifier(num_classes: int = 62, **kwargs) -> CharacterClassifierResNet:
     """Return a CharacterClassifierResNet.
 
@@ -94,6 +111,23 @@ def load_detector(path: str, device, size: str = "m", **kwargs) -> ObjectDetecto
     if isinstance(raw, dict) and 'anchors_wh' in raw:
         model.anchors_wh = raw['anchors_wh']
     model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model
+
+
+def load_multiscale_detector(
+        path: str,
+        device,
+        size: str = "m",
+        **kwargs,
+) -> MultiScaleObjectDetectorResNet:
+    """Instantiate and load a two-scale FPN detector checkpoint."""
+    model = get_multiscale_detector(size=size, **kwargs).to(device)
+    raw = torch.load(path, map_location=device, weights_only=False)
+    state_dict = raw.get('model_state_dict', raw) if isinstance(raw, dict) else raw
+    if isinstance(raw, dict) and 'anchors_wh' in raw:
+        model.anchors_wh = raw['anchors_wh']
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
