@@ -18,7 +18,8 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from .losses import pairwise_iou, mean_iou, DetectionLoss  # noqa: F401
+from .losses import pairwise_iou, mean_iou, DetectionLoss, FCOSLoss  # noqa: F401
+from .fcos_targets import FCOSTargets
 try:
     import wandb
 except ImportError:
@@ -30,12 +31,31 @@ _AMP_DTYPE = torch.bfloat16
 
 def _move_detection_batch_to_device(value, device):
     """Move a tensor or the keyed tensors of a multi-scale batch to ``device``."""
+    if value is None:
+        return None
     if isinstance(value, dict):
-        return {
-            grid_size: tensor.to(device, non_blocking=True)
-            for grid_size, tensor in value.items()
-        }
+        return {grid_size: _move_detection_batch_to_device(tensor, device) for grid_size, tensor in value.items()}
+    if isinstance(value, (tuple, list)):
+        moved = [_move_detection_batch_to_device(item, device) for item in value]
+        return type(value)(moved)
+    if isinstance(value, FCOSTargets):
+        return value.to(device, non_blocking=True)
     return value.to(device, non_blocking=True)
+
+
+def _loss_value(loss_output):
+    """Extract the scalar loss from criteria that also return diagnostics."""
+    return loss_output[0] if isinstance(loss_output, tuple) else loss_output
+
+
+def _prepare_fcos_targets(targets, labels, criterion, device):
+    """Generate deferred FCOS targets directly on the training device."""
+    if targets is not None:
+        return targets
+    if not isinstance(criterion, FCOSLoss) or not isinstance(labels, (tuple, list)) or len(labels) != 2:
+        raise ValueError("Deferred FCOS targets require FCOSLoss and (boxes, labels) annotations")
+    boxes_batch, labels_batch = labels
+    return criterion.target_generator.generate_targets(boxes_batch, labels_batch, device)
 
 
 def _flatten_detection_scales(value: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
@@ -377,6 +397,7 @@ def train_one_epoch_detection(
         images = images.to(device, non_blocking=True)
         targets = _move_detection_batch_to_device(targets, device)
         labels = _move_detection_batch_to_device(labels, device)
+        targets = _prepare_fcos_targets(targets, labels, criterion, device)
 
         if is_timing:
             torch.cuda.synchronize()
@@ -387,10 +408,10 @@ def train_one_epoch_detection(
         if is_timing:
             t0 = t_pad
 
-        with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+        with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE, enabled=use_amp):
             outputs = model(images)
             if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
-            loss = criterion(outputs, targets, labels)
+            loss = _loss_value(criterion(outputs, targets, labels))
             if is_timing: torch.cuda.synchronize(); t2 = time.perf_counter()
 
         prev_scale = scaler.get_scale() if scaler is not None else None
@@ -445,6 +466,167 @@ def train_one_epoch_detection(
 
 
 
+def evaluate_fcos_detection(
+    model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
+):
+    """Evaluate FCOS outputs with centerness-gated class-wise NMS."""
+    from .pipeline import _decode_fcos_candidates
+
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    total_iou = 0.0
+    iou_images = 0
+    tp = fp = fn = 0
+    e2e_tp = e2e_fp = e2e_fn = 0
+    class_correct = class_total = 0
+    num_classes = getattr(model, "num_classes", 47)
+    class_names = _infer_class_names_from_loader(loader)
+    if class_names is None:
+        from generator.dataset import EMNIST_CLASS_NAMES
+        class_names = list(EMNIST_CLASS_NAMES["bymerge"])
+    confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    per_class_e2e_tp = np.zeros(num_classes, dtype=np.int64)
+    per_class_e2e_fp = np.zeros(num_classes, dtype=np.int64)
+    per_class_e2e_fn = np.zeros(num_classes, dtype=np.int64)
+
+    with torch.no_grad():
+        for images, targets, labels in loader:
+            images = images.to(device, non_blocking=True)
+            targets = _move_detection_batch_to_device(targets, device)
+            labels = _move_detection_batch_to_device(labels, device)
+            targets = _prepare_fcos_targets(targets, labels, criterion, device)
+
+            with torch.autocast(device_type="cuda", dtype=_AMP_DTYPE, enabled=device.type == "cuda"):
+                outputs = model(images)
+                loss = _loss_value(criterion(outputs, targets, labels))
+            total_loss += loss.item()
+            total_batches += 1
+
+            candidates = _decode_fcos_candidates(
+                model, outputs, score_threshold=conf_threshold, iou_threshold=iou_threshold
+            )
+            boxes_batch, labels_batch = labels
+
+            for batch_idx, (pred_boxes, pred_scores, pred_classes) in enumerate(candidates):
+                gt_boxes = boxes_batch[batch_idx].float()
+                gt_labels = labels_batch[batch_idx].long()
+                n_gt = int(gt_boxes.shape[0])
+
+                if pred_boxes.numel() == 0:
+                    fn += n_gt
+                    e2e_fn += n_gt
+                    for gt_class in gt_labels.tolist():
+                        per_class_e2e_fn[int(gt_class)] += 1
+                    continue
+                if n_gt == 0:
+                    n_pred = int(pred_boxes.shape[0])
+                    fp += n_pred
+                    e2e_fp += n_pred
+                    for pred_class in pred_classes.tolist():
+                        per_class_e2e_fp[int(pred_class)] += 1
+                    continue
+
+                order = pred_scores.argsort(descending=True)
+                pred_boxes = pred_boxes[order]
+                pred_classes = pred_classes[order]
+                iou_matrix = pairwise_iou(pred_boxes, gt_boxes).cpu().numpy()
+                total_iou += float(iou_matrix.max(axis=0).mean())
+                iou_images += 1
+
+                matched = set()
+                for pred_idx in range(pred_boxes.shape[0]):
+                    gt_idx = int(np.argmax(iou_matrix[pred_idx]))
+                    if iou_matrix[pred_idx, gt_idx] >= iou_threshold and gt_idx not in matched:
+                        matched.add(gt_idx)
+                        tp += 1
+                        gt_class = int(gt_labels[gt_idx])
+                        pred_class = int(pred_classes[pred_idx])
+                        confusion_matrix[gt_class, pred_class] += 1
+                        class_total += 1
+                        if pred_class == gt_class:
+                            class_correct += 1
+                            e2e_tp += 1
+                            per_class_e2e_tp[gt_class] += 1
+                        else:
+                            e2e_fp += 1
+                            e2e_fn += 1
+                            per_class_e2e_fp[pred_class] += 1
+                            per_class_e2e_fn[gt_class] += 1
+                    else:
+                        fp += 1
+                        e2e_fp += 1
+                        per_class_e2e_fp[int(pred_classes[pred_idx])] += 1
+
+                unmatched = n_gt - len(matched)
+                fn += unmatched
+                e2e_fn += unmatched
+                for gt_idx in set(range(n_gt)) - matched:
+                    per_class_e2e_fn[int(gt_labels[gt_idx])] += 1
+
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    e2e_precision = e2e_tp / (e2e_tp + e2e_fp) if e2e_tp + e2e_fp else 0.0
+    e2e_recall = e2e_tp / (e2e_tp + e2e_fn) if e2e_tp + e2e_fn else 0.0
+    e2e_f1 = (
+        2 * e2e_precision * e2e_recall / (e2e_precision + e2e_recall)
+        if e2e_precision + e2e_recall else 0.0
+    )
+
+    per_class = {}
+    for class_idx in range(num_classes):
+        class_count = int(confusion_matrix[class_idx].sum())
+        class_hits = int(confusion_matrix[class_idx, class_idx])
+        e2e_tp_k = int(per_class_e2e_tp[class_idx])
+        e2e_fp_k = int(per_class_e2e_fp[class_idx])
+        e2e_fn_k = int(per_class_e2e_fn[class_idx])
+        e2e_p_k = e2e_tp_k / (e2e_tp_k + e2e_fp_k) if e2e_tp_k + e2e_fp_k else 0.0
+        e2e_r_k = e2e_tp_k / (e2e_tp_k + e2e_fn_k) if e2e_tp_k + e2e_fn_k else 0.0
+        e2e_f1_k = (
+            2 * e2e_p_k * e2e_r_k / (e2e_p_k + e2e_r_k)
+            if e2e_p_k + e2e_r_k else 0.0
+        )
+        class_metrics = {
+            "accuracy": class_hits / class_count if class_count else 0.0,
+            "correct": class_hits,
+            "total": class_count,
+            "e2e_tp": e2e_tp_k,
+            "e2e_fp": e2e_fp_k,
+            "e2e_fn": e2e_fn_k,
+            "e2e_precision": round(float(e2e_p_k), 4),
+            "e2e_recall": round(float(e2e_r_k), 4),
+            "e2e_f1": round(float(e2e_f1_k), 4),
+        }
+        if class_names is not None and class_idx < len(class_names):
+            class_metrics["name"] = class_names[class_idx]
+        per_class[class_idx] = class_metrics
+
+    return {
+        "loss": total_loss / max(total_batches, 1),
+        "detection": {
+            "iou": total_iou / max(iou_images, 1),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "tp": int(tp), "fp": int(fp), "fn": int(fn),
+        },
+        "classification": {
+            "accuracy": class_correct / class_total if class_total else 0.0,
+            "correct": int(class_correct),
+            "total": int(class_total),
+            "per_class": per_class,
+            "confusion_matrix": confusion_matrix.tolist(),
+        },
+        "end_to_end": {
+            "precision": e2e_precision,
+            "recall": e2e_recall,
+            "f1": e2e_f1,
+            "tp": int(e2e_tp), "fp": int(e2e_fp), "fn": int(e2e_fn),
+        },
+    }
+
+
 def evaluate_detection(
     model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
@@ -468,6 +650,11 @@ def evaluate_detection(
     For full P/R/F1 threshold sweeps, use ``evaluate_detection_sweep()``.
     Expects loader to yield (images, targets, labels).
     """
+    if isinstance(criterion, FCOSLoss):
+        return evaluate_fcos_detection(
+            model, loader, criterion, device, conf_threshold, iou_threshold
+        )
+
     model.eval()
     total_loss = 0.0
     total_iou = 0.0
@@ -490,10 +677,10 @@ def evaluate_detection(
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
                     outputs = model(images)
-                    loss = criterion(outputs, targets, labels)
+                    loss = _loss_value(criterion(outputs, targets, labels))
             else:
                 outputs = model(images)
-                loss = criterion(outputs, targets, labels)
+                loss = _loss_value(criterion(outputs, targets, labels))
 
             total_loss += loss.item()
 
@@ -991,6 +1178,7 @@ def fit(
     model_label: str = None,
     resume: bool = False,
     anchors_wh: torch.Tensor | None = None,
+    validation_interval: int = 1,
 ):
     """
     Full training loop with per-epoch logging, validation, and optional checkpointing.
@@ -1028,6 +1216,8 @@ def fit(
         model_label (str | None): Optional label added to the run config.
         resume (bool): If True, resume from the last checkpoint. Defaults to False.
         anchors_wh (Tensor | None): Fitted width/height anchor dimensions (K, 2).
+        validation_interval (int): Validate and checkpoint every N epochs, plus
+            always validate the final epoch. Defaults to 1.
 
     Returns:
         tuple: (history, logger)
@@ -1046,6 +1236,9 @@ def fit(
         'val_e2e_precision': [],
         'val_e2e_recall':   [],
     }
+
+    if validation_interval < 1:
+        raise ValueError("validation_interval must be at least 1")
 
     if anchors_wh is None and hasattr(trainloader, "dataset"):
         anchors_wh = getattr(trainloader.dataset, "anchors_wh", None)
@@ -1086,6 +1279,7 @@ def fit(
         except FileNotFoundError as e:
             print(f"Could not resume training: {e}")
 
+    last_metrics = None
     for epoch in range(start_epoch, epochs):
         train_start = time.perf_counter()
 
@@ -1106,7 +1300,16 @@ def fit(
         # ── Validate ──────────────────────────────────────────────────────────
         current_lr = optimizer.param_groups[0]["lr"]
 
-        metrics           = evaluate_detection(model, valloader, criterion, device)
+        should_validate = (
+            last_metrics is None
+            or (epoch - start_epoch) % validation_interval == 0
+            or epoch == epochs - 1
+        )
+        if should_validate:
+            metrics = evaluate_detection(model, valloader, criterion, device)
+            last_metrics = metrics
+        else:
+            metrics = last_metrics
         avg_val_loss      = metrics["loss"]
         det               = metrics["detection"]
         cls               = metrics["classification"]
@@ -1134,7 +1337,8 @@ def fit(
 
         val_end = time.perf_counter()
         elapsed = train_end - train_start
-        print(f"Train: {train_end - train_start:.1f}s | Val: {val_end - train_end:.1f}s")
+        val_label = "Val" if should_validate else "Val skipped"
+        print(f"Train: {train_end - train_start:.1f}s | {val_label}: {val_end - train_end:.1f}s")
         print(
             f"  --> Det  | PR: {val_precision:.3f} | Rec: {val_recall:.3f} | F1: {val_f1:.3f} "
             f"| TP: {det['tp']} FP: {det['fp']} FN: {det['fn']}"
@@ -1148,7 +1352,7 @@ def fit(
         )
 
         # ── Checkpoint / best tracking ────────────────────────────────────────
-        if checkpoint is not None:
+        if checkpoint is not None and should_validate:
             is_best = checkpoint(
                 val_metric, epoch, optimizer, scheduler, scaler,
                 metrics={

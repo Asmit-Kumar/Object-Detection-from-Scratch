@@ -2,7 +2,7 @@
 utils/pipeline.py — End-to-End Object Detection & Character Recognition Pipeline.
 
 Combines:
-  1. ObjectDetectorResNet (Stage 1: Multi-slot character detection)
+  1. ObjectDetectorResNet / FCOSObjectDetectorResNet (Stage 1: Multi-slot / Anchor-free character detection)
   2. CharacterClassifierResNet (Stage 2: 47-class EMNIST ByMerge character recognition)
 
 Features:
@@ -40,6 +40,86 @@ def _apply_nms(boxes_xywh: torch.Tensor, confs: torch.Tensor, iou_thresh: float 
     y2 = y1 + boxes_xywh[:, 3]
     boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
     return torchvision.ops.nms(boxes_xyxy, confs, iou_thresh)
+
+
+def _decode_fcos_candidates(
+        detector,
+        outputs: dict[int, dict[str, torch.Tensor]],
+        score_threshold: float,
+        iou_threshold: float = 0.45,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Decode FCOS outputs, gate scores with centerness, and apply class-wise NMS.
+
+    Returns one ``(boxes_xywh, scores, classes)`` tuple per batch item. The
+    highest-scoring class at each location is retained because the second
+    pipeline stage performs the final character classification.
+    """
+    first_reg = next(iter(outputs.values()))["reg_ltrb"]
+    batch_size = first_reg.size(0)
+    num_classes = next(iter(outputs.values()))["cls_logits"].size(-1)
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+    all_batch_ids = []
+
+    # Decode every image and pyramid level in one tensor pass. NMS is then
+    # performed once for the whole batch, grouped by (image, class), instead
+    # of launching one NMS call per image.
+    for grid_size, preds in outputs.items():
+        reg_ltrb = preds["reg_ltrb"].float()
+        cls_probs = preds["cls_logits"].float().sigmoid()
+        cent_probs = preds["centerness_logits"].float().sigmoid().unsqueeze(-1)
+        scores, classes = torch.sqrt((cls_probs * cent_probs).clamp_min(1e-12)).max(dim=-1)
+
+        height, width = reg_ltrb.shape[1:3]
+        centers = detector.generate_grid_centers(
+            height, width, detector.STRIDES[grid_size], reg_ltrb.device
+        )
+        x1 = centers[..., 0].view(1, height, width) - reg_ltrb[..., 0]
+        y1 = centers[..., 1].view(1, height, width) - reg_ltrb[..., 1]
+        x2 = centers[..., 0].view(1, height, width) + reg_ltrb[..., 2]
+        y2 = centers[..., 1].view(1, height, width) + reg_ltrb[..., 3]
+        boxes_xyxy = torch.stack((x1, y1, x2, y2), dim=-1).clamp(0.0, 224.0)
+
+        active = scores >= score_threshold
+        if active.any():
+            all_boxes.append(boxes_xyxy[active])
+            all_scores.append(scores[active])
+            all_classes.append(classes[active])
+            all_batch_ids.append(
+                torch.arange(batch_size, device=reg_ltrb.device)
+                .view(batch_size, 1, 1)
+                .expand_as(scores)[active]
+            )
+
+    if not all_boxes:
+        empty = first_reg.new_zeros((0, 4))
+        return [
+            (empty, empty.new_zeros((0,)), empty.new_zeros((0,), dtype=torch.long))
+            for _ in range(batch_size)
+        ]
+
+    boxes_xyxy = torch.cat(all_boxes, dim=0)
+    scores = torch.cat(all_scores, dim=0)
+    classes = torch.cat(all_classes, dim=0)
+    batch_ids = torch.cat(all_batch_ids, dim=0)
+    nms_groups = batch_ids * num_classes + classes
+    keep = torchvision.ops.batched_nms(boxes_xyxy, scores, nms_groups, iou_threshold)
+
+    boxes_xyxy = boxes_xyxy[keep]
+    scores = scores[keep]
+    classes = classes[keep]
+    batch_ids = batch_ids[keep]
+    candidates = []
+    for batch_idx in range(batch_size):
+        selected = batch_ids == batch_idx
+        boxes = boxes_xyxy[selected]
+        boxes_xywh = torch.cat(
+            (boxes[:, :2], (boxes[:, 2:] - boxes[:, :2]).clamp_min(0.0)),
+            dim=-1,
+        )
+        candidates.append((boxes_xywh, scores[selected], classes[selected]))
+    return candidates
 
 
 def _flatten_detection_outputs(outputs: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
@@ -92,7 +172,7 @@ class DetectionResult:
 class DetectionPipeline:
     """
     Two-Stage End-to-End Detection Pipeline:
-      Stage 1: ObjectDetectorResNet  — detects character bounding boxes.
+      Stage 1: ObjectDetectorResNet / FCOSObjectDetectorResNet — detects character bounding boxes.
       Stage 2: CharacterClassifierResNet — 47-class EMNIST ByMerge recognition.
     """
 
@@ -103,9 +183,10 @@ class DetectionPipeline:
         classifier_weights: str = CLASSIFIER_MODEL_PATH,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
         conf_threshold: float = 0.70,
-        iou_threshold: float = 0.50,
+        iou_threshold: float = 0.45,
         num_classes: int = 47,
         multi_scale_detector: bool = False,
+        fcos_detector: bool = False,
     ):
         self.detector_size   = detector_size
         self.conf_threshold  = conf_threshold
@@ -113,16 +194,26 @@ class DetectionPipeline:
         self.device          = device
         self.num_classes     = num_classes
         self.multi_scale_detector = multi_scale_detector
+        self.fcos_detector = fcos_detector
 
         self.detector   = self._load_detector(detector_weights)
         self.classifier = self._load_classifier(classifier_weights, num_classes)
         self.class_names = EMNIST_CLASS_NAMES["bymerge"]
 
     def _load_detector(self, weights_path: str = None):
-        from models import load_detector, load_multiscale_detector
-        path = weights_path or DETECTOR_MODEL_PATH[self.detector_size.lower()]
+        if self.fcos_detector:
+            from models import load_fcos_detector
+            loader = load_fcos_detector
+        elif self.multi_scale_detector:
+            from models import load_multiscale_detector
+            loader = load_multiscale_detector
+        else:
+            from models import load_detector
+            loader = load_detector
+
+        path = weights_path or DETECTOR_MODEL_PATH.get(self.detector_size.lower(), '')
         print(f"[DetectionPipeline] Loading Detector ('{self.detector_size}') from '{path}'...")
-        if Path(path).exists():
+        if path and Path(path).exists():
             ckpt = torch.load(path, map_location=self.device, weights_only=False)
             if isinstance(ckpt, dict) and "anchors_wh" in ckpt:
                 self.anchors_wh = ckpt["anchors_wh"]
@@ -130,15 +221,14 @@ class DetectionPipeline:
                 self.anchors_wh = None
         else:
             self.anchors_wh = None
-        loader = load_multiscale_detector if self.multi_scale_detector else load_detector
-        return loader(path=path, device=self.device, size=self.detector_size)
+
+        return loader(path=path if path and Path(path).exists() else None, device=self.device, size=self.detector_size)
 
     def _load_classifier(self, weights_path: str = None, num_classes: int = 47):
         from models import load_classifier
         path = weights_path or CLASSIFIER_MODEL_PATH
         print(f"[DetectionPipeline] Loading Classifier from '{path}'...")
         return load_classifier(path=path, device=self.device, num_classes=num_classes)
-
 
     def _preprocess_image_input(self, image_input: Any) -> torch.Tensor:
         """
@@ -232,6 +322,38 @@ class DetectionPipeline:
         return crop_normalized.transpose(-1, -2)
 
     @torch.no_grad()
+    def _detector_candidates(
+        self,
+        images_tensor: torch.Tensor,
+        conf_threshold: float,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Run detector decoding and NMS for every image in a batch."""
+        if self.fcos_detector:
+            raw_out = self.detector(images_tensor)
+            return _decode_fcos_candidates(
+                self.detector,
+                raw_out,
+                score_threshold=conf_threshold,
+                iou_threshold=self.iou_threshold,
+            )
+
+        det_outputs = _flatten_detection_outputs(self.detector(images_tensor))
+        candidates = []
+        for det_output in det_outputs:
+            det_output = det_output.reshape(-1, det_output.shape[-1])
+            boxes = det_output[:, :4]
+            confs = torch.sigmoid(det_output[:, 4])
+            mask = confs >= conf_threshold
+            if not mask.any():
+                candidates.append((boxes.new_zeros((0, 4)), confs.new_zeros((0,)), torch.zeros((0,), dtype=torch.long, device=boxes.device)))
+                continue
+            filtered_boxes = boxes[mask]
+            filtered_confs = confs[mask]
+            keep = _apply_nms(filtered_boxes, filtered_confs, iou_thresh=self.iou_threshold)
+            candidates.append((filtered_boxes[keep], filtered_confs[keep]))
+        return candidates
+
+    @torch.no_grad()
     def predict_image(
         self,
         image_input: Any,
@@ -249,25 +371,13 @@ class DetectionPipeline:
 
         img_tensor = self._preprocess_image_input(image_input)  # (1, 1, 224, 224)
 
-        # Stage 1: Detector
-        det_output = _flatten_detection_outputs(self.detector(img_tensor))
-        det_output = det_output.squeeze(0)
-        det_output = det_output.reshape(-1, det_output.shape[-1])  # (N, 5+C)
-
-        boxes = det_output[:, :4]  # (N, 4)
-        logits = det_output[:, 4]  # (N,)
-        confs = torch.sigmoid(logits)  # (N,)
-
-        mask = confs >= conf_threshold
-        if not mask.any():
+        # Stage 1: Detector, decoding, centerness gating, and NMS.
+        boxes, confs, _ = self._detector_candidates(img_tensor, conf_threshold)[0]
+        if boxes.numel() == 0:
             return []
 
-        filtered_boxes = boxes[mask]
-        filtered_confs = confs[mask]
-        keep = _apply_nms(filtered_boxes, filtered_confs, iou_thresh=0.35)
-
-        valid_boxes = filtered_boxes[keep].cpu().numpy().tolist()
-        valid_confs = filtered_confs[keep].cpu().numpy().tolist()
+        valid_boxes = boxes.cpu().numpy().tolist()
+        valid_confs = confs.cpu().numpy().tolist()
 
         # Stage 2: Parallel Crop Extraction
         img_single = img_tensor.squeeze(0)  # (1, 224, 224)
@@ -319,29 +429,20 @@ class DetectionPipeline:
         images_tensor = images_tensor.to(self.device)
         B = images_tensor.shape[0]
 
-        # Stage 1: Detector Batch Forward Pass
-        det_outputs = _flatten_detection_outputs(self.detector(images_tensor))
+        # Stage 1: Detector Batch Forward Pass, decoding, centerness gating, and NMS.
+        detector_candidates = self._detector_candidates(images_tensor, conf_threshold)
 
         batch_crops = []
         batch_crop_metadata = []  # (batch_idx, bbox, det_conf)
 
         for b in range(B):
             img_single = images_tensor[b]
-            det_output = det_outputs[b].reshape(-1, det_outputs.shape[-1])  # (N, 5+C)
-
-            boxes = det_output[:, :4]
-            confs = torch.sigmoid(det_output[:, 4])
-
-            mask = confs >= conf_threshold
-            if not mask.any():
+            boxes, confs, _ = detector_candidates[b]
+            if boxes.numel() == 0:
                 continue
 
-            filtered_boxes = boxes[mask]
-            filtered_confs = confs[mask]
-            keep = _apply_nms(filtered_boxes, filtered_confs, iou_thresh=0.35)
-
-            valid_boxes = filtered_boxes[keep].cpu().numpy().tolist()
-            valid_confs = filtered_confs[keep].cpu().numpy().tolist()
+            valid_boxes = boxes.cpu().numpy().tolist()
+            valid_confs = confs.cpu().numpy().tolist()
 
             for bbox, det_c in zip(valid_boxes, valid_confs):
                 crop = self.crop_and_preprocess_patch(img_single, bbox)
@@ -408,6 +509,10 @@ class DetectionPipeline:
                     mask = gt_mask_batch[b]
                     gt_boxes = gt_boxes_batch[b][mask].cpu().numpy()  # (M, 4)
                     gt_labels = gt_labels_batch[b][mask].cpu().numpy()  # (M,)
+                elif len(batch) == 3 and isinstance(batch[2], tuple):
+                    boxes_list, labels_list = batch[2]
+                    gt_boxes = boxes_list[b].cpu().numpy()
+                    gt_labels = labels_list[b].cpu().numpy()
                 else:  # (images, targets, labels) grid format
                     targets_batch = _flatten_detection_targets(batch[1])
                     gt_labels_grid = _flatten_detection_labels(batch[2])
@@ -440,7 +545,6 @@ class DetectionPipeline:
 
                 if matching_mode == "hungarian":
                     from scipy.optimize import linear_sum_assignment
-                    # Solve optimal 1-to-1 bipartite assignment maximizing total IoU
                     pred_indices, gt_indices = linear_sum_assignment(-iou_mat)
                     for k, m in zip(pred_indices, gt_indices):
                         if iou_mat[k, m] >= iou_match_thresh:
@@ -449,8 +553,6 @@ class DetectionPipeline:
                                 correct_chars_on_matched_boxes += 1
                                 end2end_tp += 1
                 else:
-                    # --- Confidence-sorted greedy matching ---
-                    # Highest-confidence predictions claim their best GT box first
                     sort_order = np.argsort([-p.detector_conf for p in preds])
                     matched_gt = set()
                     for k in sort_order:
@@ -515,13 +617,12 @@ class DetectionPipeline:
             if not p_dir.exists():
                 return placement_name, {"error": "directory_not_found"}
 
-            # Load test loader — num_workers=0 required on Windows: spawning
-            # DataLoader workers inside a ThreadPoolExecutor causes freeze_support errors.
             test_loader = get_detection_loaders(
                 data_root=p_dir,
                 batch_size=batch_size,
                 num_workers=0,
                 test_only=True,
+                fcos=self.fcos_detector,
                 anchors_wh=getattr(self, "anchors_wh", None),
                 grid_sizes=getattr(self.detector, "grid_sizes", (28,)),
                 anchors_per_scale=getattr(self.detector, "anchors_per_scale", None),
@@ -554,8 +655,6 @@ class DetectionPipeline:
 
 
 if __name__ == "__main__":
-    # Ensure project root and generator are on the path when run as a script
-    # (e.g. `python utils/pipeline.py`). Not needed when imported normally.
     _root = Path(__file__).resolve().parent.parent
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
@@ -591,4 +690,3 @@ if __name__ == "__main__":
             )
     else:
         print("\nNo sample image found to run single-image prediction.")
-

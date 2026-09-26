@@ -203,6 +203,62 @@ class Visualizer:
         plt.show()
 
     @staticmethod
+    def visualize_fcos_batch(
+        imgs_v, candidates, gt_boxes=None, gt_labels=None,
+        class_names=None, max_images=10,
+    ):
+        """Visualize decoded FCOS predictions alongside ground-truth boxes."""
+        n_show = min(max_images, imgs_v.size(0), len(candidates))
+        if n_show == 0:
+            print('No images available for FCOS visualisation.')
+            return
+
+        columns = min(5, n_show)
+        rows = int(np.ceil(n_show / columns))
+        fig, axes = plt.subplots(rows, columns, figsize=(4 * columns, 4 * rows), squeeze=False)
+        axes = axes.reshape(-1)
+
+        for i in range(n_show):
+            ax = axes[i]
+            ax.imshow(Visualizer._to_numpy(imgs_v[i]), cmap='gray')
+
+            image_gt_boxes = gt_boxes[i] if gt_boxes is not None else ()
+            image_gt_labels = gt_labels[i] if gt_labels is not None else ()
+            for gt_idx, box in enumerate(image_gt_boxes):
+                x, y, w, h = [float(v) for v in box]
+                ax.add_patch(patches.Rectangle(
+                    (x, y), w, h, linewidth=1.5, edgecolor='lime', facecolor='none'
+                ))
+                if gt_labels is not None and gt_idx < len(image_gt_labels):
+                    label = int(image_gt_labels[gt_idx])
+                    name = class_names[label] if class_names is not None and label < len(class_names) else str(label)
+                    ax.text(x + 1, y + h + 2, f'GT {name}', color='lime', fontsize=7)
+
+            pred_boxes, pred_scores, pred_classes = candidates[i]
+            for box, score, pred_class in zip(pred_boxes, pred_scores, pred_classes):
+                x, y, w, h = [float(v) for v in box]
+                label = int(pred_class)
+                name = class_names[label] if class_names is not None and label < len(class_names) else str(label)
+                ax.add_patch(patches.Rectangle(
+                    (x, y), w, h, linewidth=1.5, edgecolor='red',
+                    linestyle='--', facecolor='none'
+                ))
+                ax.text(
+                    x + 1, max(0, y - 3), f'{name} {float(score):.2f}',
+                    color='red', fontsize=7,
+                    bbox=dict(boxstyle='round,pad=0.1', facecolor='black', alpha=0.55, edgecolor='none'),
+                )
+
+            ax.set_title(f'GT: {len(image_gt_boxes)} | Pred: {len(pred_boxes)}', fontsize=9)
+            ax.axis('off')
+
+        for ax in axes[n_show:]:
+            ax.axis('off')
+        fig.suptitle('FCOS detections after centerness-gated NMS', fontsize=13)
+        plt.tight_layout()
+        plt.show()
+
+    @staticmethod
     def visualize_pipeline_detections(image, detections, title='End-to-End Pipeline Detections'):
         """
         Visualize pipeline detections with class labels and confidence scores.

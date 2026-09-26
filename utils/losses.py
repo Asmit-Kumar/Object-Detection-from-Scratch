@@ -3,7 +3,7 @@ Detection Loss Utilities.
 
 Contains IoU helpers, coordinate regression loss, classification loss,
 and objectness loss functions (BCE with dynamic positive weighting and Sigmoid Focal Loss)
-for the single-stage and multi-anchor spatial detection pipelines.
+for the single-stage, multi-anchor, and FCOS spatial detection pipelines.
 """
 
 from collections.abc import Mapping
@@ -15,6 +15,8 @@ from scipy.optimize import linear_sum_assignment
 import numpy as np
 import time
 from torchvision.ops import sigmoid_focal_loss
+
+from utils.fcos_targets import FCOSTargetGenerator, FCOSTargets
 
 
 # ── IoU Helpers ───────────────────────────────────────────────────────────────
@@ -67,160 +69,151 @@ def mean_iou(pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> float:
     iou_mat = pairwise_iou(pred_boxes, target_boxes)  # (N, N)
     return iou_mat.diagonal().mean().item()
 
-def aligned_iou(
-    pred_boxes: torch.Tensor,
-    target_boxes: torch.Tensor,
-) -> torch.Tensor:
-    """Compute IoU for corresponding boxes in two equally shaped tensors.
+
+def aligned_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Compute aligned (element-wise) IoU between two tensors of shape (N, 4).
+
+    Boxes are in [x, y, w, h] format.
+    """
+    x1_1, y1_1 = boxes1[:, 0], boxes1[:, 1]
+    x2_1, y2_1 = x1_1 + boxes1[:, 2], y1_1 + boxes1[:, 3]
+
+    x1_2, y1_2 = boxes2[:, 0], boxes2[:, 1]
+    x2_2, y2_2 = x1_2 + boxes2[:, 2], y1_2 + boxes2[:, 3]
+
+    inter_x1 = torch.max(x1_1, x1_2)
+    inter_y1 = torch.max(y1_1, y1_2)
+    inter_x2 = torch.min(x2_1, x2_2)
+    inter_y2 = torch.min(y2_1, y2_2)
+
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
+    inter_area = inter_w * inter_h
+
+    area1 = (boxes1[:, 2] * boxes1[:, 3]).clamp(min=0)
+    area2 = (boxes2[:, 2] * boxes2[:, 3]).clamp(min=0)
+    union_area = (area1 + area2 - inter_area).clamp(min=1e-6)
+
+    return inter_area / union_area
+
+
+def giou_loss_ltrb(pred_ltrb: torch.Tensor, target_ltrb: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Generalized IoU (GIoU) loss for boxes parameterized as [l, t, r, b] distances.
 
     Args:
-        pred_boxes: Tensor ``(..., 4)`` in ``[x, y, w, h]`` format.
-        target_boxes: Tensor ``(..., 4)`` in ``[x, y, w, h]`` format.
+        pred_ltrb: (N, 4) tensor of [l, t, r, b].
+        target_ltrb: (N, 4) tensor of [l, t, r, b].
 
     Returns:
-        Tensor ``(...)`` containing the IoU for each corresponding pair.
+        (N,) tensor of GIoU loss values: 1 - GIoU.
     """
-    px1, py1 = pred_boxes[..., 0], pred_boxes[..., 1]
-    px2 = px1 + pred_boxes[..., 2]
-    py2 = py1 + pred_boxes[..., 3]
+    pred_l, pred_t, pred_r, pred_b = pred_ltrb[:, 0], pred_ltrb[:, 1], pred_ltrb[:, 2], pred_ltrb[:, 3]
+    gt_l, gt_t, gt_r, gt_b = target_ltrb[:, 0], target_ltrb[:, 1], target_ltrb[:, 2], target_ltrb[:, 3]
 
-    tx1, ty1 = target_boxes[..., 0], target_boxes[..., 1]
-    tx2 = tx1 + target_boxes[..., 2]
-    ty2 = ty1 + target_boxes[..., 3]
+    pred_w = (pred_l + pred_r).clamp_min(0)
+    pred_h = (pred_t + pred_b).clamp_min(0)
+    pred_area = pred_w * pred_h
 
-    ix1 = torch.maximum(px1, tx1)
-    iy1 = torch.maximum(py1, ty1)
-    ix2 = torch.minimum(px2, tx2)
-    iy2 = torch.minimum(py2, ty2)
+    gt_w = (gt_l + gt_r).clamp_min(0)
+    gt_h = (gt_t + gt_b).clamp_min(0)
+    gt_area = gt_w * gt_h
 
-    inter = torch.clamp(ix2 - ix1, min=0) * torch.clamp(iy2 - iy1, min=0)
-    pred_area = pred_boxes[..., 2] * pred_boxes[..., 3]
-    target_area = target_boxes[..., 2] * target_boxes[..., 3]
-    union = pred_area + target_area - inter
+    inter_w = (torch.minimum(pred_l, gt_l) + torch.minimum(pred_r, gt_r)).clamp_min(0)
+    inter_h = (torch.minimum(pred_t, gt_t) + torch.minimum(pred_b, gt_b)).clamp_min(0)
+    inter_area = inter_w * inter_h
 
-    return inter / torch.clamp(union, min=1e-6)
+    union_area = (pred_area + gt_area - inter_area).clamp_min(1e-6)
+    iou = inter_area / union_area
+
+    convex_w = torch.maximum(pred_l, gt_l) + torch.maximum(pred_r, gt_r)
+    convex_h = torch.maximum(pred_t, gt_t) + torch.maximum(pred_b, gt_b)
+    convex_area = (convex_w * convex_h).clamp_min(1e-6)
+
+    giou = iou - (convex_area - union_area) / convex_area
+    return 1.0 - giou
 
 
 # ── Detection Loss ────────────────────────────────────────────────────────────
 
 class DetectionLoss(nn.Module):
-    """Unified tri-head detection loss for multi-object localization, objectness scoring,
-    and character classification across K anchor slots per spatial cell.
-
-    For each image in the batch:
-      1. **Spatial Target Mapping** — assigns GT boxes to corresponding $14 \times 14 \times K$
-         grid-anchor slots during collate_fn.
-      2. **Box loss (Huber)** — ``HuberLoss`` on matched (pred_box, gt_box) positive slots.
-      3. **IoU loss** — ``1.0 - mean(aligned_iou)`` on matched positive slots.
-      4. **Objectness loss (Focal or BCE)** — ``sigmoid_focal_loss`` or ``BCEWithLogitsLoss``
-         on all spatial/anchor slots; matched slots get target ``1.0``, background slots get ``0.0``.
-      5. **Class loss (CE)** — ``CrossEntropyLoss`` computed exclusively on matched slots.
-
-    Total loss = (box_loss + lambda_iou * iou_loss) + lambda_conf * conf_loss + lambda_class * class_loss
-
-    Args:
-        lambda_conf    : Weight for the objectness confidence loss term. Default ``1.0``.
-        delta          : Huber loss delta (transition point). Default ``1.0``.
-        use_pos_weight : Whether to compute positive class weight dynamically for BCE. Default ``False``.
-        lambda_class   : Weight for the classification loss term. Default ``1.0``.
-        lambda_iou     : Weight for the IoU loss term. Default ``1.0``.
-        use_focal_loss : Whether to use Sigmoid Focal Loss for objectness. Default ``True``.
-        focal_alpha    : Focal loss alpha balancing factor. Default ``0.25``.
-        focal_gamma    : Focal loss gamma focusing parameter. Default ``2.0``.
-        pos_weight_cap : Maximum cap for BCE dynamic positive weight. Default ``15.0``.
-
-    Inputs:
-        outputs   : A single prediction tensor or a dictionary of prediction
-                    tensors keyed by grid size. Last dim is
-                    ``[x, y, w, h, conf_logit, class_logits...]``.
-        target_gt : Matching target tensor(s) with last dim
-                    ``[x, y, w, h, objectness]``.
-        labels    : Matching class-index tensor(s) aligned with ``target_gt``.
+    """
+    Multi-Scale and Single-Scale Detection Loss Function.
     """
 
     def __init__(
-        self,
-        lambda_conf: float = 1.0,
-        delta: float = 1.0,
-        use_pos_weight: bool = False,
-        lambda_class: float = 1.0,
-        lambda_iou: float = 1.0,
-        use_focal_loss: bool = True,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
-        pos_weight_cap: float = 15.0,
+            self,
+            lambda_conf: float = 1.0,
+            lambda_class: float = 1.0,
+            lambda_iou: float = 1.0,
+            delta: float = 1.0,
+            pos_weight: float | None = None,
+            use_pos_weight: bool = True,
+            max_pos_weight: float = 50.0,
+            use_focal_loss: bool = False,
+            focal_alpha: float = 0.25,
+            focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_class = lambda_class
         self.lambda_iou = lambda_iou
         self.use_pos_weight = use_pos_weight
+        self.max_pos_weight = max_pos_weight
         self.use_focal_loss = use_focal_loss
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
-        self.pos_weight_cap = pos_weight_cap
-        self.huber = nn.HuberLoss(reduction='mean', delta=delta)
-        self.bce   = nn.BCEWithLogitsLoss(reduction='mean')
-        self.ce = nn.CrossEntropyLoss(reduction='mean')
+
+        self.huber = nn.HubenLoss(delta=delta) if hasattr(nn, "HubenLoss") else nn.HuberLoss(delta=delta)
+        self.ce = nn.CrossEntropyLoss()
+
+        if pos_weight is not None:
+            self.register_buffer("fixed_pos_weight", torch.tensor([pos_weight]))
+        else:
+            self.fixed_pos_weight = None
 
     def forward(
             self,
             outputs: torch.Tensor | Mapping[int, torch.Tensor],
-            target_gt: torch.Tensor | Mapping[int, torch.Tensor],
+            targets: torch.Tensor | Mapping[int, torch.Tensor],
             labels: torch.Tensor | Mapping[int, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         if isinstance(outputs, Mapping):
-            if not isinstance(target_gt, Mapping):
-                raise TypeError("multi-scale outputs require multi-scale targets")
-            if set(outputs) != set(target_gt):
-                raise ValueError("output and target scales must match exactly")
-            if labels is not None and (not isinstance(labels, Mapping) or set(labels) != set(outputs)):
-                raise ValueError("multi-scale labels must match output scales exactly")
-
-            scale_losses = [
-                self._forward_single(
-                    outputs[grid_size],
-                    target_gt[grid_size],
-                    None if labels is None else labels[grid_size],
+            scale_losses = []
+            for grid_size, scale_outputs in outputs.items():
+                scale_targets = targets[grid_size]
+                scale_labels = labels[grid_size] if labels is not None else None
+                scale_losses.append(
+                    self._forward_single(scale_outputs, scale_targets, scale_labels)
                 )
-                for grid_size in outputs
-            ]
-            return torch.stack(scale_losses).mean()
+            loss = torch.stack(scale_losses).mean()
+            return loss, {"loss": loss.item()}
 
-        if isinstance(target_gt, Mapping) or isinstance(labels, Mapping):
-            raise TypeError("single-scale outputs require tensor targets and labels")
-        return self._forward_single(outputs, target_gt, labels)
+        loss = self._forward_single(outputs, targets, labels)
+        return loss, {"loss": loss.item()}
 
     def _forward_single(
             self,
             outputs: torch.Tensor,
-            target_gt: torch.Tensor,
+            targets: torch.Tensor,
             labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-
         pred_boxes = outputs[..., :4]
         pred_conf = outputs[..., 4]
         pred_class = outputs[..., 5:]
 
-        gt_boxes = target_gt[..., :4]
-        gt_objectness = target_gt[..., 4]
+        gt_boxes = targets[..., :4]
+        gt_objectness = targets[..., 4]
 
-        positive = gt_objectness.bool()
+        positive = gt_objectness == 1.0
 
-        if self.use_pos_weight and not self.use_focal_loss:
-            n_pos = positive.sum()
-            n_cells = positive.numel()
-
-            if n_pos > 0:
-                pw = (n_cells - n_pos) / n_pos
-                pw = torch.clamp(pw, max=self.pos_weight_cap)
-                pos_weight = torch.tensor(
-                    [pw],
-                    dtype=pred_conf.dtype,
-                    device=pred_conf.device,
-                )
-            else:
-                pos_weight = None
+        if self.fixed_pos_weight is not None:
+            pos_weight = self.fixed_pos_weight.to(outputs.device)
+        elif self.use_pos_weight:
+            num_pos = positive.sum().float()
+            num_neg = (gt_objectness == 0.0).sum().float()
+            pw = (num_neg / (num_pos + 1e-6)).clamp(max=self.max_pos_weight)
+            pos_weight = pw.view(1)
         else:
             pos_weight = None
 
@@ -265,32 +258,152 @@ class DetectionLoss(nn.Module):
         )
 
 
+# ── FCOS Loss ─────────────────────────────────────────────────────────────────
+
+class FCOSLoss(nn.Module):
+    """
+    FCOS Multi-Scale Loss.
+
+    Computes:
+      - Focal Loss on multi-class classification across all feature locations.
+      - Centerness-weighted GIoU Loss on positive locations.
+      - Binary Cross-Entropy Loss on centerness for positive locations.
+
+    Args:
+        lambda_reg: Loss multiplier for bounding box GIoU regression. Default 1.0.
+        lambda_centerness: Loss multiplier for centerness BCE. Default 1.0.
+        focal_alpha: Sigmoid focal loss alpha. Default 0.25.
+        focal_gamma: Sigmoid focal loss gamma. Default 2.0.
+    """
+
+    def __init__(
+            self,
+            lambda_reg: float = 1.0,
+            lambda_centerness: float = 1.0,
+            focal_alpha: float = 0.25,
+            focal_gamma: float = 2.0,
+            grid_sizes: tuple[int, int] = (28, 14),
+    ):
+        super().__init__()
+        self.lambda_reg = lambda_reg
+        self.lambda_centerness = lambda_centerness
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.grid_sizes = grid_sizes
+        self.target_generator = FCOSTargetGenerator(grid_sizes=grid_sizes)
+
+    def forward(
+            self,
+            preds_by_scale: Mapping[int, Mapping[str, torch.Tensor]],
+            targets: FCOSTargets | tuple[list[torch.Tensor], list[torch.Tensor]],
+            labels: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """
+        Compute total FCOS loss across all pyramid scales.
+
+        Args:
+            preds_by_scale: Dict {28: {'cls_logits', 'reg_ltrb', 'centerness_logits'}, 14: ...}
+            targets: Either an FCOSTargets instance, or a list/tuple of bounding boxes [x, y, w, h].
+            labels: List of label tensors if targets is a list of bounding boxes.
+
+        Returns:
+            (total_loss, loss_dict)
+        """
+        device = next(iter(preds_by_scale.values()))["cls_logits"].device
+
+        if not isinstance(targets, FCOSTargets):
+            # Accept either separate (boxes, labels) arguments or the documented
+            # ``(boxes_batch, labels_batch)`` tuple form.
+            if labels is None and isinstance(targets, (tuple, list)) and len(targets) == 2:
+                boxes_batch, labels_batch = targets
+            else:
+                boxes_batch = targets
+                labels_batch = labels if labels is not None else []
+            fcos_targets = self.target_generator.generate_targets(boxes_batch, labels_batch, device)
+        else:
+            fcos_targets = targets
+
+        total_cls_loss = torch.tensor(0.0, device=device)
+        total_reg_loss = torch.tensor(0.0, device=device)
+        total_cent_loss = torch.tensor(0.0, device=device)
+
+        total_num_pos = 0.0
+        total_cent_gt_sum = torch.tensor(0.0, device=device)
+
+        for grid_size in self.grid_sizes:
+            preds = preds_by_scale[grid_size]
+            cls_logits = preds["cls_logits"].float()          # (B, H, W, num_classes)
+            reg_ltrb = preds["reg_ltrb"]                      # (B, H, W, 4)
+            cent_logits = preds["centerness_logits"]          # (B, H, W)
+
+            cls_gt = fcos_targets.cls_targets[grid_size]      # (B, H, W)
+            reg_gt = fcos_targets.reg_targets[grid_size]      # (B, H, W, 4)
+            cent_gt = fcos_targets.centerness_targets[grid_size]  # (B, H, W)
+
+            num_classes = cls_logits.shape[-1]
+            pos_mask = cls_gt >= 0                            # (B, H, W)
+            num_pos = pos_mask.sum().float()
+            total_num_pos += num_pos.item()
+
+            # 1. Classification Focal Loss
+            # One-hot encoding of targets (background is all zeros)
+            cls_one_hot = torch.zeros_like(cls_logits)
+            if pos_mask.any():
+                pos_labels = cls_gt[pos_mask]
+                cls_one_hot[pos_mask] = F.one_hot(pos_labels, num_classes=num_classes).float()
+
+            cls_loss = sigmoid_focal_loss(
+                cls_logits,
+                cls_one_hot,
+                alpha=self.focal_alpha,
+                gamma=self.focal_gamma,
+                reduction="sum",
+            )
+            total_cls_loss = total_cls_loss + cls_loss
+
+            # 2. Regression & Centerness Loss on positive locations
+            if pos_mask.any():
+                pred_ltrb_pos = reg_ltrb[pos_mask]            # (N_pos, 4)
+                gt_ltrb_pos = reg_gt[pos_mask]                # (N_pos, 4)
+                gt_cent_pos = cent_gt[pos_mask]                # (N_pos,)
+                pred_cent_pos = cent_logits[pos_mask]         # (N_pos,)
+
+                # GIoU loss weighted by ground-truth centerness
+                giou_losses = giou_loss_ltrb(pred_ltrb_pos, gt_ltrb_pos)  # (N_pos,)
+                reg_loss = (giou_losses * gt_cent_pos).sum()
+                total_reg_loss = total_reg_loss + reg_loss
+                total_cent_gt_sum = total_cent_gt_sum + gt_cent_pos.sum()
+
+                # Centerness BCE loss
+                cent_loss = F.binary_cross_entropy_with_logits(
+                    pred_cent_pos,
+                    gt_cent_pos,
+                    reduction="sum",
+                )
+                total_cent_loss = total_cent_loss + cent_loss
+
+        normalizer = max(total_num_pos, 1.0)
+        cls_loss_norm = total_cls_loss / normalizer
+        reg_loss_norm = total_reg_loss / normalizer
+        cent_loss_norm = total_cent_loss / normalizer
+
+        total_loss = (
+            cls_loss_norm
+            + self.lambda_reg * reg_loss_norm
+            + self.lambda_centerness * cent_loss_norm
+        )
+
+        return total_loss, {
+            "loss": total_loss.item(),
+            "cls_loss": cls_loss_norm.item(),
+            "reg_loss": reg_loss_norm.item(),
+            "cent_loss": cent_loss_norm.item(),
+            "num_pos": total_num_pos,
+        }
+
+
 if __name__ == "__main__":
-
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    LAMBDA_CONF = 1.0
-    NUM_CLASSES = 10
-    B = 2
-    K_ANCHORS = 3
-    
-    criterion = DetectionLoss(lambda_conf=LAMBDA_CONF, delta=1.0, use_pos_weight=True, use_focal_loss=True)
-    print('DetectionLoss ready.')
-
-    S = 14
-    NUM_CLASSES = 47
-    print(f"Creating sample inputs for batch of {B}...")
-
-    # dummy_out: (B, S, S, K, 5 + NUM_CLASSES)
-    dummy_out = torch.randn(B, S, S, K_ANCHORS, 5 + NUM_CLASSES, device=DEVICE)
-    # target_gt: (B, S, S, K, 5) where last dim is [x, y, w, h, objectness]
-    target_gt = torch.zeros(B, S, S, K_ANCHORS, 5, device=DEVICE)
-    # populate some random ground truth objects
-    target_gt[:, 3, 3, 0, 4] = 1.0  # object at cell (3,3), anchor 0
-    target_gt[:, 5, 5, 1, 4] = 1.0  # object at cell (5,5), anchor 1
-
-    # labels_v: (B, S, S, K)
-    labels_v = torch.randint(0, NUM_CLASSES, (B, S, S, K_ANCHORS), device=DEVICE)
-
-    with torch.no_grad():
-        loss_val = criterion(dummy_out, target_gt, labels_v)
-    print(f'Smoke-test loss: {loss_val.item():.4f}')
+    print("Testing DetectionLoss and FCOSLoss...")
+    fcos_loss = FCOSLoss()
+    print("FCOSLoss initialized successfully.")

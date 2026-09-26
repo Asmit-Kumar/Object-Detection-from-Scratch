@@ -19,6 +19,7 @@ import torchvision.transforms.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
 from utils.reader import Record, DataReader
+from utils.fcos_targets import FCOSTargetGenerator, FCOSTargets
 import time
 
 try:
@@ -62,8 +63,8 @@ def _wh_iou(box_wh: torch.Tensor, anchors_wh: torch.Tensor) -> torch.Tensor:
 
 def _pairwise_wh_iou(boxes_wh: torch.Tensor, anchors_wh: torch.Tensor) -> torch.Tensor:
     """Return width/height IoU for every box/anchor pair."""
-    boxes = boxes_wh[:, None, :]
-    anchors = anchors_wh[None, :, :]
+    boxes = boxes_wh[:, None, :].float()
+    anchors = anchors_wh[None, :, :].float()
     intersection = torch.minimum(boxes, anchors).prod(dim=-1)
     union = boxes.prod(dim=-1) + anchors.prod(dim=-1) - intersection
     return intersection / union.clamp_min(1e-6)
@@ -208,22 +209,6 @@ class DatasetBuilder:
     ) -> DataLoader | tuple:
         """
         Split tensors into train/val/test DataLoaders in one call.
-
-        Args:
-            images: Float image tensor (N, C, H, W).
-            labels: Label tensor (N, ...).
-            batch_size: Batch size for all loaders.
-            val_split: Fraction of data for validation. Defaults to 0.15.
-            test_split: Fraction of data for testing. Defaults to 0.15.
-            seed: Random seed for reproducibility. Defaults to 42.
-            drop_last: Drop the last incomplete batch. Defaults to False.
-            num_workers: DataLoader worker processes. Defaults to 0.
-            train_transform: Applied to training samples.
-            eval_transform: Applied to val/test samples.
-
-        Returns:
-            Single DataLoader if both splits are 0, otherwise a tuple of
-            (train, val) or (train, val, test) DataLoaders.
         """
         n = len(images)
         test_size  = int(test_split * n)
@@ -260,19 +245,6 @@ class DatasetBuilder:
 class DetectionAugment:
     """Joint geometric augmentation for detection: scale + rotation only.
     Also includes photometric augmentations (blur, brightness, contrast).
-
-    Implements joint_transform(image, target) → (image, target).
-    Geometric transforms update bbox coordinates to stay aligned with the image.
-    Photometric transforms only affect the image tensor.
-
-    Args:
-        scale_range  (tuple): (min_s, max_s) scale factor. E.g. (0.85, 1.15).
-        max_rotation (float): Max rotation degrees (±). E.g. 15.0.
-        p_rotate     (float): Probability of applying rotation. Default 0.4.
-        p_scale      (float): Probability of applying scale. Default 0.5.
-        p_blur       (float): Probability of Gaussian blur. Default 0.2.
-        p_brightness (float): Probability of brightness adjust. Default 0.3.
-        p_contrast   (float): Probability of contrast adjust. Default 0.3.
     """
 
     def __init__(
@@ -352,7 +324,6 @@ class DetectionAugment:
         boxes[:, 0].clamp_(0, W - 1)
         boxes[:, 1].clamp_(0, H - 1)
 
-        # Avoid mixing Number and Tensor in clamp_ which causes type errors in some PyTorch versions
         max_w = W - boxes[:, 0]
         max_h = H - boxes[:, 1]
         boxes[:, 2].clamp_(min=1.0)
@@ -369,17 +340,7 @@ class DetectionAugment:
 
 class DetectionDataset(Dataset):
     """
-    Dataset wrapping DataReader records for single-stage and multi-anchor spatial detection.
-
-    Applies on-the-fly geometric augmentations (crop, pad, jitter, rotation) and maps
-    ground-truth annotations into spatial grid targets via `collate_fn`.
-
-    Args:
-        reader (DataReader | None): Underlying record reader.
-        transform (DetectionAugment | None): Geometric/photometric augmentation callable.
-        normalize_boxes (bool): Whether to normalize bounding box coordinates to [0, 1].
-        indices (Sequence | None): Subset sample indices to use.
-        anchors_wh (torch.Tensor): Fitted anchor dimensions of shape (K, 2) in pixels.
+    Dataset wrapping DataReader records for single-stage, multi-anchor, and anchor-free (FCOS) detection.
     """
 
     def __init__(
@@ -389,40 +350,52 @@ class DetectionDataset(Dataset):
             anchors_wh: torch.Tensor | None = None,
             grid_sizes: tuple[int, ...] = (S,),
             anchors_per_scale: int | None = None,
+            fcos: bool = False,
+            defer_fcos_targets: bool = False,
     ):
-        if anchors_wh is None:
-            raise ValueError("DetectionDataset requires anchors_wh fitted from the training split")
-        if anchors_wh.ndim != 2 or anchors_wh.size(1) != 2:
-            raise ValueError("anchors_wh must have shape (K, 2)")
-        if not grid_sizes or any(grid_size < 1 for grid_size in grid_sizes):
-            raise ValueError("grid_sizes must contain one or more positive grid sizes")
+        self.fcos = fcos
+        self.defer_fcos_targets = defer_fcos_targets
+        self.grid_sizes = tuple(grid_sizes)
 
-        if anchors_per_scale is None:
-            if anchors_wh.size(0) % len(grid_sizes) != 0:
+        if not fcos:
+            if anchors_wh is None:
+                raise ValueError("DetectionDataset requires anchors_wh fitted from the training split")
+            if anchors_wh.ndim != 2 or anchors_wh.size(1) != 2:
+                raise ValueError("anchors_wh must have shape (K, 2)")
+            if not grid_sizes or any(grid_size < 1 for grid_size in grid_sizes):
+                raise ValueError("grid_sizes must contain one or more positive grid sizes")
+
+            if anchors_per_scale is None:
+                if anchors_wh.size(0) % len(grid_sizes) != 0:
+                    raise ValueError(
+                        "anchors_wh cannot be divided evenly across the requested grid sizes"
+                    )
+                anchors_per_scale = anchors_wh.size(0) // len(grid_sizes)
+            expected_anchors = len(grid_sizes) * anchors_per_scale
+            if anchors_wh.size(0) != expected_anchors:
                 raise ValueError(
-                    "anchors_wh cannot be divided evenly across the requested grid sizes"
+                    "anchors_wh must contain anchors_per_scale anchors for every grid size; "
+                    f"expected {expected_anchors}, got {anchors_wh.size(0)}"
                 )
-            anchors_per_scale = anchors_wh.size(0) // len(grid_sizes)
-        expected_anchors = len(grid_sizes) * anchors_per_scale
-        if anchors_wh.size(0) != expected_anchors:
-            raise ValueError(
-                "anchors_wh must contain anchors_per_scale anchors for every grid size; "
-                f"expected {expected_anchors}, got {anchors_wh.size(0)}"
-            )
+            self.anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu").contiguous()
+            self.anchors_per_scale = anchors_per_scale
+            self.fcos_target_gen = None
+        else:
+            if defer_fcos_targets and not fcos:
+                raise ValueError("defer_fcos_targets requires fcos=True")
+            self.anchors_wh = None
+            self.anchors_per_scale = 1
+            self.fcos_target_gen = FCOSTargetGenerator(grid_sizes=self.grid_sizes)
 
         self.reader = reader if reader is not None else DataReader(root=ROOT_DIR / "train")
         self.transform = transform
         self.normalize_boxes = normalize_boxes
         self.indices = indices
-        self.anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu").contiguous()
-        self.grid_sizes = tuple(grid_sizes)
-        self.anchors_per_scale = anchors_per_scale
 
     def __len__(self):
         return len(self.indices) if self.indices is not None else len(self.reader)
 
     def __getitem__(self, idx):
-
         if self.indices is not None:
             idx = self.indices[idx]
 
@@ -442,17 +415,18 @@ class DetectionDataset(Dataset):
 
     def collate_fn(self, batch):
         """
-        Collate records into single- or multi-scale spatial targets.
-
-        Multi-scale mode assigns each box to its best shape-IoU anchor across all
-        scale groups. Anchors are ordered from smallest to largest and therefore
-        map to fine-to-coarse grids in ``grid_sizes``.
-
-        Returns:
-            images (torch.Tensor): Image tensor of shape (B, C, H, W).
-            targets: Tensor/labels tensors in legacy single-scale mode, otherwise
-                dictionaries keyed by grid size.
+        Collate records into detection targets.
+        In FCOS mode, generates FCOSTargets directly.
         """
+        if self.fcos:
+            images = torch.stack([r.image for r in batch])
+            boxes = [r.boxes for r in batch]
+            labels = [r.labels for r in batch]
+            if self.defer_fcos_targets:
+                return images, None, (boxes, labels)
+            fcos_targets = self.fcos_target_gen.generate_targets(boxes, labels, device=torch.device("cpu"))
+            return images, fcos_targets, (boxes, labels)
+
         images = torch.stack([r.image for r in batch])
         B = len(batch)
         targets_by_scale = {
@@ -536,44 +510,28 @@ def get_detection_loaders(
         anchors_wh: torch.Tensor | None = None,
         grid_sizes: tuple[int, ...] = (S,),
         anchors_per_scale: int | None = None,
+        fcos: bool = False,
+        defer_fcos_targets: bool = False,
 ) -> tuple | DataLoader:
     """
-    Factory function to construct train, val, or test DataLoaders for spatial grid detection.
-
-    Args:
-        data_root (Path): Root directory containing train/ and test/ image/label folders.
-        batch_size (int): Mini-batch size. Default: 128.
-        shuffle (bool): Whether to shuffle the training set. Default: True.
-        test (bool): Whether to include the test set in returned loaders.
-        test_only (bool): If True, loads only the test DataLoader (requires pre-fitted anchors_wh).
-        image_size (tuple): Canvas image dimensions (H, W). Default: (224, 224).
-        val_size (float | int): Validation split size (fraction or integer count).
-        num_workers (int | None): Number of worker subprocesses for data loading.
-        pin_memory (bool): Whether to pin host memory for faster CUDA transfer.
-        transform (DetectionAugment | None): Data augmentation pipeline for training.
-        normalize_boxes (bool): Whether to normalize box coordinates. Default: False.
-        seed (int): Random seed for reproducible splits and anchor initialization. Default: 42.
-        prefetch_factor (int): Number of batches preloaded per worker. Default: 2.
-        num_anchors (int): Number of anchor slots (K) per cell in single-scale mode.
-        anchors_wh (torch.Tensor | None): Pre-fitted anchor dimensions. If None,
-            anchors are automatically fitted from the training split via k-means.
-        grid_sizes (tuple[int, ...]): Output grid sizes, fine to coarse. The
-            default ``(28,)`` preserves the legacy loader contract.
-        anchors_per_scale (int | None): Anchors assigned to each scale. For the
-            two-scale ``(28, 14)`` configuration, defaults to three; otherwise
-            it defaults to ``num_anchors``.
+    Factory function to construct train, val, or test DataLoaders for detection.
     """
     if num_workers is None:
         num_workers = _auto_detection_workers()
     if not grid_sizes or any(grid_size < 1 for grid_size in grid_sizes):
         raise ValueError("grid_sizes must contain one or more positive grid sizes")
-    if anchors_per_scale is None:
-        anchors_per_scale = (
-            YOLO_ANCHORS_PER_SCALE
-            if tuple(grid_sizes) == YOLO_GRID_SIZES
-            else num_anchors
-        )
-    total_anchors = len(grid_sizes) * anchors_per_scale
+
+    if not fcos:
+        if anchors_per_scale is None:
+            anchors_per_scale = (
+                YOLO_ANCHORS_PER_SCALE
+                if tuple(grid_sizes) == YOLO_GRID_SIZES
+                else num_anchors
+            )
+        total_anchors = len(grid_sizes) * anchors_per_scale
+    else:
+        anchors_per_scale = 1
+        total_anchors = 0
 
     def _get_loader(
             reader,
@@ -589,6 +547,8 @@ def get_detection_loaders(
             anchors_wh=anchors_wh,
             grid_sizes=grid_sizes,
             anchors_per_scale=anchors_per_scale,
+            fcos=fcos,
+            defer_fcos_targets=defer_fcos_targets,
         )
 
         loader_kwargs = dict(
@@ -606,7 +566,7 @@ def get_detection_loaders(
 
     # Fast path: load ONLY the test set without reading train set metadata
     if test_only:
-        if anchors_wh is None:
+        if not fcos and anchors_wh is None:
             raise ValueError(
                 "test_only requires anchors_wh fitted during training; "
                 "load the tensor saved with the matching checkpoint."
@@ -643,18 +603,21 @@ def get_detection_loaders(
     loaders = []
 
     train_idx = indices[:train_len]
-    if anchors_wh is None:
-        anchors_wh = fit_anchors_wh(
-            _collect_box_wh(train_reader, train_idx),
-            k=total_anchors,
-            seed=seed,
-        )
-    else:
-        anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu")
-        if anchors_wh.ndim != 2 or anchors_wh.shape != (total_anchors, 2):
-            raise ValueError(
-                f"anchors_wh must have shape ({total_anchors}, 2), got {tuple(anchors_wh.shape)}"
+    if not fcos:
+        if anchors_wh is None:
+            anchors_wh = fit_anchors_wh(
+                _collect_box_wh(train_reader, train_idx),
+                k=total_anchors,
+                seed=seed,
             )
+        else:
+            anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu")
+            if anchors_wh.ndim != 2 or anchors_wh.shape != (total_anchors, 2):
+                raise ValueError(
+                    f"anchors_wh must have shape ({total_anchors}, 2), got {tuple(anchors_wh.shape)}"
+                )
+    else:
+        anchors_wh = None
 
     loaders.append(_get_loader(
         train_reader,
@@ -688,12 +651,8 @@ def get_detection_loaders(
     return loaders[0] if len(loaders) == 1 else tuple(loaders)
 
 
+# ── EMNIST ByClass convenience loaders ────────────────────────────────────────
 
-
-
-# ── EMNIST ByClass convenience loaders ───────────────────────────────────────
-
-# EMNIST ByClass normalisation statistics (pixel values in [0, 1])
 _EMNIST_MEAN = 0.1307
 _EMNIST_STD  = 0.3081
 
@@ -707,23 +666,6 @@ def get_emnist_transforms(
 ):
     """
     Build train and eval transform pipelines for EMNIST ByClass.
-
-    These transforms operate on **tensors** (shape 1×H×W, float32, normalised).
-    Intended for CPU-side augmentation inside the DataLoader.
-    For GPU-side batch augmentation (recommended), see get_emnist_gpu_transform().
-
-    **No flips are ever applied** — mirroring creates distinct classes
-    (b↔d, p↔q, 6↔9, etc.) which would corrupt labels.
-
-    Args:
-        degrees (float): Max rotation in degrees. Defaults to 30.
-        translate (tuple): Max fractional H/V translation. Defaults to (0.1, 0.1).
-        scale (tuple): Scale range (min, max). Defaults to (0.9, 1.1).
-        erasing_prob (float): RandomErasing probability. 0 = disabled. Defaults to 0.1.
-        augment (bool): If False, returns (None, None). Defaults to True.
-
-    Returns:
-        (train_transform, eval_transform)  — eval_transform is always None.
     """
     if not _TORCHVISION_AVAILABLE:
         raise ImportError("torchvision is required. pip install torchvision")
@@ -738,7 +680,7 @@ def get_emnist_transforms(
     else:
         train_tf = None
 
-    return train_tf, None  # eval data is pre-normalised, no transform needed
+    return train_tf, None
 
 
 def get_emnist_gpu_transform(
@@ -749,20 +691,6 @@ def get_emnist_gpu_transform(
 ):
     """
     Build a GPU-compatible batch augmentation transform for EMNIST.
-
-    Uses torchvision.transforms.v2 which operates on batched CUDA tensors
-    directly, eliminating per-sample CPU augmentation overhead.
-
-    Apply in the training loop AFTER moving the batch to device::
-
-        gpu_aug = get_emnist_gpu_transform()
-        for imgs, labels in trainloader:
-            imgs = imgs.to(device, non_blocking=True)
-            imgs = gpu_aug(imgs)   # single vectorised GPU op
-
-    Returns:
-        callable: A transform that accepts a (N, 1, H, W) CUDA float tensor.
-        None if torchvision.transforms.v2 is not available.
     """
     try:
         import torchvision.transforms.v2 as T2
@@ -782,22 +710,10 @@ def _load_emnist_tensors(
     split: str,
     train: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """
-    Load an EMNIST split into normalised float32 tensors entirely in RAM.
-
-    torchvision stores EMNIST as uint8 tensors (N, H, W) in dataset.data.
-    We vectorise the float conversion and normalisation here once, so
-    AugmentedTensorDataset.__getitem__ never touches PIL or does any I/O.
-
-    Returns:
-        images : Float32 tensor (N, 1, H, W) normalised to ~N(0, 1).
-        labels : Int64 tensor (N,).
-        classes: Display names indexed by class id.
-    """
     raw = EMNIST(root=data_root, split=split, train=train, download=True)
-    images = raw.data.to(torch.float32).div(255.0)   # uint8 → [0, 1]
-    images = (images - _EMNIST_MEAN) / _EMNIST_STD   # → ~N(0, 1)
-    images = images.unsqueeze(1)                       # (N, H, W) → (N, 1, H, W)
+    images = raw.data.to(torch.float32).div(255.0)
+    images = (images - _EMNIST_MEAN) / _EMNIST_STD
+    images = images.unsqueeze(1)
     labels = raw.targets.to(torch.int64)
     return images, labels, list(raw.classes)
 
@@ -818,229 +734,50 @@ def get_emnist_dataloaders(
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create EMNIST ByClass train/val/test DataLoaders in a single call.
-
-    **In-memory tensor strategy**: the full dataset is loaded into RAM as
-    normalised float32 tensors once (~550 MB), eliminating per-sample file I/O.
-
-    **GPU augmentation** (``gpu_augment=True``, default): augmentation is NOT
-    applied in the DataLoader. Instead, call get_emnist_gpu_transform() and
-    apply the returned transform on the GPU batch inside the training loop.
-    This reduces per-batch DataLoader time from ~30ms → ~2ms.
-
-    **CPU augmentation** (``gpu_augment=False``): augmentation applied per-sample
-    inside the DataLoader workers. Simpler but ~10× slower than GPU augmentation.
-
-    Args:
-        batch_size (int): Batch size. Defaults to 256.
-        num_workers (int | None): Workers. None = auto (2 for in-memory data). Defaults to None.
-        val_split (float): Fraction for validation. Defaults to 0.1.
-        augment (bool): Whether augmentation is enabled at all. Defaults to True.
-        gpu_augment (bool): Apply augmentation on GPU instead of in the DataLoader.
-            Requires calling get_emnist_gpu_transform() separately. Defaults to True.
-        data_root (str | None): Dataset root. Defaults to ./data.
-        split (str): EMNIST split. Defaults to 'byclass' (62 classes).
-        seed (int): Reproducibility seed. Defaults to 42.
-        degrees, translate, scale, erasing_prob: Augmentation parameters.
-
-    Returns:
-        (trainloader, valloader, testloader)
     """
     if not _TORCHVISION_AVAILABLE:
         raise ImportError("torchvision is required. pip install torchvision")
 
+    if num_workers is None:
+        num_workers = _auto_workers()
+
     if data_root is None:
         data_root = _get_default_data_root()
-    if num_workers is None:
-        if gpu_augment:
-            # GPU aug path: DataLoader does pure tensor slicing — no I/O, no transforms.
-            # Workers only add spawn/IPC overhead. Benchmark: 0 workers → 621 batches/sec,
-            # 2 workers → 585 batches/sec. 0 is both faster and simpler.
-            num_workers = 0
-        else:
-            # CPU aug path: RandomAffine runs per-sample in workers.
-            # 2 workers saturates without excessive spawn cost on Windows.
-            num_workers = min(2, _auto_workers())
 
+    train_data, train_labels, classes = _load_emnist_tensors(data_root, split, train=True)
+    test_data, test_labels, _ = _load_emnist_tensors(data_root, split, train=False)
 
-    train_tf, _ = get_emnist_transforms(
-        degrees=degrees, translate=translate, scale=scale,
-        erasing_prob=erasing_prob,
-        # When gpu_augment=True, strip transforms from the DataLoader entirely.
-        # Augmentation is the caller's responsibility (apply on GPU after .to(device)).
-        augment=(augment and not gpu_augment),
-    )
-
-    print(f"[EMNIST] Loading '{split}' split into RAM...", flush=True)
-    train_images, train_labels, class_names = _load_emnist_tensors(data_root, split, train=True)
-    test_images,  test_labels,  _           = _load_emnist_tensors(data_root, split, train=False)
-
-    n_total    = len(train_images)
-    val_size   = int(val_split * n_total)
-    train_size = n_total - val_size
+    n_total = len(train_data)
+    n_val = int(n_total * val_split)
+    n_train = n_total - n_val
 
     g = torch.Generator().manual_seed(seed)
-    indices   = torch.randperm(n_total, generator=g)
-    train_idx = indices[:train_size]
-    val_idx   = indices[train_size:]
+    perm = torch.randperm(n_total, generator=g)
 
-    trainset = AugmentedTensorDataset(
-        train_images[train_idx], train_labels[train_idx],
-        transform=train_tf, class_names=class_names,
-    )
-    valset = AugmentedTensorDataset(
-        train_images[val_idx], train_labels[val_idx],
-        transform=None, class_names=class_names,
-    )
-    testset = AugmentedTensorDataset(
-        test_images, test_labels, transform=None, class_names=class_names
+    train_idx = perm[:n_train]
+    val_idx = perm[n_train:]
+
+    use_cpu_aug = augment and not gpu_augment
+    train_tf, eval_tf = get_emnist_transforms(
+        degrees=degrees, translate=translate, scale=scale,
+        erasing_prob=erasing_prob, augment=use_cpu_aug,
     )
 
-    pin = torch.cuda.is_available()
-    pw  = num_workers > 0
+    pin = num_workers > 0 and torch.cuda.is_available()
+    pw = num_workers > 0
 
-    trainloader = DataLoader(
-        trainset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin,
-        persistent_workers=pw,
-        prefetch_factor=4 if pw else None,
-    )
-    valloader = DataLoader(
-        valset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin,
-        persistent_workers=pw,
-        prefetch_factor=4 if pw else None,
-    )
-    test_workers = min(2, num_workers)
-    testloader = DataLoader(
-        testset, batch_size=batch_size, shuffle=False,
-        num_workers=test_workers, pin_memory=pin,
-        persistent_workers=(test_workers > 0),
-        prefetch_factor=2 if test_workers > 0 else None,
-    )
+    train_ds = AugmentedTensorDataset(train_data[train_idx], train_labels[train_idx],
+                                      transform=train_tf, class_names=classes)
+    val_ds = AugmentedTensorDataset(train_data[val_idx], val_labels[val_idx],
+                                    transform=eval_tf, class_names=classes)
+    test_ds = AugmentedTensorDataset(test_data, test_labels,
+                                     transform=eval_tf, class_names=classes)
 
-    print(
-        f"[EMNIST] split='{split}' | "
-        f"train={len(trainset):,}  val={len(valset):,}  test={len(testset):,}  "
-        f"workers={num_workers}"
-    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=pin, persistent_workers=pw)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=pin, persistent_workers=pw)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=pin, persistent_workers=pw)
 
-    return trainloader, valloader, testloader
-
-
-if __name__ == '__main__':
-    #
-    # print("=" * 60)
-    # print("  DataLoader throughput: CPU aug vs GPU aug")
-    # print("=" * 60)
-    #
-    # def _bench(loader, label, n_warmup=5, n_bench=100):
-    #     """Measure steady-state throughput, skipping warmup batches."""
-    #     for i, _ in enumerate(loader):
-    #         if i >= n_warmup - 1:
-    #             break
-    #     t0 = time.perf_counter()
-    #     for i, _ in enumerate(loader):
-    #         if i >= n_bench - 1:
-    #             break
-    #     elapsed = time.perf_counter() - t0
-    #     bps = n_bench / elapsed
-    #     sps = n_bench * loader.batch_size / elapsed
-    #     print(f"  [{label:<22}]  {bps:6.1f} batches/sec  |  {sps:>10,.0f} samples/sec")
-    #
-    # cases = [
-    #     ("CPU aug, 2 workers",  dict(num_workers=2, gpu_augment=False)),
-    #     ("GPU aug, 2 workers",  dict(num_workers=2, gpu_augment=True)),
-    #     ("GPU aug, 0 workers",  dict(num_workers=0, gpu_augment=True)),
-    # ]
-    #
-    # for label, kwargs in cases:
-    #     ldr, _, _ = get_emnist_dataloaders(batch_size=256, val_split=0.1, augment=True, **kwargs)
-    #     _bench(ldr, label)
-    #
-    # print("\n" + "=" * 60)
-    # print("  DetectionDataset & Loader Tests")
-    # print("=" * 60)
-    # if ROOT_DIR.exists():
-    #     try:
-    print(f"Loading detection loaders from: {ROOT_DIR}")
-    train_loader, val_loader = get_detection_loaders(
-        data_root=ROOT_DIR,
-        batch_size=10,
-        num_workers=2,
-        val_size=10
-    )
-    print(f"Train dataset size: {len(train_loader.dataset)}")
-    print(f"Val dataset size: {len(val_loader.dataset)}")
-
-    images, targets = next(iter(train_loader))
-    #         print(f"Successfully loaded a batch!")
-    #         print(f"  Images tensor shape: {images.shape}")
-    #         print(f"  Targets list size:   {len(targets)}")
-    #         print(f"  First record boxes:  \n{targets[0].boxes}")
-    #         print(f"  First record labels: {targets[0].labels}")
-    #         print(f"  First record chars:  {targets[0].classes}")
-    #
-    #         images, targets = next(iter(val_loader))
-    #
-    #         import matplotlib.pyplot as plt
-    #         import matplotlib.patches as patches
-    #
-    #         fig, ax = plt.subplots()
-    #         plt.ion()
-    #
-    #         num_to_plot = min(10, len(targets))
-    #         for i in range(num_to_plot):
-    #             image   = images[i]               # (1, H, W)
-    #             boxes   = targets[i].boxes        # (M, 4)  [x, y, w, h]
-    #             labels  = targets[i].labels       # (M,)
-    #             classes = targets[i].classes      # list[str]
-    #
-    #             print(f"\nVal batch {i+1} — image shape: {image.shape}")
-    #             for cls, lbl, bbox in zip(classes, labels, boxes):
-    #                 print(f"  '{cls}' (label={lbl.item()}) | bbox={[round(v, 1) for v in bbox.tolist()]}")
-    #
-    #             ax.clear()
-    #             ax.imshow(image.detach().cpu().squeeze().numpy(), cmap='gray')
-    #
-    #             for cls, bbox in zip(classes, boxes):
-    #                 x, y, w, h = bbox.tolist()
-    #                 rect = patches.Rectangle((x, y), w, h, linewidth=1, edgecolor='r', facecolor='none')
-    #                 ax.add_patch(rect)
-    #                 ax.text(x, y - 2, cls, color='red', fontsize=10, fontweight='bold')
-    #
-    #             plt.title(f"Val sample {i+1} — GT boxes")
-    #             plt.tight_layout()
-    #             plt.show()
-    #             plt.pause(10)
-    #
-    #         plt.ioff()
-    #
-    #     except Exception as e:
-    #         print(f"Error running DetectionDataset test: {e}")
-    # else:
-    #     print(f"Skipping detection loader tests (ROOT_DIR not found at {ROOT_DIR})")
-
-
-    it = iter(train_loader)
-
-    for i in range(20):
-        t0 = time.perf_counter()
-
-        images, targets = next(it)
-
-        t1 = time.perf_counter()
-
-        # Simulate H2D copy
-        images = images.cuda(non_blocking=True)
-
-        torch.cuda.synchronize()
-
-        t2 = time.perf_counter()
-
-        print(
-            f"Batch {i + 1:2d} | "
-            f"load={(t1 - t0) * 1000:.2f} ms | "
-            f"H2D={(t2 - t1) * 1000:.2f} ms"
-        )
-
-    print("\nDone.")
+    return train_loader, val_loader, test_loader
