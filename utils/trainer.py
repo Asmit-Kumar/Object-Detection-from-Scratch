@@ -371,7 +371,8 @@ def train_one_epoch_detection(
     """Training loop for multi-object detection.
 
     Expects the detection loader to yield ``(images, targets, labels)``.
-    Targets and labels may be legacy tensors or dictionaries keyed by grid size.
+    Targets may be dense detection tensors, FCOS target containers, or per-grid
+    dictionary outputs keyed by grid size.
     """
     model.train()
     epoch_loss = 0.0

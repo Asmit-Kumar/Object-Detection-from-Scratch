@@ -30,7 +30,7 @@ except ImportError:
     _TORCHVISION_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).resolve().parent.parent / 'data' / 'OD'
-S = 28  # Grid size for grid based detection
+S = 28  # Default single-scale grid size for the legacy grid detector configuration.
 K = 1  # Set once per training run; anchors are fitted from the training split.
 YOLO_GRID_SIZES = (28, 14)
 YOLO_ANCHORS_PER_SCALE = 3

@@ -12,8 +12,9 @@ The project evolved through multiple major architectural stages:
 
 1. **Stage 4: Two-Stage Pipeline** — Separate ResNet detector predicting bounding boxes followed by crop-slicing and passing to an independent 47-class character classifier.
 2. **Stage 5: Single-Stage Unified Detector (FC Tri-Head)** — Integrated bounding box regression, objectness scoring, and class recognition into a single network with global average pooling and Hungarian (bipartite) matching.
-3. **Stage 6: Grid-Based Spatial ResNet Detector (YOLO-style)** *(Current SOTA)* — Fully convolutional, anchor-free architecture operating directly on a $14 \times 14$ spatial feature grid with Focal Loss / BCE objectness, eliminating global pooling and FC projection overhead.
-4. **Stage 7: Multi-Anchor ($K=3$) Spatial ResNet** *(Empirically Retired)* — Evaluated $k$-means box anchor priors ($K=3$). Confirmed that anchor slot competition creates candidate ambiguity on uniform square characters without improving recall density, establishing $K=1$ as the optimal architecture.
+3. **Stage 6: Grid-Based Spatial ResNet Detector (YOLO-style)** — Fully convolutional detector operating directly on a $14 \times 14$ spatial feature grid with Focal Loss / BCE objectness, eliminating global pooling and FC projection overhead.
+4. **Stage 7: Multi-Anchor ($K=3$) Spatial ResNet** *(Empirically Retired)* — Evaluated $k$-means box anchor priors ($K=3$). Confirmed that anchor slot competition creates candidate ambiguity on uniform square characters without improving recall density.
+5. **Stage 8: FCOS Anchor-Free ResNet** *(Current SOTA)* — Multi-scale, anchor-free detector using $28 \times 28$ and $14 \times 14$ feature levels, center-sampled $l/t/r/b$ regression targets, and a centerness head to rank box quality.
 
 ### Stage 6 Grid-Based Spatial Detector Architecture
 
@@ -39,6 +40,18 @@ The project evolved through multiple major architectural stages:
  (Huber + Focal/BCE + Aligned-IoU + CE)                        Final Detections
                                                    (Boxes + Scores + Classes)
 ```
+
+### Stage 8 FCOS Anchor-Free Detector
+
+FCOS is the current best-performing detector in the project's benchmark. Unlike the grid detector, which predicts one box representation per grid location, FCOS predicts four distances from each feature location to the box boundaries. Its Feature Pyramid Network (P3 at stride 8 and P4 at stride 16) handles objects at multiple scales; center sampling and scale ranges assign positive locations during training. A centerness head estimates how well-centered each location is, and inference combines centerness and class probabilities before class-wise NMS.
+
+| Preset | Parameters | Pyramid strides | Benchmark |
+|:---|---:|:---:|:---|
+| Nano (`n`) | 0.52M | 8, 16 | [`FCOS benchmark report`](./benchmark/05_fcos_anchor_free_resnet.md) |
+| Small (`s`) | 1.79M | 8, 16 | [`FCOS benchmark report`](./benchmark/05_fcos_anchor_free_resnet.md) |
+| Medium (`m`) | 7.14M | 8, 16 | [`FCOS benchmark report`](./benchmark/05_fcos_anchor_free_resnet.md) |
+
+The detailed report includes per-layout results, density-stratified recall, and comparisons with earlier detector stages.
 
 ---
 
@@ -103,6 +116,7 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 - **[`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md)** — **Stage 5 Single-Stage Unified ResNet Detector**
 - **[`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md)** — **Stage 6 Grid-Based Spatial ResNet Detector (Focal & BCE)**
 - **[`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md)** — **Stage 7 Multi-Anchor Spatial ResNet (Retirement Report)**
+- **[`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md)** — **Stage 8 FCOS Anchor-Free ResNet Detector**
 
 ---
 
@@ -112,19 +126,28 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 pip install -r requirements.txt
 ```
 
-To run the full benchmark evaluation suite:
+The benchmark scripts support both the existing grid-based detectors and FCOS. The default `grid` mode preserves the previous behavior:
 ```bash
+# Grid-based benchmark (default)
 python scripts/run_single_stage_benchmark.py
+# FCOS benchmark
+python scripts/run_single_stage_benchmark.py --detector fcos
 ```
 
-To run the object density sweep:
+Run density-stratified recall evaluation:
 ```bash
+# Grid-based density sweep (default)
 python scripts/run_density_sweep.py
+# FCOS density sweep
+python scripts/run_density_sweep.py --detector fcos
 ```
 
-To generate visual benchmark detection grids:
+Generate benchmark prediction visualizations:
 ```bash
+# Grid-based visualizations (default)
 python scripts/generate_single_stage_visuals.py
+# FCOS visualizations
+python scripts/generate_single_stage_visuals.py --detector fcos
 ```
 
 To regenerate the synthetic dataset from scratch:

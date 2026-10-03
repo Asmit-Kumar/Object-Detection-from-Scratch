@@ -1,14 +1,16 @@
 """
-Generates visual benchmark detection grid images for Single-Stage Spatial Grid models
-across all sizes (Nano, Small, Medium) × 4 placements × 2 samples.
+Generates benchmark detection visualizations for grid-based and FCOS models
+across all sizes (Nano, Small, Medium), 4 placements, and 2 samples.
 
-Renders outputs for:
+Use ``--detector grid`` to render:
   - grid_focal_stage: 1_grid_detector_{n, s, m}
   - grid_stage: grid_detector_{n, s, m}
   - 3_grid_stage: 3_grid_detector_{n, s, m}
 
-Saves annotated detection outputs to result/benchmark/<variant>/<size>/<placement>_<idx>.png.
+Use ``--detector fcos`` to render FCOS outputs. Annotated images are saved
+under ``result/benchmark/<variant>/<size>/``.
 """
+import argparse
 import sys
 from pathlib import Path
 
@@ -25,8 +27,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
+from models import load_fcos_detector
 from models.object_detector_res import ObjectDetectorResNet
 from generator.dataset import EMNIST_CLASS_NAMES
+from utils.pipeline import _decode_fcos_candidates
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -61,10 +65,84 @@ VARIANTS = [
 ]
 
 
-def generate_visuals():
+def generate_visuals(detector: str = 'grid'):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Check if we have auto-tuned results saved in benchmark/multi_anchor_results.json
+    if detector == 'fcos':
+        print(f"Generating FCOS visual detection grids on {device}...")
+        opt_confs = {'n': 0.50, 's': 0.45, 'm': 0.50}
+        results_p = Path('benchmark/fcos_results.json')
+        if results_p.exists():
+            try:
+                import json
+                with open(results_p) as f:
+                    data = json.load(f)
+                for sz in SIZES:
+                    if sz in data and 'opt_conf' in data[sz]:
+                        opt_confs[sz] = data[sz]['opt_conf']
+            except Exception:
+                pass
+
+        for sz in SIZES:
+            ckpt_path = f'weights/fcos_{sz}_28x14_best.pth'
+            if not Path(ckpt_path).exists():
+                ckpt_path = f'checkpoint/fcos_{sz}_28x14_best.pth'
+            if not Path(ckpt_path).exists():
+                print(f"Skipping {ckpt_path} (not found)")
+                continue
+
+            conf_thresh = opt_confs[sz]
+            out_dir = Path(f'result/benchmark/fcos_stage/{sz}')
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"\n[FCOS {sz.upper()}] Loading model (conf={conf_thresh:.2f})...")
+            model = load_fcos_detector(ckpt_path, device=device, size=sz)
+            model.eval()
+
+            for placement in PLACEMENTS:
+                img_dir = Path(BENCHMARK_PATH) / placement / 'test' / 'images'
+                sample_files = SAMPLE_MAP[placement]
+                for idx, file_name in enumerate(sample_files):
+                    sample_path = img_dir / file_name
+                    img_gray = cv2.imread(str(sample_path), cv2.IMREAD_GRAYSCALE)
+                    if img_gray is None:
+                        print(f"Warning: Could not read {sample_path}")
+                        continue
+                    img_tensor = torch.from_numpy(img_gray).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
+                    img_tensor = (img_tensor - 0.1307) / 0.3081
+
+                    with torch.no_grad():
+                        outputs = model(img_tensor)
+                        candidates = _decode_fcos_candidates(model, outputs, score_threshold=conf_thresh, iou_threshold=0.45)
+                        boxes, scores, classes = candidates[0]
+                        valid_boxes = boxes.cpu().numpy()
+                        valid_scores = scores.cpu().numpy()
+                        valid_classes = classes.cpu().numpy()
+
+                    fig, ax = plt.subplots(figsize=(4.5, 4.5), dpi=120)
+                    ax.imshow(img_gray, cmap='gray', vmin=0, vmax=255)
+
+                    for box, score, cls_idx in zip(valid_boxes, valid_scores, valid_classes):
+                        x, y, w, h = box
+                        char_label = CLASS_NAMES[cls_idx] if 0 <= cls_idx < len(CLASS_NAMES) else "?"
+                        rect = patches.Rectangle((x, y), w, h, linewidth=1.5, edgecolor='#00FFCC', facecolor='none')
+                        ax.add_patch(rect)
+                        ax.text(x, max(0, y - 3), f"{char_label} {float(score):.2f}", color='#FFE03A', fontsize=7, fontweight='bold', bbox=dict(boxstyle='round,pad=0.15', fc='black', alpha=0.55, ec='none'))
+
+                    ax.set_title(f'FCOS {sz.upper()} | {placement} | {len(valid_boxes)} detections', fontsize=9, pad=5)
+                    ax.axis('off')
+                    plt.tight_layout(pad=0.4)
+                    out_path = out_dir / f'{placement}_{idx + 1}.png'
+                    plt.savefig(out_path, bbox_inches='tight', dpi=130)
+                    plt.close()
+                    print(f'  Saved: {out_path}')
+
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        print('\nAll FCOS visual grid images generated successfully!')
+        return
+
     results_path = Path('benchmark/multi_anchor_results.json')
     opt_confs = {}
     if results_path.exists():
@@ -99,11 +177,10 @@ def generate_visuals():
 
             out_dir = Path(f'result/benchmark/{v_name}') / size
             out_dir.mkdir(parents=True, exist_ok=True)
-
             conf_thresh = opt_confs.get((v_name, size), variant['default_conf'])
 
             print(f"\n[{v_name.upper()} | {SIZE_LABELS[size]}] Loading model (conf threshold: {conf_thresh:.2f})...")
-            
+
             sd = torch.load(ckpt_path, map_location=device, weights_only=False)
             sd_state = sd.get('model_state_dict', sd) if isinstance(sd, dict) else sd
             anchors_wh = sd.get('anchors_wh', None) if isinstance(sd, dict) else None
@@ -126,7 +203,7 @@ def generate_visuals():
                     img_tensor = (img_tensor - 0.1307) / 0.3081
 
                     with torch.no_grad():
-                        output = model(img_tensor).squeeze(0)  # (14, 14, K, 52)
+                        output = model(img_tensor).squeeze(0)
                         output = output.reshape(-1, 52)
                         boxes = output[:, :4]
                         confs = torch.sigmoid(output[:, 4])
@@ -134,8 +211,6 @@ def generate_visuals():
                         cls_probs = F.softmax(cls_logits, dim=-1)
                         cls_preds = torch.argmax(cls_probs, dim=-1)
                         cls_confs = torch.max(cls_probs, dim=-1)[0]
-
-                        # Standard pipeline: Filter by confidence threshold & apply NMS 0.35
                         mask = confs >= conf_thresh
                         if mask.any():
                             filtered_boxes = boxes[mask]
@@ -143,13 +218,9 @@ def generate_visuals():
                             filtered_det_confs = confs[mask]
                             filtered_classes = cls_preds[mask]
                             filtered_cls_confs = cls_confs[mask]
-
                             keep = _apply_nms(filtered_boxes, filtered_confs, iou_thresh=0.35)
-
-                            # Secondary gate: require cls_conf >= 0.30
                             cls_gate = filtered_cls_confs[keep] >= 0.30
                             keep = keep[cls_gate]
-
                             valid_boxes = filtered_boxes[keep].cpu().numpy()
                             valid_det_confs = filtered_det_confs[keep].cpu().numpy()
                             valid_classes = filtered_classes[keep].cpu().numpy()
@@ -166,27 +237,13 @@ def generate_visuals():
                     for box, det_c, cls_idx, cls_c in zip(valid_boxes, valid_det_confs, valid_classes, valid_cls_confs):
                         x, y, w, h = box
                         char_label = CLASS_NAMES[cls_idx] if 0 <= cls_idx < len(CLASS_NAMES) else "?"
-
-                        rect = patches.Rectangle(
-                            (x, y), w, h,
-                            linewidth=1.5, edgecolor='#00FFCC', facecolor='none'
-                        )
+                        rect = patches.Rectangle((x, y), w, h, linewidth=1.5, edgecolor='#00FFCC', facecolor='none')
                         ax.add_patch(rect)
-                        ax.text(
-                            x, max(0, y - 3),
-                            f"{char_label} {float(det_c):.2f}|{float(cls_c):.2f}",
-                            color='#FFE03A', fontsize=7, fontweight='bold',
-                            bbox=dict(boxstyle='round,pad=0.15', fc='black', alpha=0.55, ec='none')
-                        )
+                        ax.text(x, max(0, y - 3), f"{char_label} {float(det_c):.2f}|{float(cls_c):.2f}", color='#FFE03A', fontsize=7, fontweight='bold', bbox=dict(boxstyle='round,pad=0.15', fc='black', alpha=0.55, ec='none'))
 
-                    n_det = len(valid_boxes)
-                    ax.set_title(
-                        f'{v_name} {size.upper()} | {placement} | {n_det} detections',
-                        fontsize=9, pad=5
-                    )
+                    ax.set_title(f'{v_name} {size.upper()} | {placement} | {len(valid_boxes)} detections', fontsize=9, pad=5)
                     ax.axis('off')
                     plt.tight_layout(pad=0.4)
-
                     out_path = out_dir / f'{placement}_{idx + 1}.png'
                     plt.savefig(out_path, bbox_inches='tight', dpi=130)
                     plt.close()
@@ -200,5 +257,7 @@ def generate_visuals():
 
 
 if __name__ == '__main__':
-    generate_visuals()
-
+    parser = argparse.ArgumentParser(description='Generate benchmark visuals for the grid or FCOS detector variants.')
+    parser.add_argument('--detector', choices=['grid', 'fcos'], default='grid', help='Which detector family to render.')
+    args = parser.parse_args()
+    generate_visuals(detector=args.detector)

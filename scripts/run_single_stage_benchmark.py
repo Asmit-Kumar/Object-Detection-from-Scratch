@@ -1,15 +1,18 @@
 """
-Single-Stage & Multi-Anchor Spatial Detector Benchmark Evaluation Script.
+Grid-Based and FCOS Detector Benchmark Evaluation Script.
 
-Evaluates single-stage spatial grid models across all 4 placement layouts
-('random', 'grid', 'words', 'line') in data/OD_benchmark/:
+Evaluates detector models across all 4 placement layouts
+('random', 'grid', 'words', 'line') in data/OD_benchmark/.
+Use ``--detector grid`` for:
   1. Grid (K=1, Focal): 1_grid_detector_{n, s, m}
   2. Grid (K=1, Original BCE): grid_detector_{n, s, m}
   3. Multi-Anchor (K=3): 3_grid_detector_{n, s, m}
 
-Features auto-tuned confidence threshold discovery to maximize End-to-End F1,
-and outputs 3-level evaluation metrics (Detection P/R/F1, Classifier Accuracy, E2E F1, Image FPS).
+Use ``--detector fcos`` for FCOS Nano, Small, and Medium. Both modes tune
+confidence thresholds and report detection, classification, end-to-end, and
+throughput metrics.
 """
+import argparse
 import sys
 import time
 import json
@@ -24,8 +27,10 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+from models import load_fcos_detector
 from models.object_detector_res import ObjectDetectorResNet
 from utils.dataset import get_detection_loaders
+from utils.pipeline import _decode_fcos_candidates
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -260,8 +265,269 @@ VARIANTS = [
     {'name': 'Multi-Anchor (K=3)', 'prefix': '3_grid_detector_', 'sizes': ['n', 's', 'm']},
 ]
 
-def run_benchmark():
+
+class FCOSPipeline:
+    """Inference & Evaluation wrapper for FCOSObjectDetectorResNet."""
+
+    def __init__(self, size: str = 's', ckpt_path: str = None, device: str = 'cuda', conf_threshold: float = 0.50):
+        self.size = size.lower()
+        self.device = device
+        self.conf_threshold = conf_threshold
+
+        weights_p = Path(f'weights/fcos_{self.size}_28x14_best.pth')
+        ckpt_p = Path(f'checkpoint/fcos_{self.size}_28x14_best.pth')
+        path = ckpt_path or (str(weights_p) if weights_p.exists() else str(ckpt_p))
+        self.model = load_fcos_detector(path, device=device, size=self.size)
+        self.model.eval()
+
+    @torch.no_grad()
+    def tune_threshold(self, loader, thresholds=np.arange(0.20, 0.85, 0.05)) -> float:
+        records = []
+        for images, targets_batch, annotations in loader:
+            gt_boxes_batch, gt_labels_batch = annotations
+            images = images.to(self.device)
+            outputs = self.model(images)
+            candidates = _decode_fcos_candidates(self.model, outputs, score_threshold=0.15, iou_threshold=0.45)
+
+            for b in range(len(candidates)):
+                p_boxes, p_scores, p_classes = candidates[b]
+                records.append({
+                    'p_boxes': p_boxes.cpu().numpy(),
+                    'p_scores': p_scores.cpu().numpy(),
+                    'p_classes': p_classes.cpu().numpy(),
+                    'gt_boxes': gt_boxes_batch[b].cpu().numpy(),
+                    'gt_labels': gt_labels_batch[b].cpu().numpy(),
+                })
+
+        best_f1 = -1.0
+        best_t = 0.50
+        for t in thresholds:
+            t = round(float(t), 2)
+            det_tp = 0
+            e2e_tp = 0
+            total_preds = 0
+            total_gt = 0
+
+            for r in records:
+                mask = r['p_scores'] >= t
+                preds_boxes = r['p_boxes'][mask]
+                preds_classes = r['p_classes'][mask]
+                gt_boxes = r['gt_boxes']
+                gt_labels = r['gt_labels']
+
+                n_gt = len(gt_boxes)
+                n_pred = len(preds_boxes)
+                total_gt += n_gt
+                total_preds += n_pred
+
+                if n_gt == 0 or n_pred == 0:
+                    continue
+
+                px = preds_boxes[:, 0:1]; py = preds_boxes[:, 1:2]
+                pw = preds_boxes[:, 2:3]; ph = preds_boxes[:, 3:4]
+                gx = gt_boxes[:, 0]; gy = gt_boxes[:, 1]
+                gw = gt_boxes[:, 2]; gh = gt_boxes[:, 3]
+
+                ix1 = np.maximum(px, gx); iy1 = np.maximum(py, gy)
+                ix2 = np.minimum(px + pw, gx + gw); iy2 = np.minimum(py + ph, gy + gh)
+                inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+                union = pw * ph + gw * gh - inter
+                iou_mat = np.where(union > 0, inter / union, 0.0)
+
+                pred_idx, gt_idx = linear_sum_assignment(-iou_mat)
+                for k, m in zip(pred_idx, gt_idx):
+                    if iou_mat[k, m] >= 0.50:
+                        det_tp += 1
+                        if preds_classes[k] == gt_labels[m]:
+                            e2e_tp += 1
+
+            e2e_p = e2e_tp / max(1, total_preds)
+            e2e_r = e2e_tp / max(1, total_gt)
+            e2e_f1 = (2 * e2e_p * e2e_r) / max(1e-6, e2e_p + e2e_r)
+            if e2e_f1 > best_f1:
+                best_f1 = e2e_f1
+                best_t = t
+        return best_t
+
+    @torch.no_grad()
+    def evaluate_loader(self, loader, iou_match_thresh: float = 0.50) -> dict:
+        total_gt = 0
+        total_preds = 0
+        total_images = 0
+        det_tp = 0
+        e2e_tp = 0
+        correct_cls = 0
+
+        if self.device.startswith('cuda'):
+            dummy = torch.zeros((1, 1, 224, 224), device=self.device)
+            _ = self.model(dummy)
+            torch.cuda.synchronize()
+
+        t0 = time.time()
+        for images, targets_batch, annotations in loader:
+            gt_boxes_batch, gt_labels_batch = annotations
+            images = images.to(self.device)
+            outputs = self.model(images)
+            candidates = _decode_fcos_candidates(self.model, outputs, score_threshold=self.conf_threshold, iou_threshold=0.45)
+            total_images += images.shape[0]
+
+            for b in range(len(candidates)):
+                p_boxes, p_scores, p_classes = candidates[b]
+                preds_boxes = p_boxes.cpu().numpy()
+                preds_classes = p_classes.cpu().numpy()
+                gt_boxes = gt_boxes_batch[b].cpu().numpy()
+                gt_labels = gt_labels_batch[b].cpu().numpy()
+
+                n_gt = len(gt_boxes)
+                n_pred = len(preds_boxes)
+                total_gt += n_gt
+                total_preds += n_pred
+
+                if n_gt == 0 or n_pred == 0:
+                    continue
+
+                px = preds_boxes[:, 0:1]; py = preds_boxes[:, 1:2]
+                pw = preds_boxes[:, 2:3]; ph = preds_boxes[:, 3:4]
+                gx = gt_boxes[:, 0]; gy = gt_boxes[:, 1]
+                gw = gt_boxes[:, 2]; gh = gt_boxes[:, 3]
+
+                ix1 = np.maximum(px, gx); iy1 = np.maximum(py, gy)
+                ix2 = np.minimum(px + pw, gx + gw); iy2 = np.minimum(py + ph, gy + gh)
+                inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+                union = pw * ph + gw * gh - inter
+                iou_mat = np.where(union > 0, inter / union, 0.0)
+
+                pred_idx, gt_idx = linear_sum_assignment(-iou_mat)
+                for k, m in zip(pred_idx, gt_idx):
+                    if iou_mat[k, m] >= iou_match_thresh:
+                        det_tp += 1
+                        if preds_classes[k] == gt_labels[m]:
+                            correct_cls += 1
+                            e2e_tp += 1
+
+        if self.device.startswith('cuda'):
+            torch.cuda.synchronize()
+        elapsed = time.time() - t0
+        image_fps = total_images / max(1e-6, elapsed)
+
+        det_p = det_tp / max(1, total_preds)
+        det_r = det_tp / max(1, total_gt)
+        det_f1 = (2 * det_p * det_r) / max(1e-6, det_p + det_r)
+        cls_acc = correct_cls / max(1, det_tp)
+        e2e_p = e2e_tp / max(1, total_preds)
+        e2e_r = e2e_tp / max(1, total_gt)
+        e2e_f1 = (2 * e2e_p * e2e_r) / max(1e-6, e2e_p + e2e_r)
+
+        return {
+            'total_gt': total_gt,
+            'total_preds': total_preds,
+            'total_images': total_images,
+            'det_tp': det_tp,
+            'e2e_tp': e2e_tp,
+            'correct_cls': correct_cls,
+            'det_precision': round(det_p, 4),
+            'det_recall': round(det_r, 4),
+            'det_f1': round(det_f1, 4),
+            'classifier_acc': round(cls_acc, 4),
+            'e2e_precision': round(e2e_p, 4),
+            'e2e_recall': round(e2e_r, 4),
+            'e2e_f1': round(e2e_f1, 4),
+            'fps': round(image_fps, 1),
+            'eval_time_sec': round(elapsed, 2),
+        }
+
+
+def run_benchmark(detector: str = 'grid'):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     all_results = {}
+
+    if detector == 'fcos':
+        print("=" * 90)
+        print("  FCOS ANCHOR-FREE RESNET DETECTOR BENCHMARK (AUTO-TUNED THRESHOLDS)")
+        print(f"  Device: {device} | 10,000 Test Images across 4 Placements")
+        print("=" * 90)
+
+        for sz in SIZES:
+            print(f"\nEvaluating FCOS Preset: '{sz.upper()}'...")
+            pipe_tune = FCOSPipeline(size=sz, device=device, conf_threshold=0.50)
+            tune_loader = get_detection_loaders(
+                data_root=f"{BENCHMARK_PATH}/random", batch_size=128, test_only=True, num_workers=0, fcos=True
+            )
+            opt_conf = pipe_tune.tune_threshold(tune_loader)
+            print(f"  [Auto-Tuned] Optimal threshold for FCOS {sz.upper()}: conf = {opt_conf:.2f}")
+
+            pipe = FCOSPipeline(size=sz, device=device, conf_threshold=opt_conf)
+            all_results[sz] = {'opt_conf': opt_conf, 'placements': {}, 'summary': {}}
+
+            total_det_p = 0.0
+            total_det_r = 0.0
+            total_cls_acc = 0.0
+            total_e2e_f1 = 0.0
+            total_fps = 0.0
+
+            for p in PLACEMENTS:
+                loader = get_detection_loaders(
+                    data_root=f"{BENCHMARK_PATH}/{p}", batch_size=128, test_only=True, num_workers=0, fcos=True
+                )
+                res = pipe.evaluate_loader(loader)
+                all_results[sz]['placements'][p] = res
+                total_det_p += res['det_precision']
+                total_det_r += res['det_recall']
+                total_cls_acc += res['classifier_acc']
+                total_e2e_f1 += res['e2e_f1']
+                total_fps += res['fps']
+                print(f"  [{p:<6}] Det P={res['det_precision']:.4f} R={res['det_recall']:.4f} | Cls Acc={res['classifier_acc']:.4f} | E2E F1={res['e2e_f1']:.4f} | FPS={res['fps']:.1f} img/s")
+
+            num_p = len(PLACEMENTS)
+            avg_res = {
+                'avg_det_precision': round(total_det_p / num_p, 4),
+                'avg_det_recall': round(total_det_r / num_p, 4),
+                'avg_classifier_acc': round(total_cls_acc / num_p, 4),
+                'avg_e2e_f1': round(total_e2e_f1 / num_p, 4),
+                'avg_fps': round(total_fps / num_p, 1),
+            }
+            all_results[sz]['summary'] = avg_res
+            print(
+                f"  [AVERAGE {sz.upper()}] Det P={avg_res['avg_det_precision']:.4f} "
+                f"R={avg_res['avg_det_recall']:.4f} | "
+                f"Cls Acc={avg_res['avg_classifier_acc']:.4f} | "
+                f"E2E F1={avg_res['avg_e2e_f1']:.4f} | "
+                f"FPS={avg_res['avg_fps']:.1f} img/s"
+            )
+
+        print("\n" + "=" * 90)
+        print("  FULL FCOS BENCHMARK SUMMARY")
+        print("=" * 90)
+        print(
+            f"{'Size':<6} {'Conf':<6} {'Layout':<8} {'Det P':<8} {'Det R':<8} "
+            f"{'Cls Acc':<10} {'E2E F1':<9} {'Img FPS':<8}"
+        )
+        print("-" * 90)
+        for sz, data in all_results.items():
+            conf_t = data['opt_conf']
+            for placement, result in data['placements'].items():
+                print(
+                    f"{sz.upper():<6} {conf_t:<6.2f} {placement:<8} "
+                    f"{result['det_precision']:<8.4f} {result['det_recall']:<8.4f} "
+                    f"{result['classifier_acc']:<10.4f} {result['e2e_f1']:<9.4f} "
+                    f"{result['fps']:<8.1f}"
+                )
+            summary = data['summary']
+            print(
+                f"{sz.upper():<6} {conf_t:<6.2f} {'AVERAGE':<8} "
+                f"{summary['avg_det_precision']:<8.4f} {summary['avg_det_recall']:<8.4f} "
+                f"{summary['avg_classifier_acc']:<10.4f} {summary['avg_e2e_f1']:<9.4f} "
+                f"{summary['avg_fps']:<8.1f}"
+            )
+        print("=" * 90)
+
+        out_file = Path('benchmark/fcos_results.json')
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_file, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\nSaved raw FCOS evaluation metrics to '{out_file}'")
+        return
+
     print("=" * 90)
     print("  SINGLE-STAGE & MULTI-ANCHOR UNIFIED DETECTOR BENCHMARK (AUTO-TUNED THRESHOLDS)")
     print("=" * 90)
@@ -275,12 +541,11 @@ def run_benchmark():
         for sz in v_sizes:
             print(f"\nEvaluating Variant '{v_name}' | Preset: '{sz.upper()}' ({SIZE_LABELS[sz]})...")
             pipe_tune = SingleStagePipeline(size=sz, prefix=prefix, conf_threshold=0.65)
-            
+
             if pipe_tune.anchors_wh is None and prefix.startswith('3_'):
                 print(f"  [Skipping] Checkpoint not found for {prefix}{sz}_best.pth")
                 continue
 
-            # Auto-tune threshold using random placement split
             tune_loader = get_detection_loaders(
                 data_root=f"{BENCHMARK_PATH}/random", batch_size=128, test_only=True, num_workers=0, anchors_wh=pipe_tune.anchors_wh
             )
@@ -320,5 +585,7 @@ def run_benchmark():
 
 
 if __name__ == '__main__':
-    run_benchmark()
-
+    parser = argparse.ArgumentParser(description='Run the benchmark for the grid or FCOS detector variants.')
+    parser.add_argument('--detector', choices=['grid', 'fcos'], default='grid', help='Which detector family to evaluate.')
+    args = parser.parse_args()
+    run_benchmark(detector=args.detector)

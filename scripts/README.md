@@ -12,10 +12,10 @@ These scripts evaluate models across the `data/OD_benchmark/` dataset (10,000 im
   Evaluates the **Two-Stage** detection pipeline (Detector + independent Classifier). Computes bounding box precision/recall, secondary crop classification accuracy, and end-to-end F1 scores.
   
 - **`run_single_stage_benchmark.py`**
-  Evaluates the **Single-Stage Unified** detector (Tri-head). Handles dense predictions, optimal confidence thresholds, and computes 3-level evaluation metrics (Det / Cls / E2E).
+  Evaluates the **Single-Stage Unified** detector (Tri-head) or FCOS detector. Use `--detector grid` (default) or `--detector fcos`; both modes tune confidence thresholds and report detection, classification, end-to-end, and throughput metrics.
 
 - **`run_density_sweep.py`**
-  A specialized evaluation script that buckets test images by the ground-truth object count to measure how detection recall degrades as canvas clutter and character density increases.
+  Buckets test images by ground-truth object count to measure how detection recall degrades as canvas clutter and character density increase. Use `--detector grid` (default) or `--detector fcos`.
 
 ## 🖼️ Visualization Generators
 
@@ -28,7 +28,7 @@ These scripts render output grids with bounding boxes, predicted classes, and co
   Generates prediction visualization grids for the **Two-Stage** pipeline across varying model sizes (Nano, Small, Medium).
 
 - **`generate_single_stage_visuals.py`**
-  Generates prediction visualization grids for the **Single-Stage** models. Displays actual objectness confidence (`det_c`) alongside class confidence (`cls_c`) for NMS-filtered boxes.
+  Generates prediction visualization grids for **Single-Stage** or FCOS models. Use `--detector grid` (default) or `--detector fcos`; grid output displays detection and class confidence, while FCOS scores include centerness gating.
 
 ## 🧪 Pipeline Utilities
 

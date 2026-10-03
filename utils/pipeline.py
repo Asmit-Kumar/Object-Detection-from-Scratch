@@ -1,15 +1,15 @@
 """
-utils/pipeline.py — End-to-End Object Detection & Character Recognition Pipeline.
+utils/pipeline.py — End-to-End Detector + Character Recognition Pipeline.
 
 Combines:
-  1. ObjectDetectorResNet / FCOSObjectDetectorResNet (Stage 1: Multi-slot / Anchor-free character detection)
-  2. CharacterClassifierResNet (Stage 2: 47-class EMNIST ByMerge character recognition)
+  1. FCOSObjectDetectorResNet (anchor-free multi-scale detection)
+  2. CharacterClassifierResNet (47-class EMNIST ByMerge recognition)
 
 Features:
-  - High-throughput batched inference
-  - Vectorized GPU batch crop extraction
-  - Single-pass parallel classifier execution
-  - Concurrent multi-stream evaluation across benchmark placement layouts (random, grid, words, line)
+  - Batched inference for detector and classifier stages
+  - Vectorized GPU crop extraction
+  - High-throughput class-wise NMS and score gating
+  - Evaluation across benchmark placement layouts (random, grid, words, line)
 """
 
 import sys
