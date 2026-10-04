@@ -17,6 +17,7 @@ from pathlib import Path
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir / 'generator'))
 sys.path.insert(0, str(root_dir))
+sys.path.append(str(root_dir / 'scripts'))
 
 import cv2
 import torch
@@ -31,6 +32,7 @@ from models import load_fcos_detector
 from models.object_detector_res import ObjectDetectorResNet
 from generator.dataset import EMNIST_CLASS_NAMES
 from utils.pipeline import _decode_fcos_candidates
+from run_single_stage_benchmark import SingleStagePipeline
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -107,8 +109,8 @@ def generate_visuals(detector: str = 'grid'):
                     if img_gray is None:
                         print(f"Warning: Could not read {sample_path}")
                         continue
+                    # Detectors are trained and benchmarked on [0, 1] images (DataReader); no EMNIST normalization.
                     img_tensor = torch.from_numpy(img_gray).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                    img_tensor = (img_tensor - 0.1307) / 0.3081
 
                     with torch.no_grad():
                         outputs = model(img_tensor)
@@ -181,14 +183,8 @@ def generate_visuals(detector: str = 'grid'):
 
             print(f"\n[{v_name.upper()} | {SIZE_LABELS[size]}] Loading model (conf threshold: {conf_thresh:.2f})...")
 
-            sd = torch.load(ckpt_path, map_location=device, weights_only=False)
-            sd_state = sd.get('model_state_dict', sd) if isinstance(sd, dict) else sd
-            anchors_wh = sd.get('anchors_wh', None) if isinstance(sd, dict) else None
-
-            num_anchors = anchors_wh.shape[0] if anchors_wh is not None else (3 if prefix.startswith('3_') else 1)
-            stem, ch, blocks, pool = ObjectDetectorResNet.CONFIGS[size]
-            model = ObjectDetectorResNet(channels=ch, blocks=blocks, num_anchors=num_anchors).to(device)
-            model.load_state_dict(sd_state)
+            # Same checkpoint loading as the benchmark (selects the legacy 14x14 architecture when needed).
+            model = SingleStagePipeline(size=size, prefix=prefix, ckpt_path=ckpt_path, device=device).model
             model.eval()
 
             for placement in PLACEMENTS:
@@ -199,8 +195,8 @@ def generate_visuals(detector: str = 'grid'):
                     sample_path = img_dir / file_name
                     img_gray = cv2.imread(str(sample_path), cv2.IMREAD_GRAYSCALE)
 
+                    # Detectors are trained and benchmarked on [0, 1] images (DataReader); no EMNIST normalization.
                     img_tensor = torch.from_numpy(img_gray).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                    img_tensor = (img_tensor - 0.1307) / 0.3081
 
                     with torch.no_grad():
                         output = model(img_tensor).squeeze(0)

@@ -24,6 +24,7 @@ import numpy as np
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir / 'generator'))
 sys.path.insert(0, str(root_dir))
+sys.path.append(str(root_dir / 'scripts'))
 
 import torch
 from models import load_detector, load_fcos_detector
@@ -31,10 +32,33 @@ from models.object_detector_res import ObjectDetectorResNet
 from utils.dataset import get_detection_loaders
 from utils.pipeline import _decode_fcos_candidates
 from utils.trainer import evaluate_density_sweep
+from run_single_stage_benchmark import SingleStagePipeline
 
 BENCHMARK_ROOT = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
 BUCKETS = [(1, 4), (5, 8), (9, 12), (13, 16)]
+
+# Sweeps use the thresholds selected on the held-out tune set by run_single_stage_benchmark.py;
+# the hard-coded confs below are only fallbacks when those results are missing.
+FCOS_RESULTS = Path('benchmark/fcos_results.json')
+GRID_RESULTS = Path('benchmark/multi_anchor_results.json')
+GRID_RESULT_NAMES = {
+    'grid_focal_stage': 'Grid (K=1, Focal)',
+    'grid_bce_stage': 'Grid (K=1, Original BCE)',
+    'multi_anchor_stage': 'Multi-Anchor (K=3)',
+}
+
+
+def _tuned_conf(results_path: Path, keys: list, fallback: float) -> float:
+    if not results_path.exists():
+        return fallback
+    with open(results_path) as f:
+        node = json.load(f)
+    for k in keys:
+        if k not in node:
+            return fallback
+        node = node[k]
+    return node.get('opt_conf', fallback)
 
 VARIANTS = [
     {'name': 'grid_focal_stage', 'prefix': '1_grid_detector_', 'conf': 0.50, 'sizes': ['n', 's', 'm']},
@@ -159,7 +183,7 @@ def run_full_density_sweep(detector: str = 'grid'):
         for cfg in configs:
             size = cfg['size']
             name = cfg['name']
-            conf_t = cfg['conf']
+            conf_t = _tuned_conf(FCOS_RESULTS, [size], cfg['conf'])
             sweep_results[size] = {'name': name, 'conf': conf_t, 'layouts': {}}
             print(f"\n--- {name.upper()} (conf = {conf_t:.2f}) ---")
             ckpt_path = f'weights/fcos_{size}_28x14_best.pth'
@@ -187,40 +211,32 @@ def run_full_density_sweep(detector: str = 'grid'):
     for v in VARIANTS:
         v_name = v['name']
         prefix = v['prefix']
-        conf_t = v['conf']
         v_sizes = v.get('sizes', ['n', 's', 'm'])
         sweep_results[v_name] = {}
 
-        print(f"\n--- {v_name.upper()} MODELS (conf = {conf_t:.2f}) ---")
+        print(f"\n--- {v_name.upper()} MODELS ---")
         for size in v_sizes:
+            conf_t = _tuned_conf(GRID_RESULTS, [GRID_RESULT_NAMES[v_name], size], v['conf'])
             weights_p = Path(f'weights/{prefix}{size}_best.pth')
             ckpt_p = Path(f'checkpoint/{prefix}{size}_best.pth')
             ckpt_path = str(weights_p) if weights_p.exists() else str(ckpt_p)
-            anchors_wh = None
-            sd_state = None
-            if Path(ckpt_path).exists():
-                sd = torch.load(ckpt_path, map_location=device, weights_only=False)
-                sd_state = sd.get('model_state_dict', sd) if isinstance(sd, dict) else sd
-                anchors_wh = sd.get('anchors_wh', None) if isinstance(sd, dict) else None
-            else:
+            if not Path(ckpt_path).exists():
                 print(f"Skipping {ckpt_path} (not found)")
                 continue
 
-            num_anchors = anchors_wh.shape[0] if anchors_wh is not None else (3 if prefix.startswith('3_') else 1)
-            if anchors_wh is None and num_anchors == 1:
-                anchors_wh = torch.tensor([[16.0, 16.0]])
+            # Same checkpoint loading as the main benchmark (selects the legacy 14x14 architecture when needed).
+            pipe = SingleStagePipeline(size=size, prefix=prefix, ckpt_path=ckpt_path, device=device, conf_threshold=conf_t)
+            model = pipe.model
+            anchors_wh = pipe.anchors_wh
 
-            stem, ch, blocks, pool = ObjectDetectorResNet.CONFIGS[size]
-            model = ObjectDetectorResNet(channels=ch, blocks=blocks, num_anchors=num_anchors).to(device)
-            model.load_state_dict(sd_state)
-
-            sweep_results[v_name][size] = {}
+            sweep_results[v_name][size] = {'conf': conf_t, 'architecture': pipe.architecture, 'layouts': {}}
             for p in PLACEMENTS:
                 data_path = f"{BENCHMARK_ROOT}/{p}"
-                print(f"\n[Evaluating {v_name} {size.upper()} on layout: '{p}']")
-                loader = get_detection_loaders(data_path, batch_size=128, test_only=True, num_workers=0, anchors_wh=anchors_wh)
+                print(f"\n[Evaluating {v_name} {size.upper()} (conf = {conf_t:.2f}) on layout: '{p}']")
+                loader = get_detection_loaders(data_path, batch_size=128, test_only=True, num_workers=0,
+                                               anchors_wh=anchors_wh, num_anchors=anchors_wh.shape[0])
                 res = evaluate_density_sweep(model, loader, device=device, conf_threshold=conf_t, iou_threshold=0.50, buckets=BUCKETS)
-                sweep_results[v_name][size][p] = res
+                sweep_results[v_name][size]['layouts'][p] = res
 
     out_path = Path('benchmark/grid_density_sweep_results.json')
     out_path.parent.mkdir(parents=True, exist_ok=True)
