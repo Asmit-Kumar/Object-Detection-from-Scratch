@@ -118,12 +118,29 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 - **[`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md)** — **Stage 7 Multi-Anchor Spatial ResNet (Retirement Report)**
 - **[`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md)** — **Stage 8 FCOS Anchor-Free ResNet Detector**
 
+### Code Layout
+
+- **[`models/`](./models/)** — Architectures and size presets; `build_model(name, size)` / `load_model(name, path, device, size)` for `grid`, `multiscale`, `fcos` and `classifier`.
+- **[`dataio/`](./dataio/)** — EMNIST reader, datasets and loaders, FCOS target encoding.
+- **[`training/`](./training/)** — `fit()` and evaluation, losses, checkpointing, run logger.
+- **[`inference/`](./inference/)** — `DetectionPipeline` and prediction decoding.
+- **[`generator/`](./generator/)** — Synthetic multi-character canvas generation.
+- **[`utils/`](./utils/)** — Visualizer, plus aliases so older `utils.<module>` imports keep working.
+- **[`scripts/`](./scripts/)**, **[`notebooks/`](./notebooks/)**, **[`tests/`](./tests/)** — Benchmarks, training notebooks and the test suite.
+
+Earlier stages are tagged (`stage4-two-stage` … `stage8-fcos`, and `v1-tensorflow` for the original TensorFlow version); check one out with `git switch --detach <tag>`.
+
 ---
 
 ## 🛠️ Setup & Execution
 
 ```bash
 pip install -r requirements.txt
+```
+
+Run the tests (architecture signatures, checkpoint loading, import paths):
+```bash
+python -m unittest discover -s tests -t . -v
 ```
 
 The benchmark scripts support both the existing grid-based detectors and FCOS. The default `grid` mode preserves the previous behavior:
