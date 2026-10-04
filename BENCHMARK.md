@@ -8,68 +8,97 @@ This document maintains the master comparison index across 10,000 placement-stra
 
 ## 🏆 Master Cross-Architecture Comparison Table
 
-| Architecture Paradigm | Model Size | Model Params | Optimal `conf` | Det Precision | Det Recall | Classifier Acc | End-to-End F1 | Throughput (Image FPS) | Full Report |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---|
-| **Two-Stage Pipeline** | Nano (`n`) | 0.94M | 0.70 | 0.9330 | 0.8460 | 74.60% | 0.6620 | **662 img/s** | [`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md) |
-| **Two-Stage Pipeline** | Small (`s`) | 2.60M | 0.70 | 0.9750 | 0.9340 | 75.10% | 0.7170 | **612 img/s** | [`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md) |
-| **Two-Stage Pipeline** | Medium (`m`) | 9.21M | 0.70 | **0.9900** | **0.9510** | 75.80% | 0.7350 | 156 img/s 🐢 | [`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md) |
-| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
-| **Single-Stage Unified** | Nano (`n`) | 0.71M | 0.70 | 0.8835 | 0.8386 | 36.34% | 0.3131 | 634 img/s | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
-| **Single-Stage Unified** | Small (`s`) | 2.52M | 0.65 ⭐ | 0.9192 | 0.9101 | 71.44% | 0.6535 | 608 img/s | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
-| **Single-Stage Unified** | Medium (`m`) | 9.42M | 0.65 ⭐ | 0.9513 | 0.9490 | 83.22% | 0.7907 | **589 img/s** 🚀 | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
-| **Single-Stage Unified** | Large (`l`) | 19.99M | 0.60 ⭐ | 0.9458 | **0.9580** | **87.34%** | **0.8320** | **533 img/s** 🚀 | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
-| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
-| **Grid Spatial ($K=1$, Focal)** | Nano (`n`) | **0.39M** ⚡ | 0.45 | 0.5696 | 0.5659 | 86.89% | 0.4954 | 345 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| **Grid Spatial ($K=1$, Focal)** | Small (`s`) | **1.55M** ⚡ | 0.50 | 0.5802 | 0.5724 | **87.06%** 🚀 | 0.5047 | 399 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| **Grid Spatial ($K=1$, Focal)** | Medium (`m`) | **6.18M** ⚡ | 0.40 | **0.5851** | **0.5894** | 85.91% | 0.5098 | 377 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
-| **Grid Spatial ($K=1$, BCE)** | Nano (`n`) | **0.39M** ⚡ | 0.95 | 0.5736 | 0.5712 | 86.59% | 0.4980 | 413 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| **Grid Spatial ($K=1$, BCE)** | Small (`s`) | **1.55M** ⚡ | 0.95 | 0.5840 | 0.5842 | **87.17%** 🚀 | **0.5126** | 401 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| **Grid Spatial ($K=1$, BCE)** | Medium (`m`) | **6.18M** ⚡ | 0.95 | **0.5893** | **0.5891** | 85.63% | 0.5105 | 380 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
-| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
-| **Multi-Anchor ($K=3$)** | Nano (`n`) | **0.39M** ⚡ | 0.40 | 0.5009 | 0.5243 | 86.34% | 0.4445 | 412 img/s | [`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md) |
-| **Multi-Anchor ($K=3$)** | Small (`s`) | **1.55M** ⚡ | 0.95 | 0.5192 | 0.5870 | 86.43% | 0.4801 | 395 img/s | [`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md) |
-| **Multi-Anchor ($K=3$)** | Medium (`m`) | **6.18M** ⚡ | 0.95 | 0.5330 | **0.5960** 🚀 | 85.68% | 0.4878 | 376 img/s | [`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md) |
-| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
-| **FCOS Anchor-Free ResNet** | **Nano (`n`)** | **0.52M** ⚡ | **0.50** | **0.9994** 🌟 | **0.9654** | **92.13%** 🌟 | **0.9048** 🌟 | **505.1 img/s** | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
-| **FCOS Anchor-Free ResNet** | **Small (`s`)** | **1.79M** | **0.45** | **0.9972** | **0.9889** 🌟 | **90.93%** | **0.9030** | **655.8 img/s** 🚀 | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
-| **FCOS Anchor-Free ResNet** | **Medium (`m`)** | **7.14M** | **0.50** | **0.9988** | **0.9824** | **91.06%** | **0.9020** | **563.4 img/s** | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
+<!-- BEGIN GENERATED: master_table (scripts/render_benchmark_reports.py) -->
+| Architecture Paradigm | Size | Params | `conf` | `conf` Source | Avg Det Precision | Avg Det Recall | Avg Classifier Acc | Avg End-to-End F1 | Eval-Loop Throughput | Pure Inference | Full Report |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Two-Stage Pipeline** | Nano (`n`) | 0.94M | 0.70 | fixed | 0.9331 | 0.8455 | 74.64% | 0.6617 | 662 img/s | — | [`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md) |
+| **Two-Stage Pipeline** | Small (`s`) | 2.60M | 0.70 | fixed | 0.9748 | 0.9342 | 75.15% | 0.7168 | 612 img/s | — | [`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md) |
+| **Two-Stage Pipeline** | Medium (`m`) | 9.21M | 0.70 | fixed | 0.9895 | 0.9507 | 75.83% | 0.7353 | 386 img/s | — | [`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Single-Stage Unified** | Nano (`n`) | 0.71M | 0.70 | hard-coded, source unrecorded | 0.8835 | 0.8386 | 36.34% | 0.3130 | 634 img/s | — | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
+| **Single-Stage Unified** | Small (`s`) | 2.52M | 0.65 | hard-coded, source unrecorded | 0.9192 | 0.9103 | 71.45% | 0.6535 | 608 img/s | — | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
+| **Single-Stage Unified** | Medium (`m`) | 9.42M | 0.65 | hard-coded, source unrecorded | 0.9513 | 0.9490 | 83.22% | 0.7907 | 589 img/s | — | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
+| **Single-Stage Unified** | Large (`l`) | 19.99M | 0.60 | hard-coded, source unrecorded | 0.9458 | 0.9580 | 87.43% | 0.8320 | 532 img/s | — | [`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Grid Spatial ($K=1$, Focal)** | Nano (`n`) | 0.39M | 0.45 | held-out tune set | 0.5696 | 0.5659 | 86.89% | 0.4954 | 440 img/s | 20,972 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial ($K=1$, Focal)** | Small (`s`) | 1.55M | 0.50 | held-out tune set | 0.5802 | 0.5724 | 87.06% | 0.5047 | 416 img/s | 8,039 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial ($K=1$, Focal)** | Medium (`m`) | 6.18M | 0.45 | held-out tune set | 0.5883 | 0.5835 | 85.90% | 0.5087 | 394 img/s | 3,547 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Grid Spatial ($K=1$, BCE)** | Nano (`n`) | 0.39M | 0.90 | held-out tune set | 0.5705 | 0.5756 | 86.59% | 0.4985 | 497 img/s | 21,152 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial ($K=1$, BCE)** | Small (`s`) | 1.55M | 0.95 | held-out tune set | 0.5840 | 0.5842 | 87.17% | 0.5126 | 436 img/s | 8,094 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| **Grid Spatial ($K=1$, BCE)** | Medium (`m`) | 6.18M | 0.85 | held-out tune set | 0.5846 | 0.5917 | 85.61% | 0.5095 | 394 img/s | 3,648 img/s | [`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Multi-Anchor ($K=3$)** | Nano (`n`) | 0.41M | 0.40 | held-out tune set | 0.5009 | 0.5243 | 86.34% | 0.4445 | 434 img/s | 20,967 img/s | [`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md) |
+| **Multi-Anchor ($K=3$)** | Small (`s`) | 1.58M | 0.95 | held-out tune set | 0.5192 | 0.5869 | 86.43% | 0.4800 | 416 img/s | 8,006 img/s | [`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md) |
+| **Multi-Anchor ($K=3$)** | Medium (`m`) | 6.23M | 0.95 | held-out tune set | 0.5330 | 0.5960 | 85.68% | 0.4878 | 398 img/s | 3,575 img/s | [`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **FCOS Anchor-Free** | Nano (`n`) | 0.52M | 0.50 | held-out tune set | 0.9994 | 0.9654 | 92.13% | 0.9048 | 703 img/s | 15,276 img/s | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
+| **FCOS Anchor-Free** | Small (`s`) | 1.79M | 0.45 | held-out tune set | 0.9972 | 0.9889 | 90.93% | 0.9030 | 650 img/s | 6,868 img/s | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
+| **FCOS Anchor-Free** | Medium (`m`) | 7.14M | 0.45 | held-out tune set | 0.9972 | 0.9895 | 90.75% | 0.9015 | 603 img/s | 2,988 img/s | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
+
+_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. Non-FCOS params are counted from checkpoint state_dicts._
+<!-- END GENERATED: master_table -->
 
 ---
 
 ## ⚡ Technical Analysis: Throughput & Latency Dynamics
 
-### 📊 Direct End-to-End Throughput & Latency Comparison
+<!-- BEGIN GENERATED: throughput (scripts/render_benchmark_reports.py) -->
+| Paradigm | Size | Params | Pure Inference (`model(images)`, batch 128) | Eval-Loop Throughput |
+|:---|:---:|:---:|:---:|:---:|
+| **Two-Stage Pipeline** | Nano (`n`) | 0.94M | not measured | 662 img/s |
+| **Two-Stage Pipeline** | Small (`s`) | 2.60M | not measured | 612 img/s |
+| **Two-Stage Pipeline** | Medium (`m`) | 9.21M | not measured | 386 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **Single-Stage Unified** | Nano (`n`) | 0.71M | not measured | 634 img/s |
+| **Single-Stage Unified** | Small (`s`) | 2.52M | not measured | 608 img/s |
+| **Single-Stage Unified** | Medium (`m`) | 9.42M | not measured | 589 img/s |
+| **Single-Stage Unified** | Large (`l`) | 19.99M | not measured | 532 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **Grid Spatial ($K=1$, Focal)** | Nano (`n`) | 0.39M | **20,972 img/s** | 440 img/s |
+| **Grid Spatial ($K=1$, Focal)** | Small (`s`) | 1.55M | **8,039 img/s** | 416 img/s |
+| **Grid Spatial ($K=1$, Focal)** | Medium (`m`) | 6.18M | **3,547 img/s** | 394 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **Grid Spatial ($K=1$, BCE)** | Nano (`n`) | 0.39M | **21,152 img/s** | 497 img/s |
+| **Grid Spatial ($K=1$, BCE)** | Small (`s`) | 1.55M | **8,094 img/s** | 436 img/s |
+| **Grid Spatial ($K=1$, BCE)** | Medium (`m`) | 6.18M | **3,648 img/s** | 394 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **Multi-Anchor ($K=3$)** | Nano (`n`) | 0.41M | **20,967 img/s** | 434 img/s |
+| **Multi-Anchor ($K=3$)** | Small (`s`) | 1.58M | **8,006 img/s** | 416 img/s |
+| **Multi-Anchor ($K=3$)** | Medium (`m`) | 6.23M | **3,575 img/s** | 398 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **FCOS Anchor-Free** | Nano (`n`) | 0.52M | **15,276 img/s** | 703 img/s |
+| **FCOS Anchor-Free** | Small (`s`) | 1.79M | **6,868 img/s** | 650 img/s |
+| **FCOS Anchor-Free** | Medium (`m`) | 7.14M | **2,988 img/s** | 603 img/s |
 
-| Model Preset | Paradigm | Total Params | End-to-End Latency / Image | End-to-End Throughput (Image FPS) | Speedup vs. Two-Stage |
-|:---|:---:|:---:|:---:|:---:|:---:|
-| **Nano (`n`)** | Two-Stage | 0.94M | ~1.51 ms | **662 img/s** | Baseline (1.0×) |
-| **Nano (`n`)** | Single-Stage Unified | 0.71M | ~1.58 ms | 634 img/s | 0.96× |
-| **Nano (`n`)** | **FCOS Anchor-Free** | **0.52M** | **~1.98 ms** | **505 img/s** | 0.76× (Full Multi-Scale FPN) |
-| ─── | ─── | ─── | ─── | ─── | ─── |
-| **Small (`s`)** | Two-Stage | 2.60M | ~1.63 ms | 612 img/s | Baseline (1.0×) |
-| **Small (`s`)** | Single-Stage Unified | 2.52M | ~1.64 ms | 608 img/s | 0.99× |
-| **Small (`s`)** | **FCOS Anchor-Free** | **1.79M** | **~1.52 ms** | **656 img/s** 🚀 | **1.07× Faster** |
-| ─── | ─── | ─── | ─── | ─── | ─── |
-| **Medium (`m`)** | Two-Stage | 9.21M | ~6.41 ms | 156 img/s | Baseline (1.0×) |
-| **Medium (`m`)** | Single-Stage Unified | 9.42M | ~1.70 ms | 589 img/s | 3.8× Faster |
-| **Medium (`m`)** | **FCOS Anchor-Free** | **7.14M** | **~1.77 ms** | **563 img/s** 🚀 | 🚀 **3.6× Faster** |
+_Eval-loop throughput is wall-clock over the whole evaluation loop (PNG decoding with `num_workers=0`, target encoding in the collate function, host↔device copies, post-processing and scipy Hungarian matching); it is dominated by that overhead and varies run to run, so it is not a model-speed comparison. Pure inference times only `model(images)` on GPU-resident batches of 128 (median of repeated, synchronized runs after a ≥2 s warm-up)._ Two-Stage and Single-Stage checkpoints were not re-timed with the pure-inference protocol.
+<!-- END GENERATED: throughput -->
 
 ---
 
 ## 📈 Density-Stratified Recall Sweep (Recall vs. GT Object Count $n_{gt}$)
 
-Evaluates detection recall across ground-truth object density buckets:
+<!-- BEGIN GENERATED: density (scripts/render_benchmark_reports.py) -->
+Recall per ground-truth density bucket on the **`random`** layout (Two-Stage/Single-Stage from `benchmark/density_sweep_results.json`, Grid/Multi-Anchor from `grid_density_sweep_results.json`, FCOS from `fcos_density_sweep_results.json`):
 
-| Density Bucket ($n_{gt}$) | Test Images | Single-Stage Small | Single-Stage Medium | Grid Spatial Small ($K=1$) | Multi-Anchor Nano ($K=3$) | FCOS Nano (0.52M) | FCOS Small (1.79M) | FCOS Medium (7.14M) |
+| Density Bucket ($n_{gt}$) | Test Images | Two-Stage Medium | Single-Stage Medium | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | FCOS Nano | FCOS Small | FCOS Medium |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1 – 4 objects** | 236 | 96.79% | 94.94% | 99.75% | 74.18% | **96.7%** | **98.6%** | **98.0%** |
-| **5 – 8 objects** | 1,244 | 94.43% | 96.89% | 99.78% | 74.25% | **96.2%** | **98.5%** | **97.3%** |
-| **9 – 12 objects** | 850 | 90.37% | 94.85% | 99.82% | 74.12% | **96.2%** | **98.8%** | **97.3%** |
-| **13 – 16 objects** | 170 | 84.41% | 88.73% | 99.85% | 74.21% | **96.1%** | **98.3%** | **97.5%** |
+| **1 – 4 objects** | 236 | 93.6% | 94.9% | 98.9% | **99.1%** | 96.7% | 98.6% | **99.1%** |
+| **5 – 8 objects** | 1,244 | 95.9% | 96.9% | **99.8%** | 99.5% | 96.2% | 98.5% | 98.4% |
+| **9 – 12 objects** | 850 | 95.8% | 94.8% | **99.9%** | 99.9% | 96.2% | 98.8% | 98.6% |
+| **13 – 16 objects** | 170 | 92.9% | 88.7% | 99.8% | **99.9%** | 96.1% | 98.3% | 98.5% |
+
+The `random` layout hides the single-scale grid failure. Recall on the structured layouts (Grid/Multi-Anchor: mean over density buckets; FCOS: overall layout recall):
+
+| Layout | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | FCOS Nano | FCOS Small | FCOS Medium |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| `grid` | 50.13% | 50.59% | 94.96% | 98.09% | 98.44% |
+| `words` | 43.52% | 43.73% | 97.50% | 99.37% | 99.47% |
+| `line` | 41.59% | 42.85% | 97.49% | 99.47% | 99.34% |
+<!-- END GENERATED: density -->
 
 > **Crucial Architectural Breakthrough**:
-> While Single-Stage Unified models suffer mild capacity-correlated degradation on dense scenes (dropping to ~84–88%), and single-scale Grid ($K=1, 3$) models collapsed to ~40–50% recall on crowded structured layouts (`grid`, `words`, `line`), **FCOS Anchor-Free ResNet achieves virtually flat 97–99% recall across all density buckets and all 4 layouts without any density or layout collapse!**
+> While Single-Stage Unified models suffer mild capacity-correlated degradation on dense scenes (dropping to ~84–88%), and single-scale Grid ($K=1, 3$) models collapsed to ~40–50% recall on crowded structured layouts (`grid`, `words`, `line`), **FCOS Anchor-Free ResNet keeps recall essentially flat across density buckets and across all 4 layouts, with no density or layout collapse** (exact values in the tables above).
 
 ---
 
@@ -89,7 +118,7 @@ Evaluates detection recall across ground-truth object density buckets:
 
 ### 4. Complete Elimination of Collisions via FCOS Multi-Scale FPN & Centerness
 **The Solution**: FCOS completely abandons preset anchor boxes. It distributes detections across a multi-scale FPN (P3 at $28 \times 28$, stride 8, and P4 at $14 \times 14$, stride 16).
-**The Outcome**: Closely-spaced characters are resolved on the fine $28 \times 28$ P3 level while larger structures map to P4. Combined with centerness gating $\sqrt{\sigma(\text{cls}) \times \sigma(\text{cent})}$, FCOS achieves **99.9% Detection Precision, 98.9% Detection Recall, and >0.90 End-to-End F1 across all layouts at 655 FPS**, permanently setting the state-of-the-art detector for this benchmark.
+**The Outcome**: Closely-spaced characters are resolved on the fine $28 \times 28$ P3 level while larger structures map to P4. Combined with centerness gating $\sqrt{\sigma(\text{cls}) \times \sigma(\text{cent})}$, FCOS achieves the highest 4-layout average detection precision, recall, and end-to-end F1 of every architecture in the master table, making it the state-of-the-art detector for this benchmark.
 
 ---
 
