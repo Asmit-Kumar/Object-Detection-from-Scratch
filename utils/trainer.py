@@ -1265,20 +1265,26 @@ def fit(
             "step_scheduler_per_batch": step_scheduler_per_batch,
         }
         if model_label: config["label"] = model_label
-        logger.start(config=config)
 
     total_start = time.time()
     best_val_metric = float('-inf')
     start_epoch = 0
+    resumed = False
 
     if resume and checkpoint is not None:
         try:
             start_epoch, loaded_anchors = checkpoint.resume_training(optimizer, scheduler, scaler)
             if loaded_anchors is not None:
                 anchors_wh = loaded_anchors
+            resumed = True
             print(f"Resuming training from epoch {start_epoch}")
         except FileNotFoundError as e:
             print(f"Could not resume training: {e}")
+
+    # Start the logger after the resume decision so a resumed run continues its
+    # existing log file (earlier epochs kept) instead of opening a new one.
+    if logger is not None:
+        logger.start(config=config, resume=resumed, start_epoch=start_epoch)
 
     last_metrics = None
     for epoch in range(start_epoch, epochs):
