@@ -47,6 +47,7 @@ class CanvasGenerator:
         mean_objs (int | None): Expected number of objects (Poisson parameter). Default: canvas_size // 28.
         split (str): EMNIST split to draw characters from ('bymerge' or 'byclass'). Default: 'bymerge'.
     """
+    def __init__(self, canvas_size=224, mean_objs=None, split='bymerge'):
         self.canvas_size = canvas_size
         self.dataset = EmnistDataset(split=split)
         self.min_count = 2

@@ -39,6 +39,7 @@ class DatasetGenerator:
         num_workers (int): Number of parallel worker threads per split. Default: 4.
         write_buffer_size (int): Batch size for metadata JSONL file buffer writes. Default: 128.
     """
+    def __init__(
         self,
         split: str = 'bymerge',
         dest_dir: Path = ROOT_DIR,
