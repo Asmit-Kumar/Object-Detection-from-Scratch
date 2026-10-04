@@ -15,8 +15,8 @@ sys.path.insert(0, str(root_dir / 'generator'))
 sys.path.insert(0, str(root_dir))
 
 import torch
-from utils.pipeline import DetectionPipeline
-from utils.dataset import get_detection_loaders, ROOT_DIR
+from inference.pipeline import DetectionPipeline
+from dataio.dataset import get_detection_loaders, ROOT_DIR
 
 
 def main():

@@ -603,7 +603,7 @@ class DetectionPipeline:
         Run multi-stream CUDA parallel evaluation across all 4 benchmark placement layouts
         ('random', 'grid', 'words', 'line') simultaneously!
         """
-        from utils.dataset import get_detection_loaders
+        from dataio.dataset import get_detection_loaders
 
         benchmark_path = Path(benchmark_dir)
         placements = ["random", "grid", "words", "line"]

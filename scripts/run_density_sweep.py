@@ -29,9 +29,9 @@ sys.path.append(str(root_dir / 'scripts'))
 import torch
 from models import load_detector, load_fcos_detector
 from models.object_detector_res import ObjectDetectorResNet
-from utils.dataset import get_detection_loaders
-from utils.pipeline import _decode_fcos_candidates
-from utils.trainer import evaluate_density_sweep
+from dataio.dataset import get_detection_loaders
+from inference.pipeline import _decode_fcos_candidates
+from training.trainer import evaluate_density_sweep
 from run_single_stage_benchmark import SingleStagePipeline
 
 BENCHMARK_ROOT = 'data/OD_benchmark'

@@ -16,7 +16,7 @@ import numpy as np
 import time
 from torchvision.ops import sigmoid_focal_loss
 
-from utils.fcos_targets import FCOSTargetGenerator, FCOSTargets
+from dataio.fcos_targets import FCOSTargetGenerator, FCOSTargets
 
 
 # ── IoU Helpers ───────────────────────────────────────────────────────────────

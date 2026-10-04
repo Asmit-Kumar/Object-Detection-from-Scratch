@@ -16,7 +16,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from utils.pipeline import DetectionPipeline, PLACEMENTS, BENCHMARK_PATH
+from inference.pipeline import DetectionPipeline, PLACEMENTS, BENCHMARK_PATH
 
 SIZES = ['n', 's', 'm']
 SIZE_LABELS = {'n': 'Nano', 's': 'Small', 'm': 'Medium'}

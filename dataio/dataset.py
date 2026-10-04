@@ -18,8 +18,8 @@ import torch
 import torchvision.transforms.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from utils.reader import Record, DataReader
-from utils.fcos_targets import FCOSTargetGenerator, FCOSTargets
+from dataio.reader import Record, DataReader
+from dataio.fcos_targets import FCOSTargetGenerator, FCOSTargets
 import time
 
 try:

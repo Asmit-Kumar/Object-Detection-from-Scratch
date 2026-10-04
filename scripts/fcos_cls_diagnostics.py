@@ -26,8 +26,8 @@ from scipy.optimize import linear_sum_assignment
 from scipy.stats import binomtest
 
 from run_single_stage_benchmark import BENCHMARK_PATH, PLACEMENTS, SIZES, FCOSPipeline
-from utils.dataset import get_detection_loaders
-from utils.pipeline import _decode_fcos_candidates
+from dataio.dataset import get_detection_loaders
+from inference.pipeline import _decode_fcos_candidates
 from generator.generator import PLACEMENT_PROBS
 
 RESULTS_PATH = Path('benchmark/fcos_results.json')

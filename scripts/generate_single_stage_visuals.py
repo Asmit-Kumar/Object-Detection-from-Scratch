@@ -31,7 +31,7 @@ import matplotlib.patches as patches
 from models import load_fcos_detector
 from models.object_detector_res import ObjectDetectorResNet
 from generator.dataset import EMNIST_CLASS_NAMES
-from utils.pipeline import _decode_fcos_candidates
+from inference.pipeline import _decode_fcos_candidates
 from run_single_stage_benchmark import SingleStagePipeline
 
 BENCHMARK_PATH = 'data/OD_benchmark'

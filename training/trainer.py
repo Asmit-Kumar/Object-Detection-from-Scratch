@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from .losses import pairwise_iou, mean_iou, DetectionLoss, FCOSLoss  # noqa: F401
-from .fcos_targets import FCOSTargets
+from dataio.fcos_targets import FCOSTargets
 try:
     import wandb
 except ImportError:
@@ -471,7 +471,7 @@ def evaluate_fcos_detection(
     model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
     """Evaluate FCOS outputs with centerness-gated class-wise NMS."""
-    from .pipeline import _decode_fcos_candidates
+    from inference.pipeline import _decode_fcos_candidates
 
     model.eval()
     total_loss = 0.0
