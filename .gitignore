@@ -54,3 +54,8 @@ insights/
 .agents/
 AGENT.md
 .gemini/
+
+# Kaggle usage notes and test jobs (kept local for now)
+KAGGLE.md
+KAGGLE_EXECUTION_GUIDE.md
+kaggle_jobs/
