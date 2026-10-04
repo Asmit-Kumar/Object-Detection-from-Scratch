@@ -17,42 +17,13 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from utils.dataset import K, S, YOLO_ANCHORS_PER_SCALE, YOLO_GRID_SIZES
+from .common import ResNetDetectorBase, ScaleExp, SimpleResBlock  # noqa: F401  (re-exported for old imports)
+from .configs import (
+    FCOS_PRESETS, GRID_PRESETS, K, S, YOLO_ANCHORS_PER_SCALE, YOLO_GRID_SIZES, resolve_backbone_args,
+)
 
 
-class SimpleResBlock(nn.Module):
-    """
-    Standard ResNet residual block with 3x3 convolutions, BatchNorm, and shortcut projection.
-
-    Args:
-        in_channels (int): Input feature channels.
-        out_channels (int): Output feature channels.
-        stride (int): Downsampling stride for the first convolution. Default: 1.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_channels)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass applying residual connection and ReLU activation."""
-        out  = F.relu(self.bn1(self.conv1(x)))
-        out  = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        return F.relu(out)
-
-
-class ObjectDetectorResNet(nn.Module):
+class ObjectDetectorResNet(ResNetDetectorBase):
     """
     Single-Stage Unified ResNet Detector for multi-object localization, objectness scoring,
     and character classification in a single forward pass.
@@ -61,51 +32,24 @@ class ObjectDetectorResNet(nn.Module):
     objectness logit [obj], and class logits [cls_0 ... cls_N] for each spatial cell and anchor slot.
     """
 
-    CONFIGS = {
-        "n": (32, [32,  64,  64,  128], [1, 1, 1, 1], S),   # Nano   ~0.39M params
-        "s": (64, [64,  128, 128, 256], [1, 1, 1, 1], S),   # Small  ~1.55M params (default)
-        "m": (64, [128, 256, 256, 512], [1, 1, 1, 1], S),   # Medium ~6.18M params
-        "l": (64, [128, 256, 384, 512], [2, 2, 2, 2], S),   # Large  ~16.75M params
-    }
+    # Legacy (stem, channels, blocks, grid_size) tuples; the presets live in models/configs.py.
+    CONFIGS = {size: (p.stem, list(p.channels), list(p.blocks), S) for size, p in GRID_PRESETS.items()}
 
     def __init__(
             self, channels: list[int] | None = None,
             num_classes: int = 47, blocks: list[int] | None = None,
             num_anchors: int = K,
     ):
-        super().__init__()
-        if channels is None:
-            stem_out, channels, default_blocks, _ = self.CONFIGS["s"]
-            if blocks is None:
-                blocks = default_blocks
-        else:
-            stem_out = channels[0]
-            if blocks is None:
-                blocks = [1, 1, 1, 1]
-
-        assert len(channels) == 4, "channels must have exactly 4 entries (one per res-layer)"
-        assert len(blocks) == 4, "blocks must have exactly 4 entries (one per res-layer)"
-        assert all(n >= 1 for n in blocks), "each res-layer must contain at least one block"
+        channels, blocks = resolve_backbone_args(GRID_PRESETS, channels, blocks)
+        super().__init__(channels, blocks, strides=(2, 2, 1, 1), stem_padding=0)
 
         self.num_classes = num_classes
         self.num_anchors = num_anchors
 
-        # Stem
-        self.conv1 = nn.Conv2d(1, stem_out, kernel_size=3, stride=2, bias=False)
-        self.bn1   = nn.BatchNorm2d(stem_out)
-
-        # Residual layers
-        c = channels
-        self.in_channels = stem_out
-        self.layer1 = self._make_layer(SimpleResBlock, c[0], blocks[0], stride=2)
-        self.layer2 = self._make_layer(SimpleResBlock, c[1], blocks[1], stride=2)
-        self.layer3 = self._make_layer(SimpleResBlock, c[2], blocks[2], stride=1)
-        self.layer4 = self._make_layer(SimpleResBlock, c[3], blocks[3], stride=1)
-
-        self.grid_head = nn.Conv2d(c[3], num_anchors * (num_classes + 5), kernel_size=1)
+        self.grid_head = nn.Conv2d(channels[3], num_anchors * (num_classes + 5), kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.bn1(self.conv1(x)))
+        x = self._forward_stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -116,15 +60,8 @@ class ObjectDetectorResNet(nn.Module):
         x = x.reshape(B, H, W, self.num_anchors, 5 + self.num_classes)
         return x
 
-    def _make_layer(self, block, planes, blocks, stride=1):
-        layers = [block(self.in_channels, planes, stride=stride)]
-        self.in_channels = planes
-        for _ in range(1, blocks):
-            layers.append(block(self.in_channels, planes, stride=1))
-        return layers[0] if blocks == 1 else nn.Sequential(*layers)
 
-
-class MultiScaleObjectDetectorResNet(nn.Module):
+class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
     """YOLO-style detector with two spatial prediction heads."""
 
     CONFIGS = ObjectDetectorResNet.CONFIGS
@@ -137,38 +74,19 @@ class MultiScaleObjectDetectorResNet(nn.Module):
             anchors_per_scale: int = YOLO_ANCHORS_PER_SCALE,
             grid_sizes: tuple[int, int] = YOLO_GRID_SIZES,
     ):
-        super().__init__()
-        if channels is None:
-            stem_out, channels, default_blocks, _ = self.CONFIGS["s"]
-            if blocks is None:
-                blocks = default_blocks
-        else:
-            stem_out = channels[0]
-            if blocks is None:
-                blocks = [1, 1, 1, 1]
-
-        if len(channels) != 4 or len(blocks) != 4:
-            raise ValueError("channels and blocks must each contain four entries")
+        channels, blocks = resolve_backbone_args(GRID_PRESETS, channels, blocks)
         if tuple(grid_sizes) != YOLO_GRID_SIZES:
             raise ValueError(
                 f"grid_sizes must be {YOLO_GRID_SIZES} for the current 224px backbone"
             )
         if anchors_per_scale < 1:
             raise ValueError("anchors_per_scale must be positive")
+        super().__init__(channels, blocks, strides=(2, 2, 2, 1), stem_padding=0)
 
         self.num_classes = num_classes
         self.anchors_per_scale = anchors_per_scale
         self.grid_sizes = tuple(grid_sizes)
         self.num_anchors = len(self.grid_sizes) * anchors_per_scale
-
-        self.conv1 = nn.Conv2d(1, stem_out, kernel_size=3, stride=2, bias=False)
-        self.bn1 = nn.BatchNorm2d(stem_out)
-
-        self.in_channels = stem_out
-        self.layer1 = self._make_layer(SimpleResBlock, channels[0], blocks[0], stride=2)
-        self.layer2 = self._make_layer(SimpleResBlock, channels[1], blocks[1], stride=2)
-        self.layer3 = self._make_layer(SimpleResBlock, channels[2], blocks[2], stride=2)
-        self.layer4 = self._make_layer(SimpleResBlock, channels[3], blocks[3], stride=1)
 
         route_channels = channels[2]
         self.lateral_medium = nn.Conv2d(channels[3], route_channels, kernel_size=1, bias=False)
@@ -187,7 +105,7 @@ class MultiScaleObjectDetectorResNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> dict[int, torch.Tensor]:
-        x = F.relu(self.bn1(self.conv1(x)))
+        x = self._forward_stem(x)
         x = self.layer1(x)
         fine_features = self.layer2(x)      # 28 x 28
         medium_features = self.layer4(self.layer3(fine_features))  # 14 x 14
@@ -222,26 +140,8 @@ class MultiScaleObjectDetectorResNet(nn.Module):
             5 + self.num_classes,
         )
 
-    def _make_layer(self, block, planes, blocks, stride=1):
-        layers = [block(self.in_channels, planes, stride=stride)]
-        self.in_channels = planes
-        for _ in range(1, blocks):
-            layers.append(block(self.in_channels, planes, stride=1))
-        return layers[0] if blocks == 1 else nn.Sequential(*layers)
 
-
-class ScaleExp(nn.Module):
-    """Learnable scale multiplier with exp activation to enforce positive distances."""
-
-    def __init__(self, init_value: float = 1.0):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(float(init_value), dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.exp(x * self.scale)
-
-
-class FCOSObjectDetectorResNet(nn.Module):
+class FCOSObjectDetectorResNet(ResNetDetectorBase):
     """
     Anchor-Free Fully Convolutional ResNet Detector (FCOS) with Feature Pyramid Network (FPN),
     decoupled classification/regression towers, centerness branch, and learnable scale factors.
@@ -252,12 +152,8 @@ class FCOSObjectDetectorResNet(nn.Module):
         - 'centerness_logits': (B, H, W)
     """
 
-    CONFIGS = {
-        "n": (32, [32,  64,  64,  128], [1, 1, 1, 1], 48),    # Nano   ~0.42M params
-        "s": (64, [64,  128, 128, 256], [1, 1, 1, 1], 64),    # Small  ~1.65M params (default)
-        "m": (64, [128, 256, 256, 512], [1, 1, 1, 1], 128),   # Medium ~6.5M params
-        "l": (64, [128, 256, 384, 512], [2, 2, 2, 2], 128),   # Large  ~17.5M params
-    }
+    # Legacy (stem, channels, blocks, fpn_channels) tuples; the presets live in models/configs.py.
+    CONFIGS = {size: (p.stem, list(p.channels), list(p.blocks), p.fpn_channels) for size, p in FCOS_PRESETS.items()}
 
     GRID_SIZES = (28, 14)
     STRIDES = {28: 8.0, 14: 16.0}
@@ -270,34 +166,17 @@ class FCOSObjectDetectorResNet(nn.Module):
             fpn_channels: int | None = None,
             head_convs: int = 2,
     ):
-        super().__init__()
+        if fpn_channels is None:
+            fpn_channels = FCOS_PRESETS["s"].fpn_channels if channels is None else channels[2]
+        channels, blocks = resolve_backbone_args(FCOS_PRESETS, channels, blocks)
 
-        if channels is None:
-            stem_out, channels, default_blocks, default_fpn = self.CONFIGS["s"]
-            if blocks is None:
-                blocks = default_blocks
-            if fpn_channels is None:
-                fpn_channels = default_fpn
-        else:
-            stem_out = channels[0]
-            if blocks is None:
-                blocks = [1, 1, 1, 1]
-            if fpn_channels is None:
-                fpn_channels = channels[2]
+        # ── ResNet Backbone ───────────────────────────────────────────────────
+        # layer1 56x56, layer2 28x28 (C3), layer3 14x14 (C4), layer4 14x14 (deep C4)
+        super().__init__(channels, blocks, strides=(2, 2, 2, 1), stem_padding=1)
 
         self.num_classes = num_classes
         self.fpn_channels = fpn_channels
         self.grid_sizes = self.GRID_SIZES
-
-        # ── ResNet Backbone ───────────────────────────────────────────────────
-        self.conv1 = nn.Conv2d(1, stem_out, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(stem_out)
-
-        self.in_channels = stem_out
-        self.layer1 = self._make_layer(SimpleResBlock, channels[0], blocks[0], stride=2)  # 56x56
-        self.layer2 = self._make_layer(SimpleResBlock, channels[1], blocks[1], stride=2)  # 28x28 (C3)
-        self.layer3 = self._make_layer(SimpleResBlock, channels[2], blocks[2], stride=2)  # 14x14 (C4)
-        self.layer4 = self._make_layer(SimpleResBlock, channels[3], blocks[3], stride=1)  # 14x14 (deep C4)
 
         # ── FPN Lateral & Smoothing Layers ───────────────────────────────────
         self.lateral4 = nn.Conv2d(channels[3], fpn_channels, kernel_size=1, bias=False)
@@ -367,13 +246,6 @@ class FCOSObjectDetectorResNet(nn.Module):
         nn.init.normal_(self.cls_head.weight, std=0.01)
         nn.init.constant_(self.cls_head.bias, cls_bias_init)
 
-    def _make_layer(self, block, planes, blocks, stride=1):
-        layers = [block(self.in_channels, planes, stride=stride)]
-        self.in_channels = planes
-        for _ in range(1, blocks):
-            layers.append(block(self.in_channels, planes, stride=1))
-        return layers[0] if blocks == 1 else nn.Sequential(*layers)
-
     def forward(self, x: torch.Tensor) -> dict[int, dict[str, torch.Tensor]]:
         """
         Forward pass.
@@ -388,7 +260,7 @@ class FCOSObjectDetectorResNet(nn.Module):
                 - 'centerness_logits': (B, H, W)
         """
         # Backbone forward
-        x = F.relu(self.bn1(self.conv1(x)))
+        x = self._forward_stem(x)
         x = self.layer1(x)
         c3 = self.layer2(x)                     # (B, C1, 28, 28)
         c4 = self.layer4(self.layer3(c3))       # (B, C3, 14, 14)
