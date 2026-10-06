@@ -5,7 +5,7 @@ This is the single place the models package reads dataset-level constants from.
 """
 from dataclasses import dataclass
 
-from utils.dataset import K, S, YOLO_ANCHORS_PER_SCALE, YOLO_GRID_SIZES
+from dataio.dataset import K, S, YOLO_ANCHORS_PER_SCALE, YOLO_GRID_SIZES
 
 DEFAULT_SIZE = "s"
 

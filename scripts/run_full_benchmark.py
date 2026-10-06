@@ -9,7 +9,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir / 'generator'))
 sys.path.insert(0, str(root_dir))
 
-from utils.pipeline import DetectionPipeline
+from inference.pipeline import DetectionPipeline
 
 SIZES = ['n', 's', 'm']
 SIZE_LABELS = {'n': 'Nano (0.57M)', 's': 'Small (2.23M)', 'm': 'Medium (8.84M)'}

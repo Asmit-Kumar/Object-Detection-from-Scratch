@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir))
 
-from utils.reader import DataReader
+from dataio.reader import DataReader
 
 BENCHMARK_ROOT = Path("data/OD_benchmark")
 PLACEMENTS = ["random", "grid", "words", "line"]
