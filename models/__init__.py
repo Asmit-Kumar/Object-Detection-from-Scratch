@@ -21,9 +21,15 @@ Layout
 ------
 configs.py                     size presets (n / s / m / l) and dataset-level defaults
 common.py                      SimpleResBlock, ScaleExp, ResNetDetectorBase (stem + four res-layers)
-object_detector_res.py         the three detectors, built on ResNetDetectorBase
+grid_detector.py               ObjectDetectorResNet           ("grid")
+multiscale_detector.py         MultiScaleObjectDetectorResNet ("multiscale")
+fcos_detector.py               FCOSObjectDetectorResNet       ("fcos")
 character_classifier_resnet.py the character classifier (own BasicBlock, kept separate on purpose:
                                its layers differ from SimpleResBlock and its checkpoints depend on them)
+object_detector_res.py         re-exports the three detectors for older imports
+
+Adding a model: put it in its own file (reuse common.py), add presets to configs.py if it has
+sizes, register it in _REGISTRY below, and pin its state_dict signature in tests/test_models.py.
 """
 import warnings
 
@@ -31,11 +37,9 @@ import torch
 from torch import nn
 
 from .configs import FCOS_PRESETS, GRID_PRESETS, get_preset
-from .object_detector_res import (
-    FCOSObjectDetectorResNet,
-    MultiScaleObjectDetectorResNet,
-    ObjectDetectorResNet,
-)
+from .grid_detector import ObjectDetectorResNet
+from .multiscale_detector import MultiScaleObjectDetectorResNet
+from .fcos_detector import FCOSObjectDetectorResNet
 from .character_classifier_resnet import CharacterClassifierResNet
 
 __all__ = [
