@@ -1,5 +1,8 @@
 """
-Two-scale grid detector: 28x28 and 14x14 prediction heads joined by a small FPN.
+Two-scale grid detector: 28x28 and 14x14 prediction heads joined by a small FPN, each cell
+predicting `anchors_per_scale` slots of [x, y, w, h, objectness, class logits].
+
+    python -m models.multiscale_detector     # per-size parameters and output shapes
 """
 import torch
 from torch import nn
@@ -10,9 +13,23 @@ from .grid_detector import ObjectDetectorResNet
 
 
 class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
-    """YOLO-style detector with two spatial prediction heads."""
+    """
+    YOLO-style detector with two spatial prediction heads.
 
-    CONFIGS = ObjectDetectorResNet.CONFIGS
+    Outputs {28: (B, 28, 28, A, 5 + num_classes), 14: (B, 14, 14, A, 5 + num_classes)},
+    where A = anchors_per_scale.
+
+    Args:
+        channels (list[int] | None): Output channels of the four res-layers; None uses the 's' preset.
+        num_classes (int): Class logits per slot. Default: 47 (EMNIST ByMerge).
+        blocks (list[int] | None): Residual blocks per res-layer. Default: one each.
+        anchors_per_scale (int): Anchor slots per cell at each scale.
+        grid_sizes (tuple[int, int]): Must be (28, 14) for the 224px backbone.
+    """
+
+    INPUT_SHAPE = (1, 224, 224)  # grayscale canvas
+
+    CONFIGS = ObjectDetectorResNet.CONFIGS  # same presets as the single-scale grid detector
 
     def __init__(
             self,
@@ -29,6 +46,7 @@ class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
             )
         if anchors_per_scale < 1:
             raise ValueError("anchors_per_scale must be positive")
+        # layer3 downsamples to 14x14; layer2 (28x28) is tapped for the fine scale.
         super().__init__(channels, blocks, strides=(2, 2, 2, 1), stem_padding=0)
 
         self.num_classes = num_classes
@@ -36,6 +54,7 @@ class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
         self.grid_sizes = tuple(grid_sizes)
         self.num_anchors = len(self.grid_sizes) * anchors_per_scale
 
+        # FPN: project the 14x14 features, upsample them and fuse with the 28x28 features.
         route_channels = channels[2]
         self.lateral_medium = nn.Conv2d(channels[3], route_channels, kernel_size=1, bias=False)
         self.smooth_fine = self._smooth_block(channels[1] + route_channels, route_channels)
@@ -78,6 +97,7 @@ class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
         }
 
     def _reshape_head(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, A * (5 + classes), H, W) -> (B, H, W, A, 5 + classes)."""
         batch_size, _, height, width = x.shape
         x = x.permute(0, 2, 3, 1)
         return x.reshape(
@@ -87,3 +107,9 @@ class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
             self.anchors_per_scale,
             5 + self.num_classes,
         )
+
+
+if __name__ == "__main__":
+    from models.summary import print_summary
+
+    print_summary("multiscale")

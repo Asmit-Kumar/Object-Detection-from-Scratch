@@ -1,6 +1,8 @@
 """
 FCOS anchor-free detector (Stage 8): FPN over 28x28 / 14x14, decoupled towers, centerness branch
 and per-pixel ltrb distances.
+
+    python -m models.fcos_detector     # per-size parameters and output shapes
 """
 import math
 import torch
@@ -19,7 +21,17 @@ class FCOSObjectDetectorResNet(ResNetDetectorBase):
         - 'cls_logits':        (B, H, W, num_classes)
         - 'reg_ltrb':          (B, H, W, 4) in canvas pixel distances [l, t, r, b]
         - 'centerness_logits': (B, H, W)
+
+    Args:
+        channels (list[int] | None): Output channels of the four res-layers; None uses the 's' preset.
+        num_classes (int): Class logits per location. Default: 47 (EMNIST ByMerge).
+        blocks (list[int] | None): Residual blocks per res-layer. Default: one each.
+        fpn_channels (int | None): FPN / tower width. Default: the 's' preset's 64 when channels is
+            None, otherwise channels[2].
+        head_convs (int): 3x3 conv + GroupNorm + ReLU layers in each tower. Default: 2.
     """
+
+    INPUT_SHAPE = (1, 224, 224)  # grayscale canvas
 
     # Legacy (stem, channels, blocks, fpn_channels) tuples; the presets live in models/configs.py.
     CONFIGS = {size: (p.stem, list(p.channels), list(p.blocks), p.fpn_channels) for size, p in FCOS_PRESETS.items()}
@@ -225,3 +237,9 @@ class FCOSObjectDetectorResNet(ResNetDetectorBase):
             decoded[grid_size] = slot_tensor
 
         return decoded
+
+
+if __name__ == "__main__":
+    from models.summary import print_summary
+
+    print_summary("fcos")
