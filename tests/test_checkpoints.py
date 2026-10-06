@@ -1,7 +1,7 @@
 """
 Strict-load the trained checkpoints that match the current architectures.
 
-Weights are not in git, so each case is skipped when its file is missing (e.g. in CI).
+Weights are not in git, so each case is skipped when its file is missing (e.g. on a fresh clone).
 """
 import unittest
 from pathlib import Path
