@@ -4,7 +4,9 @@ Character Classifier Network Architecture.
 Provides a compact ResNet-style CNN model (CharacterClassifierResNet) for 28x28 grayscale
 EMNIST character recognition across 47 classes (ByMerge split) or 62 classes (ByClass split).
 
-Total Parameters: 370,351 (~0.37M)
+Total Parameters: 370,351 (~0.37M) for 47 classes, 374,206 for 62.
+
+    python -m models.character_classifier_resnet     # parameters and output shape
 """
 import torch
 from torch import nn
@@ -54,6 +56,8 @@ class CharacterClassifierResNet(nn.Module):
         num_classes (int): Number of target output classes (47 for EMNIST ByMerge, 62 for ByClass). Default: 62.
     """
 
+    INPUT_SHAPE = (1, 28, 28)  # one grayscale EMNIST character crop
+
     def __init__(self, num_classes: int = 62):
         super(CharacterClassifierResNet, self).__init__()
         self.stem = nn.Sequential(
@@ -84,15 +88,16 @@ class CharacterClassifierResNet(nn.Module):
         Returns:
             torch.Tensor: Unnormalized class logits of shape (B, num_classes).
         """
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.fc(x)
+        x = self.stem(x)     # (B, 32, 28, 28)
+        x = self.block1(x)   # (B, 64, 14, 14)
+        x = self.block2(x)   # (B, 64, 7, 7)
+        x = self.block3(x)   # (B, 64, 7, 7)
+        x = self.fc(x)       # (B, num_classes)
         return x
 
 
 if __name__ == "__main__":
-    model = CharacterClassifierResNet(num_classes=47)
-    print(model)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    from models.summary import print_summary
+
+    print_summary("classifier", num_classes=47)   # EMNIST ByMerge, as used by the pipeline
+    print_summary("classifier", num_classes=62)   # EMNIST ByClass
