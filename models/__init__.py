@@ -27,9 +27,15 @@ fcos_detector.py               FCOSObjectDetectorResNet       ("fcos")
 character_classifier_resnet.py the character classifier (own BasicBlock, kept separate on purpose:
                                its layers differ from SimpleResBlock and its checkpoints depend on them)
 object_detector_res.py         re-exports the three detectors for older imports
+archive/                       earlier architectures restored from git history ("archive.*" names),
+                               still able to load their checkpoints; see models/archive/__init__.py
+summary.py                     print_summary(name): per-size parameters and output shapes
+
+Every model file prints its summary when run: python -m models.fcos_detector
 
 Adding a model: put it in its own file (reuse common.py), add presets to configs.py if it has
 sizes, register it in _REGISTRY below, and pin its state_dict signature in tests/test_models.py.
+Retiring a model: move its file to archive/ and rename its registry entry to "archive.<name>".
 """
 import warnings
 
@@ -41,12 +47,29 @@ from .grid_detector import ObjectDetectorResNet
 from .multiscale_detector import MultiScaleObjectDetectorResNet
 from .fcos_detector import FCOSObjectDetectorResNet
 from .character_classifier_resnet import CharacterClassifierResNet
+from .archive import (
+    DigitClassifierCNN,
+    Grid14Detector,
+    SingleBoxCNN,
+    SingleBoxResNet,
+    Stage4BoxDetector,
+    Stage4SlotDetectorFC,
+    Stage5UnifiedDetector,
+)
+from .archive import grid14_detector, stage4_box_detector, stage4_slot_fc_detector, stage5_unified_detector
 
 __all__ = [
     "ObjectDetectorResNet",
     "MultiScaleObjectDetectorResNet",
     "FCOSObjectDetectorResNet",
     "CharacterClassifierResNet",
+    "SingleBoxCNN",
+    "SingleBoxResNet",
+    "DigitClassifierCNN",
+    "Stage4SlotDetectorFC",
+    "Stage4BoxDetector",
+    "Stage5UnifiedDetector",
+    "Grid14Detector",
     "MODEL_NAMES",
     "build_model",
     "load_model",
@@ -60,12 +83,20 @@ __all__ = [
     "load_classifier",
 ]
 
-# name -> (class, size presets). The classifier has a single size, so it has no presets.
+# name -> (class, size presets). Single-size models (the classifiers) have no presets.
 _REGISTRY = {
     "grid": (ObjectDetectorResNet, GRID_PRESETS),
     "multiscale": (MultiScaleObjectDetectorResNet, GRID_PRESETS),
     "fcos": (FCOSObjectDetectorResNet, FCOS_PRESETS),
     "classifier": (CharacterClassifierResNet, None),
+    # Earlier architectures (models/archive/), kept so their checkpoints still load.
+    "archive.single_box_cnn": (SingleBoxCNN, None),
+    "archive.single_box_resnet": (SingleBoxResNet, None),
+    "archive.digit_cnn": (DigitClassifierCNN, None),
+    "archive.stage4_fc": (Stage4SlotDetectorFC, stage4_slot_fc_detector.PRESETS),
+    "archive.stage4": (Stage4BoxDetector, stage4_box_detector.PRESETS),
+    "archive.stage5": (Stage5UnifiedDetector, stage5_unified_detector.PRESETS),
+    "archive.grid14": (Grid14Detector, grid14_detector.PRESETS),
 }
 MODEL_NAMES = tuple(_REGISTRY)
 
@@ -78,8 +109,9 @@ def build_model(name: str, size: str = "s", **overrides) -> nn.Module:
     """Return an untrained model for the given architecture and size preset.
 
     Args:
-        name:        One of MODEL_NAMES: "grid", "multiscale", "fcos", "classifier".
-        size:        Size preset "n" | "s" | "m" | "l" (ignored for "classifier").
+        name:        One of MODEL_NAMES: "grid", "multiscale", "fcos", "classifier", or an
+                     archived architecture such as "archive.stage4" (see models/archive/).
+        size:        Size preset "n" | "s" | "m" | "l" (ignored for single-size models).
         **overrides: Constructor arguments; they take precedence over the preset
                      (e.g. channels=[...], blocks=[...], fpn_channels=..., num_classes=...).
     """
