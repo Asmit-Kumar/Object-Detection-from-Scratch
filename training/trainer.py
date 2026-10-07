@@ -18,7 +18,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from .losses import pairwise_iou, mean_iou, DetectionLoss, FCOSLoss  # noqa: F401
+from training.losses import pairwise_iou, mean_iou, DetectionLoss, FCOSLoss  # noqa: F401
 from dataio.fcos_targets import FCOSTargets
 try:
     import wandb
@@ -1250,7 +1250,7 @@ def fit(
     # ── Set up RunLogger ──────────────────────────────────────────────────────
     logger = None
     if log:
-        from .logger import RunLogger
+        from training.logger import RunLogger
         model_name = type(model).__name__
         resolved_log_dir = log_dir if log_dir is not None else f"logs/{model_name}"
         logger = RunLogger(log_dir=resolved_log_dir, verbose=verbose)

@@ -42,12 +42,12 @@ import warnings
 import torch
 from torch import nn
 
-from .configs import FCOS_PRESETS, GRID_PRESETS, get_preset
-from .grid_detector import ObjectDetectorResNet
-from .multiscale_detector import MultiScaleObjectDetectorResNet
-from .fcos_detector import FCOSObjectDetectorResNet
-from .character_classifier_resnet import CharacterClassifierResNet
-from .archive import (
+from models.configs import FCOS_PRESETS, GRID_PRESETS, get_preset
+from models.grid_detector import ObjectDetectorResNet
+from models.multiscale_detector import MultiScaleObjectDetectorResNet
+from models.fcos_detector import FCOSObjectDetectorResNet
+from models.character_classifier_resnet import CharacterClassifierResNet
+from models.archive import (
     DigitClassifierCNN,
     Grid14Detector,
     SingleBoxCNN,
@@ -56,7 +56,7 @@ from .archive import (
     Stage4SlotDetectorFC,
     Stage5UnifiedDetector,
 )
-from .archive import grid14_detector, stage4_box_detector, stage4_slot_fc_detector, stage5_unified_detector
+from models.archive import grid14_detector, stage4_box_detector, stage4_slot_fc_detector, stage5_unified_detector
 
 __all__ = [
     "ObjectDetectorResNet",
@@ -108,7 +108,7 @@ MODEL_NAMES = tuple(_REGISTRY)
 def build_model(name: str, size: str = "s", **overrides) -> nn.Module:
     """Return an untrained model for the given architecture and size preset.
 
-    Args:
+Args:
         name:        One of MODEL_NAMES: "grid", "multiscale", "fcos", "classifier", or an
                      archived architecture such as "archive.stage4" (see models/archive/).
         size:        Size preset "n" | "s" | "m" | "l" (ignored for single-size models).

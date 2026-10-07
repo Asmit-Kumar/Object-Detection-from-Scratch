@@ -8,8 +8,8 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .common import ResNetDetectorBase, ScaleExp
-from .configs import FCOS_PRESETS, resolve_backbone_args
+from models.common import ResNetDetectorBase, ScaleExp
+from models.configs import FCOS_PRESETS, resolve_backbone_args
 
 
 class FCOSObjectDetectorResNet(ResNetDetectorBase):

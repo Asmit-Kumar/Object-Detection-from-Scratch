@@ -13,8 +13,8 @@ checkpoint/s_detector_{s,m,l}_latest.pth, checkpoint/s_detector_s_new_best.pth.
 """
 import torch
 from torch import nn
-from ..common import ResNetDetectorBase
-from ..configs import GRID_PRESETS, resolve_backbone_args
+from models.common import ResNetDetectorBase
+from models.configs import GRID_PRESETS, resolve_backbone_args
 
 PRESETS = GRID_PRESETS  # n / s / m / l, the same widths and depths as the grid detectors
 

@@ -6,8 +6,8 @@ predicts K anchor slots of [x, y, w, h, objectness, class logits].
 """
 import torch
 from torch import nn
-from .common import ResNetDetectorBase
-from .configs import GRID_PRESETS, K, S, resolve_backbone_args
+from models.common import ResNetDetectorBase
+from models.configs import GRID_PRESETS, K, S, resolve_backbone_args
 
 
 class ObjectDetectorResNet(ResNetDetectorBase):

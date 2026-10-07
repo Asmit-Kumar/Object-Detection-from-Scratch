@@ -13,8 +13,8 @@ checkpoint/detector_s_{1,11,123,1sfg}_best.pth, checkpoint/detector_resnet_s{,_1
 """
 import torch
 from torch import nn
-from ..common import ResNetDetectorBase
-from ..configs import GRID_PRESETS, resolve_backbone_args
+from models.common import ResNetDetectorBase
+from models.configs import GRID_PRESETS, resolve_backbone_args
 
 PRESETS = {size: GRID_PRESETS[size] for size in ("n", "s")}
 

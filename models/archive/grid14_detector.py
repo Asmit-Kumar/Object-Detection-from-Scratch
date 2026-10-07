@@ -14,8 +14,8 @@ Checkpoints (14x14 grid, K anchors, anchors_wh stored alongside):
 """
 import torch
 from torch import nn
-from ..common import ResNetDetectorBase
-from ..configs import GRID_PRESETS, K, resolve_backbone_args
+from models.common import ResNetDetectorBase
+from models.configs import GRID_PRESETS, K, resolve_backbone_args
 
 PRESETS = GRID_PRESETS
 GRID_SIZE = 14
