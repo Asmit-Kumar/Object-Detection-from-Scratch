@@ -4,13 +4,18 @@ Training and Evaluation Utilities.
 Provides reusable functions for training loops, validation, testing, and
 metrics computation (both classification and regression) with AMP support.
 
-BF16 + GradScaler note:
-    bfloat16 has a wider dynamic range than float16, so it does NOT require
-    loss scaling in practice. However, GradScaler is accepted here for API
-    uniformity — when device_type='cuda' and dtype=bfloat16, PyTorch
-    automatically makes the scaler a no-op (scale stays at 1.0, no overflow
-    checks). Pass  scaler=torch.amp.GradScaler('cuda')  if you want the
-    unified API, or simply pass  scaler=None  for bf16 runs.
+AMP dtype and GradScaler:
+    The autocast dtype is chosen per GPU by _amp_dtype(): bfloat16 on GPUs that run
+    it natively (compute capability 8.0+, Ampere and newer), float16 on older ones
+    (e.g. the Kaggle T4, 7.5, or P100, 6.0), where bf16 is only emulated and runs
+    slower than fp32. torch.cuda.is_bf16_supported() is not used for this because
+    it reports True on a T4.
+
+    bfloat16 has a wider dynamic range than float16, so it does NOT require loss
+    scaling; pass scaler=None (or a GradScaler, which then acts as a no-op).
+    float16 does need it: when the dtype is float16 and the caller passes
+    scaler=None, the training loops create a torch.amp.GradScaler('cuda')
+    themselves (see _resolve_grad_scaler()).
 """
 
 import time
@@ -25,8 +30,24 @@ try:
 except ImportError:
     wandb = None
 
-# Default AMP dtype used across all training helpers.
-_AMP_DTYPE = torch.bfloat16
+
+def _amp_dtype(device: torch.device) -> torch.dtype:
+    """Autocast dtype for ``device``: bfloat16 where the GPU runs it natively, else float16.
+
+    Native bf16 needs compute capability 8.0+ (Ampere and newer). CPU devices keep
+    bfloat16; the training helpers only enable autocast on CUDA.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return torch.bfloat16
+    major, _ = torch.cuda.get_device_capability(device)
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
+def _resolve_grad_scaler(scaler, device: torch.device):
+    """Return ``scaler``, or a new GradScaler when fp16 autocast would otherwise run unscaled."""
+    if scaler is None and device.type == "cuda" and _amp_dtype(device) == torch.float16:
+        return torch.amp.GradScaler("cuda")
+    return scaler
 
 
 def _move_detection_batch_to_device(value, device):
@@ -88,7 +109,8 @@ def train_one_epoch(
     """
     Run one full training epoch.
 
-    Uses bfloat16 autocast when a CUDA device is detected.
+    Uses autocast on CUDA devices, in the dtype _amp_dtype() picks for the GPU. With
+    float16 and scaler=None, a GradScaler is created for this epoch.
 
     Args:
         clip_grad_norm: If > 0, clip gradient norms to this value before the
@@ -114,6 +136,7 @@ def train_one_epoch(
     n_batches = 0
 
     use_amp = device.type == "cuda"
+    scaler = _resolve_grad_scaler(scaler, device)
 
     for inputs, labels in loader:
         # non_blocking=True: async CPU→GPU copy while GPU runs previous batch
@@ -130,7 +153,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
-            with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+            with torch.autocast(device_type='cuda', dtype=_amp_dtype(device)):
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
         else:
@@ -235,7 +258,7 @@ def evaluate_classification(
             imgs   = imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             if use_amp:
-                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                with torch.autocast(device_type='cuda', dtype=_amp_dtype(device)):
                     outputs = model(imgs)
                     total_loss += criterion(outputs, labels).item()
             else:
@@ -316,7 +339,7 @@ def evaluate_regression(model, loader, criterion, device):
             imgs   = imgs.to(device, non_blocking=True)
             bboxes = bboxes.to(device, non_blocking=True)
             if use_amp:
-                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                with torch.autocast(device_type='cuda', dtype=_amp_dtype(device)):
                     outputs = model(imgs)
             else:
                 outputs = model(imgs)
@@ -373,11 +396,15 @@ def train_one_epoch_detection(
     Expects the detection loader to yield ``(images, targets, labels)``.
     Targets may be dense detection tensors, FCOS target containers, or per-grid
     dictionary outputs keyed by grid size.
+
+    With float16 autocast (pre-Ampere GPUs) and scaler=None, a GradScaler is created
+    for this epoch; fit() creates one for the whole run instead.
     """
     model.train()
     epoch_loss = 0.0
     n_batches  = 0
     use_amp    = device.type == "cuda"
+    scaler     = _resolve_grad_scaler(scaler, device)
 
     loader_iter = iter(loader)
     while True:
@@ -409,7 +436,7 @@ def train_one_epoch_detection(
         if is_timing:
             t0 = t_pad
 
-        with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE, enabled=use_amp):
+        with torch.autocast(device_type='cuda', dtype=_amp_dtype(device), enabled=use_amp):
             outputs = model(images)
             if is_timing: torch.cuda.synchronize(); t1 = time.perf_counter()
             loss = _loss_value(criterion(outputs, targets, labels))
@@ -498,7 +525,7 @@ def evaluate_fcos_detection(
             labels = _move_detection_batch_to_device(labels, device)
             targets = _prepare_fcos_targets(targets, labels, criterion, device)
 
-            with torch.autocast(device_type="cuda", dtype=_AMP_DTYPE, enabled=device.type == "cuda"):
+            with torch.autocast(device_type="cuda", dtype=_amp_dtype(device), enabled=device.type == "cuda"):
                 outputs = model(images)
                 loss = _loss_value(criterion(outputs, targets, labels))
             total_loss += loss.item()
@@ -676,7 +703,7 @@ def evaluate_detection(
             labels = _move_detection_batch_to_device(labels, device)
 
             if use_amp:
-                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                with torch.autocast(device_type='cuda', dtype=_amp_dtype(device)):
                     outputs = model(images)
                     loss = _loss_value(criterion(outputs, targets, labels))
             else:
@@ -923,7 +950,7 @@ def evaluate_detection_sweep(
             labels = _move_detection_batch_to_device(labels, device)
 
             if use_amp:
-                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                with torch.autocast(device_type='cuda', dtype=_amp_dtype(device)):
                     outputs = model(images)
             else:
                 outputs = model(images)
@@ -1079,7 +1106,7 @@ def evaluate_density_sweep(
             targets = _move_detection_batch_to_device(targets, device)
 
             if use_amp:
-                with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                with torch.autocast(device_type='cuda', dtype=_amp_dtype(device)):
                     outputs = model(images)
             else:
                 outputs = model(images)
@@ -1185,8 +1212,10 @@ def fit(
     Full training loop with per-epoch logging, validation, and optional checkpointing.
     Detection-only: uses train_one_epoch_detection and evaluate_detection.
 
-    Uses bfloat16 autocast automatically on CUDA devices. Pass a GradScaler
-    for API uniformity (it behaves as a no-op with bf16).
+    Uses autocast automatically on CUDA devices: bfloat16 on GPUs with native bf16
+    (compute capability 8.0+), float16 on older ones such as the T4. With float16 and
+    scaler=None, a GradScaler is created for the run (and saved / resumed with the
+    checkpoint); with bfloat16 a passed GradScaler behaves as a no-op.
 
     Args:
         model (nn.Module): The model to train.
@@ -1202,8 +1231,8 @@ def fit(
             - step_scheduler_per_batch=False: stepped once per epoch after
               validation (e.g. CosineAnnealingLR, StepLR).
         scaler (GradScaler, optional): torch.amp.GradScaler for AMP training.
-            For bf16 this is a no-op but is accepted for API compatibility.
-            Defaults to None.
+            For bf16 this is a no-op but is accepted for API compatibility. With
+            fp16 autocast, None means a GradScaler is created. Defaults to None.
         clip_grad_norm (float): Clip gradient norms to this value before the
             optimizer step. Set to 0.0 to disable. Defaults to 1.0.
         checkpoint (ModelCheckpoint, optional): Callback invoked after each epoch.
@@ -1244,7 +1273,14 @@ def fit(
     if anchors_wh is None and hasattr(trainloader, "dataset"):
         anchors_wh = getattr(trainloader.dataset, "anchors_wh", None)
 
-    amp_info = "bf16 autocast" if device.type == "cuda" else "fp32 (CPU)"
+    # Created before resuming so a saved scaler state is restored into it.
+    scaler = _resolve_grad_scaler(scaler, device)
+    if device.type == "cuda":
+        amp_info = {torch.bfloat16: "bf16", torch.float16: "fp16"}[_amp_dtype(device)] + " autocast"
+        if scaler is not None and scaler.is_enabled():
+            amp_info += " + GradScaler"
+    else:
+        amp_info = "fp32 (CPU)"
     print(f"Training with {amp_info} | Epochs: {epochs}")
 
     # ── Set up RunLogger ──────────────────────────────────────────────────────
@@ -1261,6 +1297,7 @@ def fit(
             "lr":        optimizer.param_groups[0]["lr"],
             "epochs":    epochs,
             "device":    str(device),
+            "amp":       amp_info,
             "clip_grad_norm": clip_grad_norm,
             "step_scheduler_per_batch": step_scheduler_per_batch,
         }
