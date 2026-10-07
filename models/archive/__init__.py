@@ -22,13 +22,13 @@ Each module's docstring lists the checkpoints it loads; `python -m models.archiv
 its per-size parameters and output shapes. The TensorFlow models of the first versions lived in
 notebooks and are kept by the v1/v2/v3-tensorflow tags rather than here.
 """
-from .digit_classifier_cnn import DigitClassifierCNN
-from .grid14_detector import Grid14Detector
-from .single_box_cnn import SingleBoxCNN
-from .single_box_resnet import SingleBoxResNet
-from .stage4_box_detector import Stage4BoxDetector
-from .stage4_slot_fc_detector import Stage4SlotDetectorFC
-from .stage5_unified_detector import Stage5UnifiedDetector
+from models.archive.digit_classifier_cnn import DigitClassifierCNN
+from models.archive.grid14_detector import Grid14Detector
+from models.archive.single_box_cnn import SingleBoxCNN
+from models.archive.single_box_resnet import SingleBoxResNet
+from models.archive.stage4_box_detector import Stage4BoxDetector
+from models.archive.stage4_slot_fc_detector import Stage4SlotDetectorFC
+from models.archive.stage5_unified_detector import Stage5UnifiedDetector
 
 __all__ = [
     "SingleBoxCNN",

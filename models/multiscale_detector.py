@@ -7,9 +7,9 @@ predicting `anchors_per_scale` slots of [x, y, w, h, objectness, class logits].
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .common import ResNetDetectorBase
-from .configs import GRID_PRESETS, YOLO_ANCHORS_PER_SCALE, YOLO_GRID_SIZES, resolve_backbone_args
-from .grid_detector import ObjectDetectorResNet
+from models.common import ResNetDetectorBase
+from models.configs import GRID_PRESETS, YOLO_ANCHORS_PER_SCALE, YOLO_GRID_SIZES, resolve_backbone_args
+from models.grid_detector import ObjectDetectorResNet
 
 
 class MultiScaleObjectDetectorResNet(ResNetDetectorBase):
