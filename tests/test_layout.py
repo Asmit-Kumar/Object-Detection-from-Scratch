@@ -8,7 +8,8 @@ import unittest
 MOVED = {
     "utils.reader": "dataio.reader",
     "utils.dataset": "dataio.dataset",
-    "utils.fcos_targets": "dataio.fcos_targets",
+    "utils.fcos_targets": "dataio.ltrb_targets",
+    "dataio.fcos_targets": "dataio.ltrb_targets",
     "utils.trainer": "training.trainer",
     "utils.losses": "training.losses",
     "utils.callbacks": "training.callbacks",

@@ -1,5 +1,5 @@
 """
-Generates benchmark detection visualizations for grid-based and FCOS models
+Generates benchmark detection visualizations for grid-based, FCOS, and YOLOv8 models
 across all sizes (Nano, Small, Medium), 4 placements, and 2 samples.
 
 Use ``--detector grid`` to render:
@@ -9,8 +9,11 @@ Use ``--detector grid`` to render:
 
 Use ``--detector fcos`` to render FCOS outputs. Annotated images are saved
 under ``result/benchmark/<variant>/<size>/``.
+Use ``--detector yolov8`` to render YOLOv8 outputs using the tuned thresholds
+saved by ``run_single_stage_benchmark.py``.
 """
 import argparse
+import json as jsonlib
 import sys
 from pathlib import Path
 
@@ -28,7 +31,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from models import load_fcos_detector
+from models import load_fcos_detector, load_model
 from models.object_detector_res import ObjectDetectorResNet
 from generator.dataset import EMNIST_CLASS_NAMES
 from inference.pipeline import _decode_fcos_candidates
@@ -70,34 +73,49 @@ VARIANTS = [
 def generate_visuals(detector: str = 'grid'):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if detector == 'fcos':
-        print(f"Generating FCOS visual detection grids on {device}...")
-        opt_confs = {'n': 0.50, 's': 0.45, 'm': 0.50}
-        results_p = Path('benchmark/fcos_results.json')
+    if detector in ('fcos', 'yolov8'):
+        family_name = 'FCOS' if detector == 'fcos' else 'YOLOv8'
+        print(f"Generating {family_name} visual detection grids on {device}...")
+        opt_confs = {'n': 0.50, 's': 0.45, 'm': 0.50} if detector == 'fcos' else {}
+        results_p = Path(f'benchmark/{detector}_results.json')
+        if detector == 'yolov8' and not results_p.exists():
+            raise FileNotFoundError(
+                f"{results_p} is missing; run scripts/run_single_stage_benchmark.py --detector yolov8 first."
+            )
         if results_p.exists():
             try:
-                import json
                 with open(results_p) as f:
-                    data = json.load(f)
+                    data = jsonlib.load(f)
                 for sz in SIZES:
                     if sz in data and 'opt_conf' in data[sz]:
                         opt_confs[sz] = data[sz]['opt_conf']
+                if detector == 'yolov8' and any(sz not in data or 'opt_conf' not in data[sz] for sz in SIZES):
+                    raise ValueError(f"{results_p} does not contain tuned thresholds for Nano, Small, and Medium.")
             except Exception:
-                pass
+                if detector == 'yolov8':
+                    raise
 
         for sz in SIZES:
-            ckpt_path = f'weights/fcos_{sz}_28x14_best.pth'
-            if not Path(ckpt_path).exists():
-                ckpt_path = f'checkpoint/fcos_{sz}_28x14_best.pth'
+            if detector == 'fcos':
+                ckpt_path = f'weights/fcos_{sz}_28x14_best.pth'
+                if not Path(ckpt_path).exists():
+                    ckpt_path = f'checkpoint/fcos_{sz}_28x14_best.pth'
+            else:
+                ckpt_path = f'weights/yolov8_{sz}_28x14_best.pth'
+                if not Path(ckpt_path).exists():
+                    ckpt_path = f'checkpoint/yolov8_{sz}_28x14_best.pth'
             if not Path(ckpt_path).exists():
                 print(f"Skipping {ckpt_path} (not found)")
                 continue
 
             conf_thresh = opt_confs[sz]
-            out_dir = Path(f'result/benchmark/fcos_stage/{sz}')
+            out_dir = Path('result/benchmark/fcos_stage' if detector == 'fcos' else 'result/benchmark/yolov8') / sz
             out_dir.mkdir(parents=True, exist_ok=True)
-            print(f"\n[FCOS {sz.upper()}] Loading model (conf={conf_thresh:.2f})...")
-            model = load_fcos_detector(ckpt_path, device=device, size=sz)
+            print(f"\n[{family_name} {sz.upper()}] Loading model (conf={conf_thresh:.2f})...")
+            if detector == 'fcos':
+                model = load_fcos_detector(ckpt_path, device=device, size=sz)
+            else:
+                model = load_model('yolov8', ckpt_path, device=device, size=sz, strict=True)
             model.eval()
 
             for placement in PLACEMENTS:
@@ -130,7 +148,7 @@ def generate_visuals(detector: str = 'grid'):
                         ax.add_patch(rect)
                         ax.text(x, max(0, y - 3), f"{char_label} {float(score):.2f}", color='#FFE03A', fontsize=7, fontweight='bold', bbox=dict(boxstyle='round,pad=0.15', fc='black', alpha=0.55, ec='none'))
 
-                    ax.set_title(f'FCOS {sz.upper()} | {placement} | {len(valid_boxes)} detections', fontsize=9, pad=5)
+                    ax.set_title(f'{family_name} {sz.upper()} | {placement} | {len(valid_boxes)} detections', fontsize=9, pad=5)
                     ax.axis('off')
                     plt.tight_layout(pad=0.4)
                     out_path = out_dir / f'{placement}_{idx + 1}.png'
@@ -142,7 +160,7 @@ def generate_visuals(detector: str = 'grid'):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        print('\nAll FCOS visual grid images generated successfully!')
+        print(f'\nAll {family_name} visual grid images generated successfully!')
         return
 
     results_path = Path('benchmark/multi_anchor_results.json')
@@ -165,9 +183,9 @@ def generate_visuals(detector: str = 'grid'):
             pass
 
     for variant in VARIANTS:
-        v_name = variant['name']
-        prefix = variant['prefix']
-        v_sizes = variant.get('sizes', SIZES)
+        v_name = str(variant['name'])
+        prefix = str(variant['prefix'])
+        v_sizes = [str(size) for size in variant.get('sizes', SIZES)]
 
         for size in v_sizes:
             weights_p = Path(f'weights/{prefix}{size}_best.pth')
@@ -253,7 +271,7 @@ def generate_visuals(detector: str = 'grid'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Generate benchmark visuals for the grid or FCOS detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos'], default='grid', help='Which detector family to render.')
+    parser = argparse.ArgumentParser(description='Generate benchmark visuals for grid, FCOS, or YOLOv8 detector variants.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8'], default='grid', help='Which detector family to render.')
     args = parser.parse_args()
     generate_visuals(detector=args.detector)

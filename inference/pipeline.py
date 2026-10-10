@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+from dataio.ltrb_targets import LTRBTargetGenerator
 from generator.dataset import EMNIST_CLASS_NAMES
 
 
@@ -42,13 +43,16 @@ def _apply_nms(boxes_xywh: torch.Tensor, confs: torch.Tensor, iou_thresh: float 
     return torchvision.ops.nms(boxes_xyxy, confs, iou_thresh)
 
 
-def _decode_fcos_candidates(
+def _decode_ltrb_candidates(
         detector,
         outputs: dict[int, dict[str, torch.Tensor]],
         score_threshold: float,
         iou_threshold: float = 0.45,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Decode FCOS outputs, gate scores with centerness, and apply class-wise NMS.
+    """Decode ltrb-head outputs, gate scores with centerness when present, and apply class-wise NMS.
+
+    ``detector`` only needs a ``STRIDES`` mapping (grid size -> stride in pixels). Without
+    ``centerness_logits`` in the outputs (e.g. the YOLOv8 head) the score is the class probability.
 
     Returns one ``(boxes_xywh, scores, classes)`` tuple per batch item. The
     highest-scoring class at each location is retained because the second
@@ -68,11 +72,14 @@ def _decode_fcos_candidates(
     for grid_size, preds in outputs.items():
         reg_ltrb = preds["reg_ltrb"].float()
         cls_probs = preds["cls_logits"].float().sigmoid()
-        cent_probs = preds["centerness_logits"].float().sigmoid().unsqueeze(-1)
-        scores, classes = torch.sqrt((cls_probs * cent_probs).clamp_min(1e-12)).max(dim=-1)
+        if "centerness_logits" in preds:
+            cent_probs = preds["centerness_logits"].float().sigmoid().unsqueeze(-1)
+            scores, classes = torch.sqrt((cls_probs * cent_probs).clamp_min(1e-12)).max(dim=-1)
+        else:
+            scores, classes = cls_probs.max(dim=-1)
 
         height, width = reg_ltrb.shape[1:3]
-        centers = detector.generate_grid_centers(
+        centers = LTRBTargetGenerator.get_grid_centers(
             height, width, detector.STRIDES[grid_size], reg_ltrb.device
         )
         x1 = centers[..., 0].view(1, height, width) - reg_ltrb[..., 0]
@@ -120,6 +127,9 @@ def _decode_fcos_candidates(
         )
         candidates.append((boxes_xywh, scores[selected], classes[selected]))
     return candidates
+
+
+_decode_fcos_candidates = _decode_ltrb_candidates  # former name, kept so existing imports keep working
 
 
 def _flatten_detection_outputs(outputs: torch.Tensor | dict[int, torch.Tensor]) -> torch.Tensor:
@@ -172,8 +182,10 @@ class DetectionResult:
 class DetectionPipeline:
     """
     Two-Stage End-to-End Detection Pipeline:
-      Stage 1: ObjectDetectorResNet / FCOSObjectDetectorResNet — detects character bounding boxes.
+      Stage 1: ObjectDetectorResNet / an ltrb detector (FCOS, YOLOv8) — detects character bounding boxes.
       Stage 2: CharacterClassifierResNet — 47-class EMNIST ByMerge recognition.
+
+    ``ltrb_detector=True`` loads the registry model named by ``ltrb_model`` ("fcos" or "yolov8").
     """
 
     def __init__(
@@ -186,7 +198,8 @@ class DetectionPipeline:
         iou_threshold: float = 0.45,
         num_classes: int = 47,
         multi_scale_detector: bool = False,
-        fcos_detector: bool = False,
+        ltrb_detector: bool = False,
+        ltrb_model: str = 'fcos',
     ):
         self.detector_size   = detector_size
         self.conf_threshold  = conf_threshold
@@ -194,16 +207,19 @@ class DetectionPipeline:
         self.device          = device
         self.num_classes     = num_classes
         self.multi_scale_detector = multi_scale_detector
-        self.fcos_detector = fcos_detector
+        self.ltrb_detector = ltrb_detector
+        self.ltrb_model = ltrb_model
 
         self.detector   = self._load_detector(detector_weights)
         self.classifier = self._load_classifier(classifier_weights, num_classes)
         self.class_names = EMNIST_CLASS_NAMES["bymerge"]
 
     def _load_detector(self, weights_path: str = None):
-        if self.fcos_detector:
-            from models import load_fcos_detector
-            loader = load_fcos_detector
+        if self.ltrb_detector:
+            from models import load_model
+
+            def loader(path, device, size):
+                return load_model(self.ltrb_model, path, device, size=size, strict=False)
         elif self.multi_scale_detector:
             from models import load_multiscale_detector
             loader = load_multiscale_detector
@@ -328,9 +344,9 @@ class DetectionPipeline:
         conf_threshold: float,
     ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Run detector decoding and NMS for every image in a batch."""
-        if self.fcos_detector:
+        if self.ltrb_detector:
             raw_out = self.detector(images_tensor)
-            return _decode_fcos_candidates(
+            return _decode_ltrb_candidates(
                 self.detector,
                 raw_out,
                 score_threshold=conf_threshold,
@@ -622,7 +638,7 @@ class DetectionPipeline:
                 batch_size=batch_size,
                 num_workers=0,
                 test_only=True,
-                fcos=self.fcos_detector,
+                ltrb=self.ltrb_detector,
                 anchors_wh=getattr(self, "anchors_wh", None),
                 grid_sizes=getattr(self.detector, "grid_sizes", (28,)),
                 anchors_per_scale=getattr(self.detector, "anchors_per_scale", None),

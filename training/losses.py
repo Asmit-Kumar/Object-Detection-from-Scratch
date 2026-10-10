@@ -3,7 +3,7 @@ Detection Loss Utilities.
 
 Contains IoU helpers, coordinate regression loss, classification loss,
 and objectness loss functions (BCE with dynamic positive weighting and Sigmoid Focal Loss)
-for the single-stage, multi-anchor, and FCOS spatial detection pipelines.
+for the single-stage, multi-anchor, and ltrb (FCOS / anchor-free YOLOv8) spatial detection pipelines.
 """
 
 from collections.abc import Mapping
@@ -16,7 +16,7 @@ import numpy as np
 import time
 from torchvision.ops import sigmoid_focal_loss
 
-from dataio.fcos_targets import FCOSTargetGenerator, FCOSTargets
+from dataio.ltrb_targets import LTRBTargetGenerator, LTRBTargets
 
 
 # ── IoU Helpers ───────────────────────────────────────────────────────────────
@@ -258,16 +258,21 @@ class DetectionLoss(nn.Module):
         )
 
 
-# ── FCOS Loss ─────────────────────────────────────────────────────────────────
+# ── ltrb Loss (FCOS, anchor-free YOLOv8) ──────────────────────────────────────
 
-class FCOSLoss(nn.Module):
+class LTRBLoss(nn.Module):
     """
-    FCOS Multi-Scale Loss.
+    Multi-Scale Loss for detectors that predict per-location [l, t, r, b] distances.
 
     Computes:
       - Focal Loss on multi-class classification across all feature locations.
-      - Centerness-weighted GIoU Loss on positive locations.
-      - Binary Cross-Entropy Loss on centerness for positive locations.
+      - Centerness-weighted GIoU Loss on positive locations. The weight is the ground-truth
+        centerness from the targets, so it does not need a predicted centerness.
+      - Binary Cross-Entropy Loss on centerness for positive locations. Skipped for scales whose
+        predictions have no ``centerness_logits`` (e.g. the YOLOv8 head), which then report
+        ``cent_loss`` as 0.
+
+    ``FCOSLoss`` is kept as an alias of this class.
 
     Args:
         lambda_reg: Loss multiplier for bounding box GIoU regression. Default 1.0.
@@ -290,20 +295,21 @@ class FCOSLoss(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.grid_sizes = grid_sizes
-        self.target_generator = FCOSTargetGenerator(grid_sizes=grid_sizes)
+        self.target_generator = LTRBTargetGenerator(grid_sizes=grid_sizes)
 
     def forward(
             self,
             preds_by_scale: Mapping[int, Mapping[str, torch.Tensor]],
-            targets: FCOSTargets | tuple[list[torch.Tensor], list[torch.Tensor]],
+            targets: LTRBTargets | tuple[list[torch.Tensor], list[torch.Tensor]],
             labels: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """
-        Compute total FCOS loss across all pyramid scales.
+        Compute total ltrb loss across all pyramid scales.
 
         Args:
-            preds_by_scale: Dict {28: {'cls_logits', 'reg_ltrb', 'centerness_logits'}, 14: ...}
-            targets: Either an FCOSTargets instance, or a list/tuple of bounding boxes [x, y, w, h].
+            preds_by_scale: Dict {28: {'cls_logits', 'reg_ltrb', 'centerness_logits'}, 14: ...}.
+                'centerness_logits' is optional.
+            targets: Either an LTRBTargets instance, or a list/tuple of bounding boxes [x, y, w, h].
             labels: List of label tensors if targets is a list of bounding boxes.
 
         Returns:
@@ -311,7 +317,7 @@ class FCOSLoss(nn.Module):
         """
         device = next(iter(preds_by_scale.values()))["cls_logits"].device
 
-        if not isinstance(targets, FCOSTargets):
+        if not isinstance(targets, LTRBTargets):
             # Accept either separate (boxes, labels) arguments or the documented
             # ``(boxes_batch, labels_batch)`` tuple form.
             if labels is None and isinstance(targets, (tuple, list)) and len(targets) == 2:
@@ -319,9 +325,9 @@ class FCOSLoss(nn.Module):
             else:
                 boxes_batch = targets
                 labels_batch = labels if labels is not None else []
-            fcos_targets = self.target_generator.generate_targets(boxes_batch, labels_batch, device)
+            ltrb_targets = self.target_generator.generate_targets(boxes_batch, labels_batch, device)
         else:
-            fcos_targets = targets
+            ltrb_targets = targets
 
         total_cls_loss = torch.tensor(0.0, device=device)
         total_reg_loss = torch.tensor(0.0, device=device)
@@ -334,11 +340,11 @@ class FCOSLoss(nn.Module):
             preds = preds_by_scale[grid_size]
             cls_logits = preds["cls_logits"].float()          # (B, H, W, num_classes)
             reg_ltrb = preds["reg_ltrb"]                      # (B, H, W, 4)
-            cent_logits = preds["centerness_logits"]          # (B, H, W)
+            cent_logits = preds.get("centerness_logits")      # (B, H, W), or None without a centerness branch
 
-            cls_gt = fcos_targets.cls_targets[grid_size]      # (B, H, W)
-            reg_gt = fcos_targets.reg_targets[grid_size]      # (B, H, W, 4)
-            cent_gt = fcos_targets.centerness_targets[grid_size]  # (B, H, W)
+            cls_gt = ltrb_targets.cls_targets[grid_size]      # (B, H, W)
+            reg_gt = ltrb_targets.reg_targets[grid_size]      # (B, H, W, 4)
+            cent_gt = ltrb_targets.centerness_targets[grid_size]  # (B, H, W)
 
             num_classes = cls_logits.shape[-1]
             pos_mask = cls_gt >= 0                            # (B, H, W)
@@ -366,7 +372,6 @@ class FCOSLoss(nn.Module):
                 pred_ltrb_pos = reg_ltrb[pos_mask]            # (N_pos, 4)
                 gt_ltrb_pos = reg_gt[pos_mask]                # (N_pos, 4)
                 gt_cent_pos = cent_gt[pos_mask]                # (N_pos,)
-                pred_cent_pos = cent_logits[pos_mask]         # (N_pos,)
 
                 # GIoU loss weighted by ground-truth centerness
                 giou_losses = giou_loss_ltrb(pred_ltrb_pos, gt_ltrb_pos)  # (N_pos,)
@@ -374,13 +379,14 @@ class FCOSLoss(nn.Module):
                 total_reg_loss = total_reg_loss + reg_loss
                 total_cent_gt_sum = total_cent_gt_sum + gt_cent_pos.sum()
 
-                # Centerness BCE loss
-                cent_loss = F.binary_cross_entropy_with_logits(
-                    pred_cent_pos,
-                    gt_cent_pos,
-                    reduction="sum",
-                )
-                total_cent_loss = total_cent_loss + cent_loss
+                # Centerness BCE loss (only for heads that predict centerness)
+                if cent_logits is not None:
+                    cent_loss = F.binary_cross_entropy_with_logits(
+                        cent_logits[pos_mask],                # (N_pos,)
+                        gt_cent_pos,
+                        reduction="sum",
+                    )
+                    total_cent_loss = total_cent_loss + cent_loss
 
         normalizer = max(total_num_pos, 1.0)
         cls_loss_norm = total_cls_loss / normalizer
@@ -402,8 +408,11 @@ class FCOSLoss(nn.Module):
         }
 
 
+FCOSLoss = LTRBLoss  # former name, kept so existing imports keep working
+
+
 if __name__ == "__main__":
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Testing DetectionLoss and FCOSLoss...")
-    fcos_loss = FCOSLoss()
-    print("FCOSLoss initialized successfully.")
+    print("Testing DetectionLoss and LTRBLoss...")
+    ltrb_loss = LTRBLoss()
+    print("LTRBLoss initialized successfully.")

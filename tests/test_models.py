@@ -24,6 +24,10 @@ STATE_DICT_SIGNATURES = {
     ("multiscale", "s"): "2ace66867a0c8b25",
     ("multiscale", "m"): "a07245e246f364d2",
     ("multiscale", "l"): "8bc4b84d5b3b1485",
+    ("yolov8", "n"): "027bc483b8f7e287",
+    ("yolov8", "s"): "794f0cff2b646ed7",
+    ("yolov8", "m"): "dfd48dc3a52b9fde",
+    ("yolov8", "l"): "b030146286f1911e",
     ("fcos", "n"): "710d021395ec1833",
     ("fcos", "s"): "6c85a23cb4ef228f",
     ("fcos", "m"): "b603841a1aa0a2c9",
@@ -59,12 +63,16 @@ class TestArchitectures(unittest.TestCase):
         with torch.no_grad():
             grid = models.build_model("grid", size="n").eval()(x)
             multi = models.build_model("multiscale", size="n").eval()(x)
+            yolov8 = models.build_model("yolov8", size="n").eval()(x)
             fcos = models.build_model("fcos", size="n").eval()(x)
             cls = models.build_model("classifier", num_classes=47).eval()(torch.randn(2, 1, 28, 28))
 
         self.assertEqual(tuple(grid.shape), (2, 28, 28, 1, 5 + 47))
         self.assertEqual({k: tuple(v.shape) for k, v in multi.items()},
                          {28: (2, 28, 28, 3, 52), 14: (2, 14, 14, 3, 52)})
+        self.assertEqual(tuple(yolov8[28]["cls_logits"].shape), (2, 28, 28, 47))
+        self.assertEqual(tuple(yolov8[14]["reg_ltrb"].shape), (2, 14, 14, 4))
+        self.assertNotIn("centerness_logits", yolov8[28])
         self.assertEqual(tuple(fcos[28]["cls_logits"].shape), (2, 28, 28, 47))
         self.assertEqual(tuple(fcos[14]["reg_ltrb"].shape), (2, 14, 14, 4))
         self.assertEqual(tuple(fcos[14]["centerness_logits"].shape), (2, 14, 14))
@@ -74,12 +82,14 @@ class TestArchitectures(unittest.TestCase):
         # scripts unpack these as (stem, channels, blocks, last)
         self.assertEqual(models.ObjectDetectorResNet.CONFIGS["s"], (64, [64, 128, 128, 256], [1, 1, 1, 1], 28))
         self.assertIs(models.MultiScaleObjectDetectorResNet.CONFIGS, models.ObjectDetectorResNet.CONFIGS)
+        self.assertEqual(models.YOLOv8ObjectDetector.CONFIGS["n"], (16, [16, 32, 64, 128], [1, 1, 1, 1]))
         self.assertEqual(models.FCOSObjectDetectorResNet.CONFIGS["n"], (32, [32, 64, 64, 128], [1, 1, 1, 1], 48))
 
     def test_getters_match_build_model(self):
         pairs = [
             (lambda: models.get_detector(size="m"), lambda: models.build_model("grid", size="m")),
             (lambda: models.get_multiscale_detector(size="s"), lambda: models.build_model("multiscale", size="s")),
+            (lambda: models.get_yolov8_detector(size="n"), lambda: models.build_model("yolov8", size="n")),
             (lambda: models.get_fcos_detector(size="n"), lambda: models.build_model("fcos", size="n")),
             (lambda: models.get_classifier(), lambda: models.build_model("classifier")),
         ]

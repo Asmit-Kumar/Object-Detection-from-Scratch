@@ -44,6 +44,15 @@ FCOS_PRESETS = {
     "l": DetectorPreset(64, (128, 256, 384, 512), (2, 2, 2, 2), fpn_channels=128),   # Large  ~17.5M params
 }
 
+# YOLOv8-inspired backbone and PAN neck widths/depths. These presets are
+# deliberately separate from GRID_PRESETS because their C2f layout is distinct.
+YOLOV8_PRESETS = {
+    "n": DetectorPreset(16, (16,  32,  64,  128), (1, 1, 1, 1)),
+    "s": DetectorPreset(32, (32,  64,  128, 256), (1, 1, 2, 1)),
+    "m": DetectorPreset(48, (48,  96,  192, 384), (1, 2, 4, 2)),
+    "l": DetectorPreset(64, (64, 128, 256, 512), (2, 3, 6, 3)),
+}
+
 
 def get_preset(presets: dict[str, DetectorPreset], size: str) -> DetectorPreset:
     """Look up a size preset, case-insensitively."""

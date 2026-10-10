@@ -1,5 +1,5 @@
 """
-Grid-Based and FCOS Detector Benchmark Evaluation Script.
+Grid-Based, FCOS, and YOLOv8 Detector Benchmark Evaluation Script.
 
 Evaluates detector models across all 4 placement layouts
 ('random', 'grid', 'words', 'line') in data/OD_benchmark/.
@@ -8,9 +8,10 @@ Use ``--detector grid`` for:
   2. Grid (K=1, Original BCE): grid_detector_{n, s, m}
   3. Multi-Anchor (K=3): 3_grid_detector_{n, s, m}
 
-Use ``--detector fcos`` for FCOS Nano, Small, and Medium. Both modes tune
-confidence thresholds and report detection, classification, end-to-end, and
-throughput metrics.
+Use ``--detector fcos`` or ``--detector yolov8`` for anchor-free Nano, Small,
+and Medium models. Each mode tunes confidence thresholds (or accepts a fixed
+override) and reports detection, classification, end-to-end, and throughput
+metrics.
 """
 import argparse
 import sys
@@ -28,7 +29,7 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from models import load_fcos_detector
+from models import load_fcos_detector, load_model
 from models.object_detector_res import ObjectDetectorResNet
 from legacy_models.grid_detector_14x14 import ObjectDetectorResNet as GridDetectorResNet14x14
 from dataio.dataset import get_detection_loaders
@@ -496,31 +497,61 @@ class FCOSPipeline:
         return measure_pure_inference(self.model, loader, self.device)
 
 
-def run_benchmark(detector: str = 'grid'):
+class YOLOv8Pipeline(FCOSPipeline):
+    """Inference and evaluation wrapper for the two-scale YOLOv8 detector."""
+
+    def __init__(self, size: str = 's', ckpt_path: str = None, device: str = 'cuda', conf_threshold: float = 0.50):
+        self.size = size.lower()
+        self.device = str(device)
+        self.conf_threshold = conf_threshold
+
+        weights_p = Path(f'weights/yolov8_{self.size}_28x14_best.pth')
+        ckpt_p = Path(f'checkpoint/yolov8_{self.size}_28x14_best.pth')
+        path = ckpt_path or (str(weights_p) if weights_p.exists() else str(ckpt_p))
+        self.model = load_model('yolov8', path, device=device, size=self.size, strict=True)
+        self.model.eval()
+        self.architecture = f'YOLOv8ObjectDetector ({self.size})'
+
+
+def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path: str = None):
+    if fixed_conf is not None and not 0.0 <= fixed_conf <= 1.0:
+        raise ValueError(f'fixed_conf must be between 0 and 1, got {fixed_conf}')
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     all_results = {}
 
-    if detector == 'fcos':
+    if detector in ('fcos', 'yolov8'):
+        family_name = 'FCOS' if detector == 'fcos' else 'YOLOv8'
+        pipeline_cls = FCOSPipeline if detector == 'fcos' else YOLOv8Pipeline
         print("=" * 90)
-        print("  FCOS ANCHOR-FREE RESNET DETECTOR BENCHMARK (AUTO-TUNED THRESHOLDS)")
+        threshold_mode = 'FIXED THRESHOLD' if fixed_conf is not None else 'AUTO-TUNED THRESHOLDS'
+        print(f"  {family_name.upper()} ANCHOR-FREE DETECTOR BENCHMARK ({threshold_mode})")
         print(f"  Device: {device} | 10,000 Test Images across 4 Placements")
         print("=" * 90)
 
         for sz in SIZES:
-            print(f"\nEvaluating FCOS Preset: '{sz.upper()}'...")
-            pipe_tune = FCOSPipeline(size=sz, device=device, conf_threshold=0.50)
+            print(f"\nEvaluating {family_name} Preset: '{sz.upper()}'...")
+            pipe_tune = pipeline_cls(size=sz, device=device, conf_threshold=0.50)
             tune_loader = get_detection_loaders(
-                data_root=f"{TUNE_PATH}/random", batch_size=128, test_only=True, num_workers=0, fcos=True
+                data_root=f"{TUNE_PATH}/random", batch_size=128, test_only=True, num_workers=0, ltrb=True
             )
-            opt_conf = pipe_tune.tune_threshold(tune_loader)
-            print(f"  [Auto-Tuned] Optimal threshold for FCOS {sz.upper()}: conf = {opt_conf:.2f} (tuned on {TUNE_PATH}/random)")
+            if fixed_conf is None:
+                opt_conf = pipe_tune.tune_threshold(tune_loader)
+                threshold_source = 'held-out tune set'
+                print(f"  [Auto-Tuned] Optimal threshold for {family_name} {sz.upper()}: conf = {opt_conf:.2f} (tuned on {TUNE_PATH}/random)")
+            else:
+                opt_conf = float(fixed_conf)
+                threshold_source = 'fixed CLI override'
+                print(f"  [Fixed] Threshold for {family_name} {sz.upper()}: conf = {opt_conf:.2f}")
 
-            pipe = FCOSPipeline(size=sz, device=device, conf_threshold=opt_conf)
+            pipe = pipeline_cls(size=sz, device=device, conf_threshold=opt_conf)
             pure = pipe.measure_inference(tune_loader)
             print(f"  [Pure Inference] model(images) only, batch={pure['batch_size']}: {pure['median_img_s']:.1f} img/s (median of {pure['repeats']})")
             all_results[sz] = {
                 'opt_conf': opt_conf,
-                'tune_data_root': f"{TUNE_PATH}/random",
+                'threshold_source': threshold_source,
+                'tune_data_root': f"{TUNE_PATH}/random" if fixed_conf is None else None,
+                'device': device,
                 'pure_inference': pure,
                 'placements': {},
                 'summary': {},
@@ -534,9 +565,11 @@ def run_benchmark(detector: str = 'grid'):
 
             for p in PLACEMENTS:
                 loader = get_detection_loaders(
-                    data_root=f"{BENCHMARK_PATH}/{p}", batch_size=128, test_only=True, num_workers=0, fcos=True
+                    data_root=f"{BENCHMARK_PATH}/{p}", batch_size=128, test_only=True, num_workers=0, ltrb=True
                 )
                 res = pipe.evaluate_loader(loader)
+                expected_gt = sum(len(record.labels) for record in loader.dataset.reader.records)
+                assert res['total_gt'] == expected_gt, (family_name, sz, p, res['total_gt'], expected_gt)
                 all_results[sz]['placements'][p] = res
                 total_det_p += res['det_precision']
                 total_det_r += res['det_recall']
@@ -565,7 +598,7 @@ def run_benchmark(detector: str = 'grid'):
             )
 
         print("\n" + "=" * 90)
-        print("  FULL FCOS BENCHMARK SUMMARY")
+        print(f"  FULL {family_name.upper()} BENCHMARK SUMMARY")
         print("=" * 90)
         print(
             f"{'Size':<6} {'Conf':<6} {'Layout':<8} {'Det P':<8} {'Det R':<8} "
@@ -590,11 +623,17 @@ def run_benchmark(detector: str = 'grid'):
             )
         print("=" * 90)
 
-        out_file = Path('benchmark/fcos_results.json')
+        if output_path:
+            out_file = Path(output_path)
+        elif fixed_conf is not None:
+            conf_tag = f'{int(round(fixed_conf * 100)):03d}'
+            out_file = Path(f'benchmark/{detector}_results_conf{conf_tag}.json')
+        else:
+            out_file = Path(f'benchmark/{detector}_results.json')
         out_file.parent.mkdir(parents=True, exist_ok=True)
         with open(out_file, 'w') as f:
             json.dump(all_results, f, indent=2)
-        print(f"\nSaved raw FCOS evaluation metrics to '{out_file}'")
+        print(f"\nSaved raw {family_name} evaluation metrics to '{out_file}'")
         return
 
     print("=" * 90)
@@ -602,9 +641,9 @@ def run_benchmark(detector: str = 'grid'):
     print("=" * 90)
 
     for v in VARIANTS:
-        v_name = v['name']
-        prefix = v['prefix']
-        v_sizes = v.get('sizes', SIZES)
+        v_name = str(v['name'])
+        prefix = str(v['prefix'])
+        v_sizes = [str(size) for size in v.get('sizes', SIZES)]
         all_results[v_name] = {}
 
         for sz in v_sizes:
@@ -677,7 +716,11 @@ def run_benchmark(detector: str = 'grid'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run the benchmark for the grid or FCOS detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos'], default='grid', help='Which detector family to evaluate.')
+    parser = argparse.ArgumentParser(description='Run the benchmark for grid, FCOS, or YOLOv8 detector variants.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8'], default='grid', help='Which detector family to evaluate.')
+    parser.add_argument('--confidence-threshold', type=float, default=None, dest='fixed_conf',
+                        help='Use a fixed confidence threshold instead of held-out tuning.')
+    parser.add_argument('--output', default=None, dest='output_path',
+                        help='Optional output JSON path; fixed-threshold runs otherwise use a suffixed file.')
     args = parser.parse_args()
-    run_benchmark(detector=args.detector)
+    run_benchmark(detector=args.detector, fixed_conf=args.fixed_conf, output_path=args.output_path)

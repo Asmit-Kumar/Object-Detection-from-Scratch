@@ -41,7 +41,7 @@ IOU_MATCH = 0.50
 def per_gt_outcomes(pipe: FCOSPipeline, placement: str) -> dict:
     """Map (placement, image, gt_idx) -> (detected, correct), using evaluate_loader's matching."""
     loader = get_detection_loaders(
-        data_root=f"{BENCHMARK_PATH}/{placement}", batch_size=128, test_only=True, num_workers=0, fcos=True
+        data_root=f"{BENCHMARK_PATH}/{placement}", batch_size=128, test_only=True, num_workers=0, ltrb=True
     )
     assert isinstance(loader.sampler, torch.utils.data.SequentialSampler), "loader must be unshuffled"
     records = loader.dataset.reader.records

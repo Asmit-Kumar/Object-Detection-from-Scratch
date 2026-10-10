@@ -6,16 +6,16 @@ Usage
 # One factory for every architecture (recommended)
 from models import build_model, load_model
 
-detector   = build_model("fcos", size="s")                  # "grid" | "multiscale" | "fcos" | "classifier"
+detector   = build_model("fcos", size="s")                  # "grid" | "multiscale" | "yolov8" | "fcos" | "classifier"
 detector   = build_model("grid", size="m", num_anchors=3)   # keyword arguments override the preset
 classifier = build_model("classifier", num_classes=47)
 detector   = load_model("fcos", "weights/fcos_s_28x14_best.pth", device, size="s")
 
 # Per-architecture helpers (still work)
-from models import get_detector, get_multiscale_detector, get_fcos_detector, get_classifier
+from models import get_detector, get_multiscale_detector, get_yolov8_detector, get_fcos_detector, get_classifier
 
 # Direct class import (still works)
-from models import ObjectDetectorResNet, MultiScaleObjectDetectorResNet, FCOSObjectDetectorResNet, CharacterClassifierResNet
+from models import ObjectDetectorResNet, MultiScaleObjectDetectorResNet, YOLOv8ObjectDetector, FCOSObjectDetectorResNet, CharacterClassifierResNet
 
 Layout
 ------
@@ -23,6 +23,7 @@ configs.py                     size presets (n / s / m / l) and dataset-level de
 common.py                      SimpleResBlock, ScaleExp, ResNetDetectorBase (stem + four res-layers)
 grid_detector.py               ObjectDetectorResNet           ("grid")
 multiscale_detector.py         MultiScaleObjectDetectorResNet ("multiscale")
+yolov8_detector.py             YOLOv8ObjectDetector           ("yolov8")
 fcos_detector.py               FCOSObjectDetectorResNet       ("fcos")
 character_classifier_resnet.py the character classifier (own BasicBlock, kept separate on purpose:
                                its layers differ from SimpleResBlock and its checkpoints depend on them)
@@ -42,9 +43,10 @@ import warnings
 import torch
 from torch import nn
 
-from models.configs import FCOS_PRESETS, GRID_PRESETS, get_preset
+from models.configs import FCOS_PRESETS, GRID_PRESETS, YOLOV8_PRESETS, get_preset
 from models.grid_detector import ObjectDetectorResNet
 from models.multiscale_detector import MultiScaleObjectDetectorResNet
+from models.yolov8_detector import YOLOv8ObjectDetector
 from models.fcos_detector import FCOSObjectDetectorResNet
 from models.character_classifier_resnet import CharacterClassifierResNet
 from models.archive import (
@@ -61,6 +63,7 @@ from models.archive import grid14_detector, stage4_box_detector, stage4_slot_fc_
 __all__ = [
     "ObjectDetectorResNet",
     "MultiScaleObjectDetectorResNet",
+    "YOLOv8ObjectDetector",
     "FCOSObjectDetectorResNet",
     "CharacterClassifierResNet",
     "SingleBoxCNN",
@@ -75,10 +78,12 @@ __all__ = [
     "load_model",
     "get_detector",
     "get_multiscale_detector",
+    "get_yolov8_detector",
     "get_fcos_detector",
     "get_classifier",
     "load_detector",
     "load_multiscale_detector",
+    "load_yolov8_detector",
     "load_fcos_detector",
     "load_classifier",
 ]
@@ -87,6 +92,7 @@ __all__ = [
 _REGISTRY = {
     "grid": (ObjectDetectorResNet, GRID_PRESETS),
     "multiscale": (MultiScaleObjectDetectorResNet, GRID_PRESETS),
+    "yolov8": (YOLOv8ObjectDetector, YOLOV8_PRESETS),
     "fcos": (FCOSObjectDetectorResNet, FCOS_PRESETS),
     "classifier": (CharacterClassifierResNet, None),
     # Earlier architectures (models/archive/), kept so their checkpoints still load.
@@ -109,7 +115,7 @@ def build_model(name: str, size: str = "s", **overrides) -> nn.Module:
     """Return an untrained model for the given architecture and size preset.
 
 Args:
-        name:        One of MODEL_NAMES: "grid", "multiscale", "fcos", "classifier", or an
+        name:        One of MODEL_NAMES: "grid", "multiscale", "yolov8", "fcos", "classifier", or an
                      archived architecture such as "archive.stage4" (see models/archive/).
         size:        Size preset "n" | "s" | "m" | "l" (ignored for single-size models).
         **overrides: Constructor arguments; they take precedence over the preset
@@ -193,6 +199,11 @@ def get_multiscale_detector(size: str = "s", **kwargs) -> MultiScaleObjectDetect
     return build_model("multiscale", size=size, **kwargs)
 
 
+def get_yolov8_detector(size: str = "s", **kwargs) -> YOLOv8ObjectDetector:
+    """Return the YOLOv8-inspired two-scale detector for the requested size preset."""
+    return build_model("yolov8", size=size, **kwargs)
+
+
 def get_fcos_detector(size: str = "s", **kwargs) -> FCOSObjectDetectorResNet:
     """Return an FCOSObjectDetectorResNet for the requested size preset.
 
@@ -232,6 +243,11 @@ def load_detector(path: str, device, size: str = "m", **kwargs) -> ObjectDetecto
 def load_multiscale_detector(path: str, device, size: str = "s", **kwargs) -> MultiScaleObjectDetectorResNet:
     """Instantiate and load MultiScaleObjectDetectorResNet weights from *path*."""
     return load_model("multiscale", path, device, size=size, strict=False, **kwargs)
+
+
+def load_yolov8_detector(path: str, device, size: str = "s", **kwargs) -> YOLOv8ObjectDetector:
+    """Instantiate and load YOLOv8ObjectDetector weights from *path*."""
+    return load_model("yolov8", path, device, size=size, strict=False, **kwargs)
 
 
 def load_fcos_detector(path: str, device, size: str = "s", **kwargs) -> FCOSObjectDetectorResNet:

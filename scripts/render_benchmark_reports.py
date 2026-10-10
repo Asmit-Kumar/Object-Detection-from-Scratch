@@ -7,13 +7,14 @@ block is read from its source here, never hand-copied. Everything outside the ma
 
 Sources:
   - benchmark/fcos_results.json, fcos_cls_diagnostics.json, fcos_density_sweep_results.json
+  - benchmark/yolov8_results.json, yolov8_density_sweep_results.json
   - benchmark/multi_anchor_results.json (+ .pre_tune_fix.json for the before/after table),
     grid_density_sweep_results.json                     (Grid K=1 Focal/BCE, Multi-Anchor K=3)
   - benchmark/single_stage_results.json, density_sweep_results.json   (Single-Stage, Two-Stage density)
   - benchmark/01_two_stage_resnet.md per-layout tables  (Two-Stage; no JSON is saved for it)
   - Params: FCOS by instantiation; other architectures from their checkpoint state_dicts.
 
-Rendered files: BENCHMARK.md, benchmark/03_*.md, benchmark/04_*.md, benchmark/05_*.md
+Rendered files: BENCHMARK.md, benchmark/03_*.md through benchmark/06_*.md
 """
 import json
 import re
@@ -32,6 +33,8 @@ B = Path('benchmark')
 FCOS_RESULTS = B / 'fcos_results.json'
 FCOS_DIAG = B / 'fcos_cls_diagnostics.json'
 FCOS_DENSITY = B / 'fcos_density_sweep_results.json'
+YOLOV8_RESULTS = B / 'yolov8_results.json'
+YOLOV8_DENSITY = B / 'yolov8_density_sweep_results.json'
 GRID_RESULTS = B / 'multi_anchor_results.json'
 GRID_RESULTS_BEFORE = B / 'multi_anchor_results.pre_tune_fix.json'
 GRID_DENSITY = B / 'grid_density_sweep_results.json'
@@ -42,6 +45,7 @@ SINGLE_STAGE_REPORT = B / '02_single_stage_unified_resnet.md'
 GRID_REPORT = B / '03_grid_based_spatial_resnet.md'
 MULTI_ANCHOR_REPORT = B / '04_multi_anchor_spatial_resnet.md'
 FCOS_REPORT = B / '05_fcos_anchor_free_resnet.md'
+YOLOV8_REPORT = B / '06_yolov8_anchor_free_resnet.md'
 MASTER = Path('BENCHMARK.md')
 TWO_STAGE_SCRIPT = Path('scripts/run_full_benchmark.py')
 
@@ -62,6 +66,7 @@ GRID_VARIANTS = {
 CONF_SRC_HELDOUT = 'held-out tune set'
 CONF_SRC_FIXED = 'fixed'
 CONF_SRC_HARDCODED = 'hard-coded, source unrecorded'
+CONF_SRC_TEST_SWEEP = 'test-sweep override'
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -160,6 +165,18 @@ def fcos_row(size: str, res: dict, params: dict) -> dict:
     d = res[size]
     return _row('FCOS Anchor-Free', size, params[size], d['opt_conf'], CONF_SRC_HELDOUT, d['placements'],
                 'eval_loop_fps', d['pure_inference']['median_img_s'], extra={'report': FCOS_REPORT.name})
+
+
+def yolov8_row(size: str, res: dict) -> dict:
+    d = res[size]
+    checkpoint = first_existing(
+        f'weights/yolov8_{size}_28x14_best.pth',
+        f'checkpoint/yolov8_{size}_28x14_best.pth',
+    )
+    return _row('YOLOv8 Anchor-Free', size, checkpoint_params(checkpoint), d['opt_conf'],
+                d.get('threshold_source', CONF_SRC_HELDOUT),
+                d['placements'], 'eval_loop_fps', d['pure_inference']['median_img_s'],
+                extra={'report': YOLOV8_REPORT.name, 'checkpoint': checkpoint})
 
 
 def fcos_params() -> dict:
@@ -525,16 +542,124 @@ def render_cls_diagnostics(diag: dict) -> str:
     return '\n'.join(out)
 
 
+# ── Report 06: YOLOv8 ─────────────────────────────────────────────────────────
+
+def render_yolov8_report(res: dict) -> dict:
+    rows = {sz: yolov8_row(sz, res) for sz in SIZES}
+    device = str(res[SIZES[0]].get('device', 'unknown')).upper()
+
+    def per_size(key, fmt):
+        return ', '.join(f'**{fmt(rows[sz]["avg"][key])}** ({SIZE_NAMES[sz]})' for sz in SIZES)
+
+    recalls = {sz: [res[sz]['placements'][p]['det_recall'] for p in PLACEMENTS] for sz in SIZES}
+    summary = [
+        f'- **Detection Precision**: {per_size("det_precision", pct)}',
+        f'- **Detection Recall**: {per_size("det_recall", pct)}',
+        f'- **Classifier Accuracy**: {per_size("classifier_acc", pct)}',
+        f'- **End-to-End F1**: {per_size("e2e_f1", lambda v: f"{v:.4f}")}',
+        f'- **Pure Inference Throughput** (`model(images)` only, batch 128, {device}): '
+        + ', '.join(f'**{rows[sz]["pure_fps"]:,.0f} img/s** ({SIZE_NAMES[sz]})' for sz in SIZES),
+        '',
+        'Per-layout detection recall ranges across `random`, `grid`, `words`, and `line`: '
+        + '; '.join(f'{SIZE_NAMES[sz]} {pct(min(recalls[sz]))}–{pct(max(recalls[sz]))}' for sz in SIZES) + '.',
+    ]
+    blocks = {'summary': '\n'.join(summary)}
+    threshold_bits = ', '.join(
+        f'{SIZE_NAMES[sz]} `{res[sz]["opt_conf"]:.2f}` ({res[sz].get("threshold_source", CONF_SRC_HELDOUT)})'
+        for sz in SIZES)
+    sources = {res[sz].get('threshold_source', CONF_SRC_HELDOUT) for sz in SIZES}
+    if sources == {CONF_SRC_HELDOUT}:
+        blocks['tuning'] = heldout_note('YOLOv8') + ' Selected thresholds: ' + threshold_bits + '.'
+    else:
+        by_source = {}
+        for sz in SIZES:
+            by_source.setdefault(res[sz].get('threshold_source', CONF_SRC_HELDOUT), []).append(SIZE_NAMES[sz])
+        provenance = []
+        for source, names in by_source.items():
+            label = ' and '.join(names)
+            verb = 'use' if len(names) > 1 else 'uses'
+            if source == CONF_SRC_HELDOUT:
+                provenance.append(f'{label} {verb} the held-out tuning set (`data/OD_benchmark/tune/random`)')
+            elif source == CONF_SRC_TEST_SWEEP:
+                provenance.append(f'{label} {verb} an explicit benchmark test-sweep override')
+            else:
+                provenance.append(f'{label} {verb} {source}')
+        blocks['tuning'] = (
+            'YOLOv8 confidence thresholds are recorded per size. ' + '; '.join(provenance) + '. '
+            f'Selected thresholds: {threshold_bits}.'
+        )
+
+    out = ['| Size Preset | Model Name | Total Parameters | Prediction Scales | Optimal `conf` | Checkpoint File |',
+           '|:---|:---|:---:|:---:|:---:|:---|']
+    for sz in SIZES:
+        row = rows[sz]
+        out.append(f'| **{SIZE_NAMES[sz]} (`{sz}`)** | `YOLOv8ObjectDetector` | **{row["params"]:,}** '
+                   f'({millions(row["params"])}) | 28 × 28, 14 × 14 | `{row["conf"]:.2f}` | `{row["checkpoint"]}` |')
+    out += ['', '_Parameter counts are read from each trained checkpoint state_dict, excluding BatchNorm buffers._']
+    blocks['params'] = '\n'.join(out)
+
+    blocks['results'] = '\n\n'.join(
+        layout_table(rows[sz], f'### {SIZE_ICONS[sz]} YOLOv8 {SIZE_NAMES[sz]} — '
+                     f'{millions(rows[sz]["params"])} Params (`conf = {res[sz]["opt_conf"]:.2f}`)')
+        for sz in SIZES)
+
+    out = ['| Size | Pure Inference (median) | Pure Inference (min–max over repeats) | '
+           'Eval-Loop Throughput (avg of 4 layouts) | Eval-Loop range across layouts |',
+           '|:---|:---:|:---:|:---:|:---:|']
+    for sz in SIZES:
+        repeats = res[sz]['pure_inference']['repeat_img_s']
+        loop = [res[sz]['placements'][p]['eval_loop_fps'] for p in PLACEMENTS]
+        out.append(f'| **{SIZE_NAMES[sz]}** | **{rows[sz]["pure_fps"]:,.1f} img/s** | '
+                   f'{min(repeats):,.1f}–{max(repeats):,.1f} | {rows[sz]["loop_fps"]:.1f} img/s | '
+                   f'{min(loop):.1f}–{max(loop):.1f} |')
+    pure = res[SIZES[0]]['pure_inference']
+    out += ['', f'- Pure inference times only `model(images)` on {device}-resident batches of {pure["batch_size"]}; '
+                f'it uses at least {pure["warmup_sec"]:.0f} seconds of warm-up and {pure["repeats"]} repeats × '
+                f'{pure["iters_per_repeat"]} synchronized forward passes. The median is reported.',
+            '- Eval-loop throughput includes image loading, target collation, decoding, NMS, device transfers, and '
+            'Hungarian matching; it is context for the full evaluation path rather than a model-only speed measure.']
+    blocks['throughput'] = '\n'.join(out)
+
+    density = load_json(YOLOV8_DENSITY)
+    stale = [sz for sz in SIZES if abs(density[sz]['conf'] - res[sz]['opt_conf']) > 1e-9]
+    out = ['Density recall uses the thresholds recorded in `benchmark/yolov8_results.json` and IoU 0.50.',
+           'Threshold provenance: ' + ', '.join(
+               f'{SIZE_NAMES[sz]} {res[sz].get("threshold_source", CONF_SRC_HELDOUT)}' for sz in SIZES) + '.']
+    if stale:
+        out += ['', '> [!CAUTION]', '> The density sweep thresholds differ from the latest tuned thresholds for: '
+                + ', '.join(f'{SIZE_NAMES[sz]} ({density[sz]["conf"]:.2f} vs. {res[sz]["opt_conf"]:.2f})' for sz in stale)
+                + '. Rerun `scripts/run_density_sweep.py --detector yolov8`.']
+    for placement in PLACEMENTS:
+        cols = [(f'YOLOv8 {SIZE_NAMES[sz]} ({millions(rows[sz]["params"])})', density[sz]['layouts'][placement])
+                for sz in SIZES]
+        out += ['', density_table(cols, placement, f'### {DENSITY_LABELS[placement]}')]
+    blocks['density'] = '\n'.join(out)
+
+    out = ['Visuals use each model\'s recorded threshold and the shared ltrb decoder with class-wise NMS.', '']
+    for sz in SIZES:
+        base = f'../result/benchmark/yolov8/{sz}'
+        out += [f'### {SIZE_ICONS[sz]} {SIZE_NAMES[sz]} ({millions(rows[sz]["params"])}) — `conf = {rows[sz]["conf"]:.2f}`', '',
+                '| random | random | grid | grid |', '|:---:|:---:|:---:|:---:|',
+                f'| ![]({base}/random_1.png) | ![]({base}/random_2.png) | ![]({base}/grid_1.png) | ![]({base}/grid_2.png) |',
+                '| **words** | **words** | **line** | **line** |',
+                f'| ![]({base}/words_1.png) | ![]({base}/words_2.png) | ![]({base}/line_1.png) | ![]({base}/line_2.png) |', '']
+    blocks['visuals'] = '\n'.join(out).rstrip()
+    return blocks
+
+
 # ── BENCHMARK.md (master index) ───────────────────────────────────────────────
 
-def render_master(res: dict, params: dict) -> dict:
+def render_master(res: dict, params: dict, yolov8_res: dict) -> dict:
     rows = ([two_stage_row(sz) for sz in SIZES] + [single_stage_row(sz) for sz in ('n', 's', 'm', 'l')]
             + [grid_row(v, sz) for v in ('focal', 'bce', 'k3') for sz in SIZES]
-            + [fcos_row(sz, res, params) for sz in SIZES])
+            + [fcos_row(sz, res, params) for sz in SIZES]
+            + [yolov8_row(sz, yolov8_res) for sz in SIZES])
     blocks = {'master_table': summary_table(rows, 'Architecture Paradigm', with_report=True) + '\n\n' + (
         '_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; '
-        '**fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). '
-        'Averages are unweighted means over the 4 layouts. Non-FCOS params are counted from checkpoint state_dicts._')}
+        '**test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned '
+        'on held-out data (provenance of the Single-Stage values is not recorded). '
+        'Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other '
+        'parameter counts come from checkpoint state_dicts._')}
 
     out = ['| Paradigm | Size | Params | Pure Inference (`model(images)`, batch 128) | Eval-Loop Throughput |',
            '|:---|:---:|:---:|:---:|:---:|']
@@ -550,24 +675,29 @@ def render_master(res: dict, params: dict) -> dict:
 
     legacy = load_json(LEGACY_DENSITY)
     fd = load_json(FCOS_DENSITY)
+    yd = load_json(YOLOV8_DENSITY)
     cols = [('Two-Stage Medium', legacy['two_stage']['m']), ('Single-Stage Medium', legacy['single_stage']['m']),
             ('Grid Medium ($K=1$, BCE)', grid_density('bce', 'm')['layouts']['random']),
             ('Multi-Anchor Medium ($K=3$)', grid_density('k3', 'm')['layouts']['random'])] + \
-           [(f'FCOS {SIZE_NAMES[sz]}', fd[sz]['layouts']['random']) for sz in SIZES]
+           [(f'FCOS {SIZE_NAMES[sz]}', fd[sz]['layouts']['random']) for sz in SIZES] + \
+           [(f'YOLOv8 {SIZE_NAMES[sz]}', yd[sz]['layouts']['random']) for sz in SIZES]
     struct = []
     for p in ('grid', 'words', 'line'):
         struct.append(f'| `{p}` | ' + ' | '.join(
             pct(mean(b['recall'] for b in grid_density(v, 'm')['layouts'][p])) for v in ('bce', 'k3'))
-            + ' | ' + ' | '.join(pct(res[sz]['placements'][p]['det_recall']) for sz in SIZES) + ' |')
+            + ' | ' + ' | '.join(pct(res[sz]['placements'][p]['det_recall']) for sz in SIZES)
+            + ' | ' + ' | '.join(pct(yolov8_res[sz]['placements'][p]['det_recall']) for sz in SIZES) + ' |')
     blocks['density'] = '\n'.join([
         'Recall per ground-truth density bucket on the **`random`** layout (Two-Stage/Single-Stage from '
         '`benchmark/density_sweep_results.json`, Grid/Multi-Anchor from `grid_density_sweep_results.json`, FCOS from '
-        '`fcos_density_sweep_results.json`):', '',
+        '`fcos_density_sweep_results.json`, and YOLOv8 from `yolov8_density_sweep_results.json`):', '',
         density_table(cols, 'random'), '',
         'The `random` layout hides the single-scale grid failure. Recall on the structured layouts '
-        '(Grid/Multi-Anchor: mean over density buckets; FCOS: overall layout recall):', '',
-        '| Layout | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | ' + ' | '.join(f'FCOS {SIZE_NAMES[sz]}' for sz in SIZES) + ' |',
-        '|:---|' + ':---:|' * 5,
+        '(Grid/Multi-Anchor: mean over density buckets; FCOS and YOLOv8: overall layout recall):', '',
+        '| Layout | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | '
+        + ' | '.join(f'FCOS {SIZE_NAMES[sz]}' for sz in SIZES) + ' | '
+        + ' | '.join(f'YOLOv8 {SIZE_NAMES[sz]}' for sz in SIZES) + ' |',
+        '|:---|' + ':---:|' * 8,
     ] + struct)
     return blocks
 
@@ -593,10 +723,12 @@ def render_file(path: Path, blocks: dict) -> None:
 def main():
     res = load_json(FCOS_RESULTS)
     params = fcos_params()
+    yolov8_res = load_json(YOLOV8_RESULTS)
     render_file(FCOS_REPORT, render_report_05(res, params))
+    render_file(YOLOV8_REPORT, render_yolov8_report(yolov8_res))
     render_file(GRID_REPORT, render_report_03())
     render_file(MULTI_ANCHOR_REPORT, render_report_04())
-    render_file(MASTER, render_master(res, params))
+    render_file(MASTER, render_master(res, params, yolov8_res))
 
 
 if __name__ == '__main__':

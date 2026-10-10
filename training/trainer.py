@@ -23,8 +23,8 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from training.losses import pairwise_iou, mean_iou, DetectionLoss, FCOSLoss  # noqa: F401
-from dataio.fcos_targets import FCOSTargets
+from training.losses import pairwise_iou, mean_iou, DetectionLoss, LTRBLoss, FCOSLoss  # noqa: F401
+from dataio.ltrb_targets import LTRBTargets
 try:
     import wandb
 except ImportError:
@@ -59,7 +59,7 @@ def _move_detection_batch_to_device(value, device):
     if isinstance(value, (tuple, list)):
         moved = [_move_detection_batch_to_device(item, device) for item in value]
         return type(value)(moved)
-    if isinstance(value, FCOSTargets):
+    if isinstance(value, LTRBTargets):
         return value.to(device, non_blocking=True)
     return value.to(device, non_blocking=True)
 
@@ -69,12 +69,12 @@ def _loss_value(loss_output):
     return loss_output[0] if isinstance(loss_output, tuple) else loss_output
 
 
-def _prepare_fcos_targets(targets, labels, criterion, device):
-    """Generate deferred FCOS targets directly on the training device."""
+def _prepare_ltrb_targets(targets, labels, criterion, device):
+    """Generate deferred ltrb targets directly on the training device."""
     if targets is not None:
         return targets
-    if not isinstance(criterion, FCOSLoss) or not isinstance(labels, (tuple, list)) or len(labels) != 2:
-        raise ValueError("Deferred FCOS targets require FCOSLoss and (boxes, labels) annotations")
+    if not isinstance(criterion, LTRBLoss) or not isinstance(labels, (tuple, list)) or len(labels) != 2:
+        raise ValueError("Deferred ltrb targets require LTRBLoss and (boxes, labels) annotations")
     boxes_batch, labels_batch = labels
     return criterion.target_generator.generate_targets(boxes_batch, labels_batch, device)
 
@@ -394,7 +394,7 @@ def train_one_epoch_detection(
     """Training loop for multi-object detection.
 
     Expects the detection loader to yield ``(images, targets, labels)``.
-    Targets may be dense detection tensors, FCOS target containers, or per-grid
+    Targets may be dense detection tensors, ltrb target containers, or per-grid
     dictionary outputs keyed by grid size.
 
     With float16 autocast (pre-Ampere GPUs) and scaler=None, a GradScaler is created
@@ -425,7 +425,7 @@ def train_one_epoch_detection(
         images = images.to(device, non_blocking=True)
         targets = _move_detection_batch_to_device(targets, device)
         labels = _move_detection_batch_to_device(labels, device)
-        targets = _prepare_fcos_targets(targets, labels, criterion, device)
+        targets = _prepare_ltrb_targets(targets, labels, criterion, device)
 
         if is_timing:
             torch.cuda.synchronize()
@@ -494,11 +494,11 @@ def train_one_epoch_detection(
 
 
 
-def evaluate_fcos_detection(
+def evaluate_ltrb_detection(
     model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
-    """Evaluate FCOS outputs with centerness-gated class-wise NMS."""
-    from inference.pipeline import _decode_fcos_candidates
+    """Evaluate ltrb-head outputs with class-wise NMS (scores are centerness-gated when the head has one)."""
+    from inference.pipeline import _decode_ltrb_candidates
 
     model.eval()
     total_loss = 0.0
@@ -523,7 +523,7 @@ def evaluate_fcos_detection(
             images = images.to(device, non_blocking=True)
             targets = _move_detection_batch_to_device(targets, device)
             labels = _move_detection_batch_to_device(labels, device)
-            targets = _prepare_fcos_targets(targets, labels, criterion, device)
+            targets = _prepare_ltrb_targets(targets, labels, criterion, device)
 
             with torch.autocast(device_type="cuda", dtype=_amp_dtype(device), enabled=device.type == "cuda"):
                 outputs = model(images)
@@ -531,7 +531,7 @@ def evaluate_fcos_detection(
             total_loss += loss.item()
             total_batches += 1
 
-            candidates = _decode_fcos_candidates(
+            candidates = _decode_ltrb_candidates(
                 model, outputs, score_threshold=conf_threshold, iou_threshold=iou_threshold
             )
             boxes_batch, labels_batch = labels
@@ -655,6 +655,9 @@ def evaluate_fcos_detection(
     }
 
 
+evaluate_fcos_detection = evaluate_ltrb_detection  # former name, kept so existing imports keep working
+
+
 def evaluate_detection(
     model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
@@ -678,8 +681,8 @@ def evaluate_detection(
     For full P/R/F1 threshold sweeps, use ``evaluate_detection_sweep()``.
     Expects loader to yield (images, targets, labels).
     """
-    if isinstance(criterion, FCOSLoss):
-        return evaluate_fcos_detection(
+    if isinstance(criterion, LTRBLoss):
+        return evaluate_ltrb_detection(
             model, loader, criterion, device, conf_threshold, iou_threshold
         )
 

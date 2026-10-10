@@ -1,5 +1,5 @@
 """
-Density-Stratified Benchmark Sweep Script for Grid and FCOS Detectors.
+Density-Stratified Benchmark Sweep Script for Grid, FCOS, and YOLOv8 Detectors.
 
 Evaluates recall drop-off across object density buckets:
   - Bucket 1: 1 - 4 objects/image (sparse)
@@ -13,6 +13,7 @@ Use ``--detector grid`` to run across spatial grid variants:
   - multi_anchor_stage: 3_grid_detector_{n, s, m} (conf = 0.95)
 
 Use ``--detector fcos`` to run across FCOS Nano, Small, and Medium models.
+Use ``--detector yolov8`` to run across YOLOv8 Nano, Small, and Medium models.
 """
 import argparse
 import sys
@@ -27,7 +28,7 @@ sys.path.insert(0, str(root_dir))
 sys.path.append(str(root_dir / 'scripts'))
 
 import torch
-from models import load_detector, load_fcos_detector
+from models import load_detector, load_fcos_detector, load_model
 from models.object_detector_res import ObjectDetectorResNet
 from dataio.dataset import get_detection_loaders
 from inference.pipeline import _decode_fcos_candidates
@@ -41,6 +42,7 @@ BUCKETS = [(1, 4), (5, 8), (9, 12), (13, 16)]
 # Sweeps use the thresholds selected on the held-out tune set by run_single_stage_benchmark.py;
 # the hard-coded confs below are only fallbacks when those results are missing.
 FCOS_RESULTS = Path('benchmark/fcos_results.json')
+YOLOV8_RESULTS = Path('benchmark/yolov8_results.json')
 GRID_RESULTS = Path('benchmark/multi_anchor_results.json')
 GRID_RESULT_NAMES = {
     'grid_focal_stage': 'Grid (K=1, Focal)',
@@ -89,7 +91,7 @@ def _pairwise_iou_xywh(box1, box2):
 
 
 def evaluate_fcos_density_sweep(model, loader, device, conf_threshold=0.50, iou_threshold=0.50, buckets=BUCKETS):
-    """Evaluate FCOS recall by GT-object density bucket using decoded candidates."""
+    """Evaluate anchor-free LTRB detector recall by GT-object density bucket."""
     model.eval()
     records = []
 
@@ -173,45 +175,67 @@ def run_full_density_sweep(detector: str = 'grid'):
     print("  FULL BENCHMARK DENSITY-STRATIFIED SWEEP (ALL LAYOUTS x DENSITY BUCKETS)")
     print("=" * 90)
 
-    if detector == 'fcos':
-        configs = [
-            {'size': 'n', 'name': 'FCOS Nano (0.52M)', 'conf': 0.50},
-            {'size': 's', 'name': 'FCOS Small (1.79M)', 'conf': 0.45},
-            {'size': 'm', 'name': 'FCOS Medium (7.14M)', 'conf': 0.50},
-        ]
+    if detector in ('fcos', 'yolov8'):
+        if detector == 'fcos':
+            configs = [
+                {'size': 'n', 'name': 'FCOS Nano (0.52M)', 'conf': 0.50},
+                {'size': 's', 'name': 'FCOS Small (1.79M)', 'conf': 0.45},
+                {'size': 'm', 'name': 'FCOS Medium (7.14M)', 'conf': 0.50},
+            ]
+            results_path = FCOS_RESULTS
+            out_path = Path('benchmark/fcos_density_sweep_results.json')
+        else:
+            configs = [
+                {'size': sz, 'name': f'YOLOv8 {label}', 'conf': 0.50}
+                for sz, label in (('n', 'Nano'), ('s', 'Small'), ('m', 'Medium'))
+            ]
+            results_path = YOLOV8_RESULTS
+            out_path = Path('benchmark/yolov8_density_sweep_results.json')
+            if not results_path.exists():
+                raise FileNotFoundError(
+                    f"{results_path} is missing; run scripts/run_single_stage_benchmark.py --detector yolov8 first "
+                    "so the density sweep uses held-out tuned thresholds."
+                )
 
         for cfg in configs:
             size = cfg['size']
             name = cfg['name']
-            conf_t = _tuned_conf(FCOS_RESULTS, [size], cfg['conf'])
+            conf_t = _tuned_conf(results_path, [size], cfg['conf'])
             sweep_results[size] = {'name': name, 'conf': conf_t, 'layouts': {}}
             print(f"\n--- {name.upper()} (conf = {conf_t:.2f}) ---")
-            ckpt_path = f'weights/fcos_{size}_28x14_best.pth'
-            if not Path(ckpt_path).exists():
-                ckpt_path = f'checkpoint/fcos_{size}_28x14_best.pth'
+            if detector == 'fcos':
+                ckpt_path = f'weights/fcos_{size}_28x14_best.pth'
+                if not Path(ckpt_path).exists():
+                    ckpt_path = f'checkpoint/fcos_{size}_28x14_best.pth'
+            else:
+                ckpt_path = f'weights/yolov8_{size}_28x14_best.pth'
+                if not Path(ckpt_path).exists():
+                    ckpt_path = f'checkpoint/yolov8_{size}_28x14_best.pth'
             if not Path(ckpt_path).exists():
                 print(f"Skipping {ckpt_path} (not found)")
                 continue
 
-            model = load_fcos_detector(ckpt_path, device=device, size=size)
+            if detector == 'fcos':
+                model = load_fcos_detector(ckpt_path, device=device, size=size)
+            else:
+                model = load_model('yolov8', ckpt_path, device=device, size=size, strict=True)
             for p in PLACEMENTS:
                 data_path = f"{BENCHMARK_ROOT}/{p}"
-                loader = get_detection_loaders(data_path, batch_size=128, test_only=True, num_workers=0, fcos=True)
+                loader = get_detection_loaders(data_path, batch_size=128, test_only=True, num_workers=0, ltrb=True)
                 res = evaluate_fcos_density_sweep(model, loader, device=device, conf_threshold=conf_t, iou_threshold=0.50, buckets=BUCKETS)
                 sweep_results[size]['layouts'][p] = res
                 print(f"  [{p:<6}] " + " | ".join([f"{b['bucket']}: R={b['recall']*100:.1f}% ({b['n_images']} imgs)" for b in res]))
 
-        out_path = Path('benchmark/fcos_density_sweep_results.json')
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, 'w') as f:
             json.dump(sweep_results, f, indent=2)
-        print(f"\nSaved FCOS density sweep results to '{out_path}'")
+        print(f"\nSaved {detector.upper()} density sweep results to '{out_path}'")
         return
 
     for v in VARIANTS:
-        v_name = v['name']
-        prefix = v['prefix']
-        v_sizes = v.get('sizes', ['n', 's', 'm'])
+        v_name = str(v['name'])
+        prefix = str(v['prefix'])
+        v_sizes = [str(size) for size in v.get('sizes', ['n', 's', 'm'])]
         sweep_results[v_name] = {}
 
         print(f"\n--- {v_name.upper()} MODELS ---")
@@ -246,8 +270,8 @@ def run_full_density_sweep(detector: str = 'grid'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run the density sweep for the grid or FCOS detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos'], default='grid', help='Which detector family to evaluate.')
+    parser = argparse.ArgumentParser(description='Run the density sweep for grid, FCOS, or YOLOv8 detector variants.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8'], default='grid', help='Which detector family to evaluate.')
     args = parser.parse_args()
     run_full_density_sweep(detector=args.detector)
 

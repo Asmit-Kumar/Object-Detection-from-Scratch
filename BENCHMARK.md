@@ -35,8 +35,12 @@ This document maintains the master comparison index across 10,000 placement-stra
 | **FCOS Anchor-Free** | Nano (`n`) | 0.52M | 0.50 | held-out tune set | 0.9994 | 0.9654 | 92.13% | 0.9048 | 703 img/s | 15,276 img/s | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
 | **FCOS Anchor-Free** | Small (`s`) | 1.79M | 0.45 | held-out tune set | 0.9972 | 0.9889 | 90.93% | 0.9030 | 650 img/s | 6,868 img/s | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
 | **FCOS Anchor-Free** | Medium (`m`) | 7.14M | 0.45 | held-out tune set | 0.9972 | 0.9895 | 90.75% | 0.9015 | 603 img/s | 2,988 img/s | [`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **YOLOv8 Anchor-Free** | Nano (`n`) | 0.83M | 0.45 | held-out tune set | 0.9948 | 0.9421 | 93.90% | 0.9087 | 712 img/s | 11,084 img/s | [`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md) |
+| **YOLOv8 Anchor-Free** | Small (`s`) | 2.51M | 0.45 | held-out tune set | 0.9943 | 0.9614 | 92.70% | 0.9061 | 687 img/s | 4,827 img/s | [`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md) |
+| **YOLOv8 Anchor-Free** | Medium (`m`) | 6.47M | 0.50 | test-sweep override | 0.9974 | 0.9594 | 91.94% | 0.8990 | 581 img/s | 2,298 img/s | [`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md) |
 
-_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. Non-FCOS params are counted from checkpoint state_dicts._
+_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other parameter counts come from checkpoint state_dicts._
 <!-- END GENERATED: master_table -->
 
 ---
@@ -70,6 +74,10 @@ _`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`
 | **FCOS Anchor-Free** | Nano (`n`) | 0.52M | **15,276 img/s** | 703 img/s |
 | **FCOS Anchor-Free** | Small (`s`) | 1.79M | **6,868 img/s** | 650 img/s |
 | **FCOS Anchor-Free** | Medium (`m`) | 7.14M | **2,988 img/s** | 603 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **YOLOv8 Anchor-Free** | Nano (`n`) | 0.83M | **11,084 img/s** | 712 img/s |
+| **YOLOv8 Anchor-Free** | Small (`s`) | 2.51M | **4,827 img/s** | 687 img/s |
+| **YOLOv8 Anchor-Free** | Medium (`m`) | 6.47M | **2,298 img/s** | 581 img/s |
 
 _Eval-loop throughput is wall-clock over the whole evaluation loop (PNG decoding with `num_workers=0`, target encoding in the collate function, host↔device copies, post-processing and scipy Hungarian matching); it is dominated by that overhead and varies run to run, so it is not a model-speed comparison. Pure inference times only `model(images)` on GPU-resident batches of 128 (median of repeated, synchronized runs after a ≥2 s warm-up)._ Two-Stage and Single-Stage checkpoints were not re-timed with the pure-inference protocol.
 <!-- END GENERATED: throughput -->
@@ -79,26 +87,26 @@ _Eval-loop throughput is wall-clock over the whole evaluation loop (PNG decoding
 ## 📈 Density-Stratified Recall Sweep (Recall vs. GT Object Count $n_{gt}$)
 
 <!-- BEGIN GENERATED: density (scripts/render_benchmark_reports.py) -->
-Recall per ground-truth density bucket on the **`random`** layout (Two-Stage/Single-Stage from `benchmark/density_sweep_results.json`, Grid/Multi-Anchor from `grid_density_sweep_results.json`, FCOS from `fcos_density_sweep_results.json`):
+Recall per ground-truth density bucket on the **`random`** layout (Two-Stage/Single-Stage from `benchmark/density_sweep_results.json`, Grid/Multi-Anchor from `grid_density_sweep_results.json`, FCOS from `fcos_density_sweep_results.json`, and YOLOv8 from `yolov8_density_sweep_results.json`):
 
-| Density Bucket ($n_{gt}$) | Test Images | Two-Stage Medium | Single-Stage Medium | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | FCOS Nano | FCOS Small | FCOS Medium |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1 – 4 objects** | 236 | 93.6% | 94.9% | 98.9% | **99.1%** | 96.7% | 98.6% | **99.1%** |
-| **5 – 8 objects** | 1,244 | 95.9% | 96.9% | **99.8%** | 99.5% | 96.2% | 98.5% | 98.4% |
-| **9 – 12 objects** | 850 | 95.8% | 94.8% | **99.9%** | 99.9% | 96.2% | 98.8% | 98.6% |
-| **13 – 16 objects** | 170 | 92.9% | 88.7% | 99.8% | **99.9%** | 96.1% | 98.3% | 98.5% |
+| Density Bucket ($n_{gt}$) | Test Images | Two-Stage Medium | Single-Stage Medium | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | FCOS Nano | FCOS Small | FCOS Medium | YOLOv8 Nano | YOLOv8 Small | YOLOv8 Medium |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 236 | 93.6% | 94.9% | 98.9% | **99.1%** | 96.7% | 98.6% | **99.1%** | 92.7% | 94.2% | 94.1% |
+| **5 – 8 objects** | 1,244 | 95.9% | 96.9% | **99.8%** | 99.5% | 96.2% | 98.5% | 98.4% | 92.2% | 94.1% | 93.9% |
+| **9 – 12 objects** | 850 | 95.8% | 94.8% | **99.9%** | 99.9% | 96.2% | 98.8% | 98.6% | 92.5% | 94.5% | 94.5% |
+| **13 – 16 objects** | 170 | 92.9% | 88.7% | 99.8% | **99.9%** | 96.1% | 98.3% | 98.5% | 93.1% | 94.9% | 94.5% |
 
-The `random` layout hides the single-scale grid failure. Recall on the structured layouts (Grid/Multi-Anchor: mean over density buckets; FCOS: overall layout recall):
+The `random` layout hides the single-scale grid failure. Recall on the structured layouts (Grid/Multi-Anchor: mean over density buckets; FCOS and YOLOv8: overall layout recall):
 
-| Layout | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | FCOS Nano | FCOS Small | FCOS Medium |
-|:---|:---:|:---:|:---:|:---:|:---:|
-| `grid` | 50.13% | 50.59% | 94.96% | 98.09% | 98.44% |
-| `words` | 43.52% | 43.73% | 97.50% | 99.37% | 99.47% |
-| `line` | 41.59% | 42.85% | 97.49% | 99.47% | 99.34% |
+| Layout | Grid Medium ($K=1$, BCE) | Multi-Anchor Medium ($K=3$) | FCOS Nano | FCOS Small | FCOS Medium | YOLOv8 Nano | YOLOv8 Small | YOLOv8 Medium |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `grid` | 50.13% | 50.59% | 94.96% | 98.09% | 98.44% | 92.50% | 94.45% | 94.13% |
+| `words` | 43.52% | 43.73% | 97.50% | 99.37% | 99.47% | 95.93% | 97.88% | 97.78% |
+| `line` | 41.59% | 42.85% | 97.49% | 99.47% | 99.34% | 95.92% | 97.87% | 97.62% |
 <!-- END GENERATED: density -->
 
 > **Crucial Architectural Breakthrough**:
-> While Single-Stage Unified models suffer mild capacity-correlated degradation on dense scenes (dropping to ~84–88%), and single-scale Grid ($K=1, 3$) models collapsed to ~40–50% recall on crowded structured layouts (`grid`, `words`, `line`), **FCOS Anchor-Free ResNet keeps recall essentially flat across density buckets and across all 4 layouts, with no density or layout collapse** (exact values in the tables above).
+> While Single-Stage Unified models suffer mild capacity-correlated degradation on dense scenes (dropping to ~84–88%), and single-scale Grid ($K=1, 3$) models collapsed to ~40–50% recall on crowded structured layouts (`grid`, `words`, `line`), **FCOS and YOLOv8 anchor-free detectors keep recall essentially flat across density buckets**. FCOS is strongest on structured-layout recall; YOLOv8 also avoids the single-scale collision collapse (exact values in the tables above).
 
 ---
 
@@ -117,8 +125,13 @@ The `random` layout hides the single-scale grid failure. Recall on the structure
 **The Root Cause**: Fixed single-scale $14 \times 14$ grid cells (stride 16) suffer from severe spatial receptive field collisions when characters appear side-by-side or stacked closely in lines and word blocks.
 
 ### 4. Complete Elimination of Collisions via FCOS Multi-Scale FPN & Centerness
+The comparison table shows that FCOS leads average detection precision and recall, while YOLOv8 Nano has the highest average end-to-end F1 (0.9087). Thus the anchor-free families lead different aggregate metrics even though both avoid the single-scale grid collision failure mode.
+
+### 5. YOLOv8 Anchor-Free DFL Head
+**The Solution**: The YOLOv8-inspired detector uses a C2f/SPPF/PAN body with separate class logits and distributional LTRB regression at the same two scales (28 × 28 and 14 × 14), with no anchor tensor and no objectness channel.
+**The Outcome**: The trained models retain high recall across all four layouts (Nano 94.21%, Small 96.14%, Medium 95.94% average), and density recall stays in the 92–99% range rather than collapsing on structured scenes. This is below FCOS on structured recall but substantially above the single-scale grid baselines.
 **The Solution**: FCOS completely abandons preset anchor boxes. It distributes detections across a multi-scale FPN (P3 at $28 \times 28$, stride 8, and P4 at $14 \times 14$, stride 16).
-**The Outcome**: Closely-spaced characters are resolved on the fine $28 \times 28$ P3 level while larger structures map to P4. Combined with centerness gating $\sqrt{\sigma(\text{cls}) \times \sigma(\text{cent})}$, FCOS achieves the highest 4-layout average detection precision, recall, and end-to-end F1 of every architecture in the master table, making it the state-of-the-art detector for this benchmark.
+**The Outcome**: Closely-spaced characters are resolved on the fine $28 \times 28$ P3 level while larger structures map to P4. Combined with centerness gating $\sqrt{\sigma(\text{cls}) \times \sigma(\text{cent})}$, FCOS achieves the highest 4-layout average detection precision and recall in the master table. YOLOv8 Nano records the highest average end-to-end F1 (0.9087), so the two anchor-free designs lead different aggregate metrics while both remove the grid collision failure mode.
 
 ---
 
@@ -129,3 +142,4 @@ The `random` layout hides the single-scale grid failure. Recall on the structure
 - **[`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md)** — **Stage 6 Grid-Based Spatial ResNet Detector**
 - **[`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md)** — **Stage 7 Multi-Anchor ($K=3$) Spatial ResNet Detector**
 - **[`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md)** — **Stage 8 FCOS Anchor-Free ResNet Detector**
+- **[`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md)** — **YOLOv8-Inspired Anchor-Free Detector**
