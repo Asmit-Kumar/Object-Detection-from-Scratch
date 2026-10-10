@@ -19,7 +19,7 @@ import torchvision.transforms.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
 from dataio.reader import Record, DataReader
-from dataio.fcos_targets import FCOSTargetGenerator, FCOSTargets
+from dataio.ltrb_targets import LTRBTargetGenerator, LTRBTargets
 import time
 
 try:
@@ -340,7 +340,8 @@ class DetectionAugment:
 
 class DetectionDataset(Dataset):
     """
-    Dataset wrapping DataReader records for single-stage, multi-anchor, and anchor-free (FCOS) detection.
+    Dataset wrapping DataReader records for single-stage, multi-anchor, and anchor-free ltrb
+    (FCOS, anchor-free YOLOv8) detection.
     """
 
     def __init__(
@@ -350,14 +351,14 @@ class DetectionDataset(Dataset):
             anchors_wh: torch.Tensor | None = None,
             grid_sizes: tuple[int, ...] = (S,),
             anchors_per_scale: int | None = None,
-            fcos: bool = False,
-            defer_fcos_targets: bool = False,
+            ltrb: bool = False,
+            defer_ltrb_targets: bool = False,
     ):
-        self.fcos = fcos
-        self.defer_fcos_targets = defer_fcos_targets
+        self.ltrb = ltrb
+        self.defer_ltrb_targets = defer_ltrb_targets
         self.grid_sizes = tuple(grid_sizes)
 
-        if not fcos:
+        if not ltrb:
             if anchors_wh is None:
                 raise ValueError("DetectionDataset requires anchors_wh fitted from the training split")
             if anchors_wh.ndim != 2 or anchors_wh.size(1) != 2:
@@ -379,13 +380,13 @@ class DetectionDataset(Dataset):
                 )
             self.anchors_wh = anchors_wh.detach().to(dtype=torch.float32, device="cpu").contiguous()
             self.anchors_per_scale = anchors_per_scale
-            self.fcos_target_gen = None
+            self.ltrb_target_gen = None
         else:
-            if defer_fcos_targets and not fcos:
-                raise ValueError("defer_fcos_targets requires fcos=True")
+            if defer_ltrb_targets and not ltrb:
+                raise ValueError("defer_ltrb_targets requires ltrb=True")
             self.anchors_wh = None
             self.anchors_per_scale = 1
-            self.fcos_target_gen = FCOSTargetGenerator(grid_sizes=self.grid_sizes)
+            self.ltrb_target_gen = LTRBTargetGenerator(grid_sizes=self.grid_sizes)
 
         self.reader = reader if reader is not None else DataReader(root=ROOT_DIR / "train")
         self.transform = transform
@@ -416,16 +417,16 @@ class DetectionDataset(Dataset):
     def collate_fn(self, batch):
         """
         Collate records into detection targets.
-        In FCOS mode, generates FCOSTargets directly.
+        In ltrb mode, generates LTRBTargets directly.
         """
-        if self.fcos:
+        if self.ltrb:
             images = torch.stack([r.image for r in batch])
             boxes = [r.boxes for r in batch]
             labels = [r.labels for r in batch]
-            if self.defer_fcos_targets:
+            if self.defer_ltrb_targets:
                 return images, None, (boxes, labels)
-            fcos_targets = self.fcos_target_gen.generate_targets(boxes, labels, device=torch.device("cpu"))
-            return images, fcos_targets, (boxes, labels)
+            ltrb_targets = self.ltrb_target_gen.generate_targets(boxes, labels, device=torch.device("cpu"))
+            return images, ltrb_targets, (boxes, labels)
 
         images = torch.stack([r.image for r in batch])
         B = len(batch)
@@ -510,8 +511,8 @@ def get_detection_loaders(
         anchors_wh: torch.Tensor | None = None,
         grid_sizes: tuple[int, ...] = (S,),
         anchors_per_scale: int | None = None,
-        fcos: bool = False,
-        defer_fcos_targets: bool = False,
+        ltrb: bool = False,
+        defer_ltrb_targets: bool = False,
 ) -> tuple | DataLoader:
     """
     Factory function to construct train, val, or test DataLoaders for detection.
@@ -521,7 +522,7 @@ def get_detection_loaders(
     if not grid_sizes or any(grid_size < 1 for grid_size in grid_sizes):
         raise ValueError("grid_sizes must contain one or more positive grid sizes")
 
-    if not fcos:
+    if not ltrb:
         if anchors_per_scale is None:
             anchors_per_scale = (
                 YOLO_ANCHORS_PER_SCALE
@@ -547,8 +548,8 @@ def get_detection_loaders(
             anchors_wh=anchors_wh,
             grid_sizes=grid_sizes,
             anchors_per_scale=anchors_per_scale,
-            fcos=fcos,
-            defer_fcos_targets=defer_fcos_targets,
+            ltrb=ltrb,
+            defer_ltrb_targets=defer_ltrb_targets,
         )
 
         loader_kwargs = dict(
@@ -566,7 +567,7 @@ def get_detection_loaders(
 
     # Fast path: load ONLY the test set without reading train set metadata
     if test_only:
-        if not fcos and anchors_wh is None:
+        if not ltrb and anchors_wh is None:
             raise ValueError(
                 "test_only requires anchors_wh fitted during training; "
                 "load the tensor saved with the matching checkpoint."
@@ -603,7 +604,7 @@ def get_detection_loaders(
     loaders = []
 
     train_idx = indices[:train_len]
-    if not fcos:
+    if not ltrb:
         if anchors_wh is None:
             anchors_wh = fit_anchors_wh(
                 _collect_box_wh(train_reader, train_idx),

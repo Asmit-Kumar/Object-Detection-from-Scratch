@@ -203,14 +203,17 @@ class Visualizer:
         plt.show()
 
     @staticmethod
-    def visualize_fcos_batch(
+    def visualize_ltrb_batch(
         imgs_v, candidates, gt_boxes=None, gt_labels=None,
         class_names=None, max_images=10,
     ):
-        """Visualize decoded FCOS predictions alongside ground-truth boxes."""
+        """Visualize decoded ltrb-head (FCOS / YOLOv8) predictions alongside ground-truth boxes.
+
+        ``visualize_fcos_batch`` is kept as an alias.
+        """
         n_show = min(max_images, imgs_v.size(0), len(candidates))
         if n_show == 0:
-            print('No images available for FCOS visualisation.')
+            print('No images available for ltrb visualisation.')
             return
 
         columns = min(5, n_show)
@@ -254,9 +257,11 @@ class Visualizer:
 
         for ax in axes[n_show:]:
             ax.axis('off')
-        fig.suptitle('FCOS detections after centerness-gated NMS', fontsize=13)
+        fig.suptitle('Detections after class-wise NMS', fontsize=13)
         plt.tight_layout()
         plt.show()
+
+    visualize_fcos_batch = visualize_ltrb_batch  # former name, kept so existing callers keep working
 
     @staticmethod
     def visualize_pipeline_detections(image, detections, title='End-to-End Pipeline Detections'):
