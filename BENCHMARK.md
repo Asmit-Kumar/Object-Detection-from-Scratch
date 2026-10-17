@@ -39,8 +39,11 @@ This document maintains the master comparison index across 10,000 placement-stra
 | **YOLOv8 Anchor-Free** | Nano (`n`) | 0.83M | 0.45 | held-out tune set | 0.9948 | 0.9421 | 93.90% | 0.9087 | 712 img/s | 11,084 img/s | [`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md) |
 | **YOLOv8 Anchor-Free** | Small (`s`) | 2.51M | 0.45 | held-out tune set | 0.9943 | 0.9614 | 92.70% | 0.9061 | 687 img/s | 4,827 img/s | [`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md) |
 | **YOLOv8 Anchor-Free** | Medium (`m`) | 6.47M | 0.50 | test-sweep override | 0.9974 | 0.9594 | 91.94% | 0.8990 | 581 img/s | 2,298 img/s | [`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **Auxiliary YOLOv8** | Nano (`n`) | 0.83M | 0.40 | held-out tune set | 0.9867 | 0.9814 | 92.18% | 0.9071 | 507 img/s | 8,633 img/s | [`benchmark/07_auxiliary_yolov8_resnet.md`](./benchmark/07_auxiliary_yolov8_resnet.md) |
+| **Auxiliary YOLOv8** | Small (`s`) | 2.51M | 0.45 | held-out tune set | 0.9957 | 0.9586 | 92.81% | 0.9065 | 611 img/s | 4,415 img/s | [`benchmark/07_auxiliary_yolov8_resnet.md`](./benchmark/07_auxiliary_yolov8_resnet.md) |
 
-_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other parameter counts come from checkpoint state_dicts._
+_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other parameter counts come from checkpoint state_dicts. Auxiliary YOLOv8 reports main-only deployment parameters; training-only branch counts are in its report._
 <!-- END GENERATED: master_table -->
 
 ---
@@ -78,6 +81,9 @@ _`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`
 | **YOLOv8 Anchor-Free** | Nano (`n`) | 0.83M | **11,084 img/s** | 712 img/s |
 | **YOLOv8 Anchor-Free** | Small (`s`) | 2.51M | **4,827 img/s** | 687 img/s |
 | **YOLOv8 Anchor-Free** | Medium (`m`) | 6.47M | **2,298 img/s** | 581 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **Auxiliary YOLOv8** | Nano (`n`) | 0.83M | **8,633 img/s** | 507 img/s |
+| **Auxiliary YOLOv8** | Small (`s`) | 2.51M | **4,415 img/s** | 611 img/s |
 
 _Eval-loop throughput is wall-clock over the whole evaluation loop (PNG decoding with `num_workers=0`, target encoding in the collate function, host↔device copies, post-processing and scipy Hungarian matching); it is dominated by that overhead and varies run to run, so it is not a model-speed comparison. Pure inference times only `model(images)` on GPU-resident batches of 128 (median of repeated, synchronized runs after a ≥2 s warm-up)._ Two-Stage and Single-Stage checkpoints were not re-timed with the pure-inference protocol.
 <!-- END GENERATED: throughput -->
@@ -103,6 +109,44 @@ The `random` layout hides the single-scale grid failure. Recall on the structure
 | `grid` | 50.13% | 50.59% | 94.96% | 98.09% | 98.44% | 92.50% | 94.45% | 94.13% |
 | `words` | 43.52% | 43.73% | 97.50% | 99.37% | 99.47% | 95.93% | 97.88% | 97.78% |
 | `line` | 41.59% | 42.85% | 97.49% | 99.47% | 99.34% | 95.92% | 97.87% | 97.62% |
+
+Auxiliary YOLOv8 at held-out tuned thresholds (main-only inference):
+
+### Auxiliary — 🎲 Random Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | Auxiliary Nano | Auxiliary Small |
+|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 236 | **97.5%** | 94.0% |
+| **5 – 8 objects** | 1,244 | **97.0%** | 93.8% |
+| **9 – 12 objects** | 850 | **97.5%** | 94.2% |
+| **13 – 16 objects** | 170 | **97.9%** | 94.3% |
+
+### Auxiliary — 📐 Grid Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | Auxiliary Nano | Auxiliary Small |
+|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 228 | **97.2%** | 93.6% |
+| **5 – 8 objects** | 1,319 | **97.5%** | 94.3% |
+| **9 – 12 objects** | 807 | **97.3%** | 94.1% |
+| **13 – 16 objects** | 146 | **97.2%** | 94.1% |
+
+### Auxiliary — 📝 Words Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | Auxiliary Nano | Auxiliary Small |
+|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 253 | **98.3%** | 97.0% |
+| **5 – 8 objects** | 1,235 | **99.0%** | 97.9% |
+| **9 – 12 objects** | 866 | **98.8%** | 97.5% |
+| **13 – 16 objects** | 137 | **99.3%** | 97.5% |
+
+### Auxiliary — 📏 Line Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | Auxiliary Nano | Auxiliary Small |
+|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 244 | **98.9%** | 97.4% |
+| **5 – 8 objects** | 1,231 | **99.1%** | 97.6% |
+| **9 – 12 objects** | 862 | **98.8%** | 97.5% |
+| **13 – 16 objects** | 149 | **98.8%** | 98.0% |
 <!-- END GENERATED: density -->
 
 > **Crucial Architectural Breakthrough**:
@@ -137,9 +181,12 @@ The comparison table shows that FCOS leads average detection precision and recal
 
 ## 📁 Individual Architecture Benchmark Reports
 
+The auxiliary-supervision experiment did not demonstrate a meaningful end-to-end accuracy improvement over the YOLOv8 baseline under the tested configurations. Nano and Small achieved nearly identical F1, while Nano offered substantially higher inference throughput. Further scaling to Medium was deferred because the available evidence did not justify the additional training cost. See the [auxiliary benchmark report](./benchmark/07_auxiliary_yolov8_resnet.md) for the measurements and limitations.
+
 - **[`benchmark/01_two_stage_resnet.md`](./benchmark/01_two_stage_resnet.md)** — **Stage 4 Two-Stage ResNet Detection Pipeline**
 - **[`benchmark/02_single_stage_unified_resnet.md`](./benchmark/02_single_stage_unified_resnet.md)** — **Stage 5 Single-Stage Unified ResNet Detector**
 - **[`benchmark/03_grid_based_spatial_resnet.md`](./benchmark/03_grid_based_spatial_resnet.md)** — **Stage 6 Grid-Based Spatial ResNet Detector**
 - **[`benchmark/04_multi_anchor_spatial_resnet.md`](./benchmark/04_multi_anchor_spatial_resnet.md)** — **Stage 7 Multi-Anchor ($K=3$) Spatial ResNet Detector**
 - **[`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md)** — **Stage 8 FCOS Anchor-Free ResNet Detector**
 - **[`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md)** — **YOLOv8-Inspired Anchor-Free Detector**
+- **[`benchmark/07_auxiliary_yolov8_resnet.md`](./benchmark/07_auxiliary_yolov8_resnet.md)** — **Auxiliary YOLOv8 Nano and Small, Main-Only Inference**

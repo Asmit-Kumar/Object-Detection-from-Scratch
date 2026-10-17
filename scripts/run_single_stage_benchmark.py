@@ -17,6 +17,7 @@ import argparse
 import sys
 import time
 import json
+import hashlib
 from pathlib import Path
 
 root_dir = Path(__file__).resolve().parent.parent
@@ -358,6 +359,7 @@ class FCOSPipeline:
 
         best_f1 = -1.0
         best_t = 0.50
+        self.threshold_sweep = []
         for t in thresholds:
             t = round(float(t), 2)
             det_tp = 0
@@ -401,6 +403,10 @@ class FCOSPipeline:
             e2e_p = e2e_tp / max(1, total_preds)
             e2e_r = e2e_tp / max(1, total_gt)
             e2e_f1 = (2 * e2e_p * e2e_r) / max(1e-6, e2e_p + e2e_r)
+            self.threshold_sweep.append({'conf': t, 'e2e_precision': e2e_p,
+                                         'e2e_recall': e2e_r, 'e2e_f1': e2e_f1,
+                                         'det_tp': det_tp, 'e2e_tp': e2e_tp,
+                                         'total_preds': total_preds, 'total_gt': total_gt})
             if e2e_f1 > best_f1:
                 best_f1 = e2e_f1
                 best_t = t
@@ -513,6 +519,21 @@ class YOLOv8Pipeline(FCOSPipeline):
         self.architecture = f'YOLOv8ObjectDetector ({self.size})'
 
 
+class AuxiliaryPipeline(FCOSPipeline):
+    """Strictly load the trained model, then remove the training-only branch."""
+
+    def __init__(self, size='s', ckpt_path=None, device='cuda', conf_threshold=0.50):
+        self.size = size.lower()
+        self.device = str(device)
+        self.conf_threshold = conf_threshold
+        weights = Path(f'weights/auxiliary_{self.size}_28x14_best.pth')
+        self.checkpoint_path = str(ckpt_path or (weights if weights.exists() else
+                                  Path(f'checkpoint/auxiliary_{self.size}_28x14_best.pth')))
+        trained = load_model('auxiliary', self.checkpoint_path, device=device, size=self.size, strict=True)
+        self.training_params = sum(p.numel() for p in trained.parameters())
+        self.model = trained.to_inference()
+
+
 def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path: str = None):
     if fixed_conf is not None and not 0.0 <= fixed_conf <= 1.0:
         raise ValueError(f'fixed_conf must be between 0 and 1, got {fixed_conf}')
@@ -520,16 +541,16 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     all_results = {}
 
-    if detector in ('fcos', 'yolov8'):
-        family_name = 'FCOS' if detector == 'fcos' else 'YOLOv8'
-        pipeline_cls = FCOSPipeline if detector == 'fcos' else YOLOv8Pipeline
+    if detector in ('fcos', 'yolov8', 'auxiliary'):
+        family_name = {'fcos': 'FCOS', 'yolov8': 'YOLOv8', 'auxiliary': 'Auxiliary YOLOv8'}[detector]
+        pipeline_cls = {'fcos': FCOSPipeline, 'yolov8': YOLOv8Pipeline, 'auxiliary': AuxiliaryPipeline}[detector]
         print("=" * 90)
         threshold_mode = 'FIXED THRESHOLD' if fixed_conf is not None else 'AUTO-TUNED THRESHOLDS'
         print(f"  {family_name.upper()} ANCHOR-FREE DETECTOR BENCHMARK ({threshold_mode})")
         print(f"  Device: {device} | 10,000 Test Images across 4 Placements")
         print("=" * 90)
 
-        for sz in SIZES:
+        for sz in (['n', 's'] if detector == 'auxiliary' else SIZES):
             print(f"\nEvaluating {family_name} Preset: '{sz.upper()}'...")
             pipe_tune = pipeline_cls(size=sz, device=device, conf_threshold=0.50)
             tune_loader = get_detection_loaders(
@@ -556,6 +577,18 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
                 'placements': {},
                 'summary': {},
             }
+            if detector == 'auxiliary':
+                all_results[sz].update({
+                    'threshold_sweep': getattr(pipe_tune, 'threshold_sweep', []),
+                    'selection_metric': 'held-out E2E F1' if fixed_conf is None else None,
+                    'checkpoint': pipe.checkpoint_path,
+                    'checkpoint_sha256': hashlib.sha256(Path(pipe.checkpoint_path).read_bytes()).hexdigest(),
+                    'training_params': pipe.training_params,
+                    'inference_params': sum(p.numel() for p in pipe.model.parameters()),
+                    'gpu': torch.cuda.get_device_name(0) if device == 'cuda' else None,
+                    'torch_version': torch.__version__,
+                    'precision': 'float32', 'nms_iou': 0.45, 'match_iou': 0.50,
+                })
 
             total_det_p = 0.0
             total_det_r = 0.0
@@ -717,7 +750,7 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run the benchmark for grid, FCOS, or YOLOv8 detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8'], default='grid', help='Which detector family to evaluate.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary'], default='grid', help='Which detector family to evaluate.')
     parser.add_argument('--confidence-threshold', type=float, default=None, dest='fixed_conf',
                         help='Use a fixed confidence threshold instead of held-out tuning.')
     parser.add_argument('--output', default=None, dest='output_path',
