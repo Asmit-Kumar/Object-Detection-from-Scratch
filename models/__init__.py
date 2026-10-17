@@ -47,6 +47,7 @@ from models.configs import FCOS_PRESETS, GRID_PRESETS, YOLOV8_PRESETS, get_prese
 from models.grid_detector import ObjectDetectorResNet
 from models.multiscale_detector import MultiScaleObjectDetectorResNet
 from models.yolov8_detector import YOLOv8ObjectDetector
+from models.auxiliary_network_detector import AuxiliaryObjectDetector
 from models.fcos_detector import FCOSObjectDetectorResNet
 from models.character_classifier_resnet import CharacterClassifierResNet
 from models.archive import (
@@ -64,6 +65,7 @@ __all__ = [
     "ObjectDetectorResNet",
     "MultiScaleObjectDetectorResNet",
     "YOLOv8ObjectDetector",
+    "AuxiliaryObjectDetector",
     "FCOSObjectDetectorResNet",
     "CharacterClassifierResNet",
     "SingleBoxCNN",
@@ -93,6 +95,7 @@ _REGISTRY = {
     "grid": (ObjectDetectorResNet, GRID_PRESETS),
     "multiscale": (MultiScaleObjectDetectorResNet, GRID_PRESETS),
     "yolov8": (YOLOv8ObjectDetector, YOLOV8_PRESETS),
+    "auxiliary": (AuxiliaryObjectDetector, YOLOV8_PRESETS),
     "fcos": (FCOSObjectDetectorResNet, FCOS_PRESETS),
     "classifier": (CharacterClassifierResNet, None),
     # Earlier architectures (models/archive/), kept so their checkpoints still load.

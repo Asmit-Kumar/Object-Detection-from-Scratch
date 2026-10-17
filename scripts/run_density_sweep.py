@@ -33,7 +33,7 @@ from models.object_detector_res import ObjectDetectorResNet
 from dataio.dataset import get_detection_loaders
 from inference.pipeline import _decode_fcos_candidates
 from training.trainer import evaluate_density_sweep
-from run_single_stage_benchmark import SingleStagePipeline
+from run_single_stage_benchmark import SingleStagePipeline, AuxiliaryPipeline
 
 BENCHMARK_ROOT = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -175,7 +175,7 @@ def run_full_density_sweep(detector: str = 'grid'):
     print("  FULL BENCHMARK DENSITY-STRATIFIED SWEEP (ALL LAYOUTS x DENSITY BUCKETS)")
     print("=" * 90)
 
-    if detector in ('fcos', 'yolov8'):
+    if detector in ('fcos', 'yolov8', 'auxiliary'):
         if detector == 'fcos':
             configs = [
                 {'size': 'n', 'name': 'FCOS Nano (0.52M)', 'conf': 0.50},
@@ -186,14 +186,15 @@ def run_full_density_sweep(detector: str = 'grid'):
             out_path = Path('benchmark/fcos_density_sweep_results.json')
         else:
             configs = [
-                {'size': sz, 'name': f'YOLOv8 {label}', 'conf': 0.50}
+                {'size': sz, 'name': f'{"Auxiliary YOLOv8" if detector == "auxiliary" else "YOLOv8"} {label}', 'conf': 0.50}
                 for sz, label in (('n', 'Nano'), ('s', 'Small'), ('m', 'Medium'))
+                if detector != 'auxiliary' or sz != 'm'
             ]
-            results_path = YOLOV8_RESULTS
-            out_path = Path('benchmark/yolov8_density_sweep_results.json')
+            results_path = Path(f'benchmark/{detector}_results.json')
+            out_path = Path(f'benchmark/{detector}_density_sweep_results.json')
             if not results_path.exists():
                 raise FileNotFoundError(
-                    f"{results_path} is missing; run scripts/run_single_stage_benchmark.py --detector yolov8 first "
+                    f"{results_path} is missing; run scripts/run_single_stage_benchmark.py --detector {detector} first "
                     "so the density sweep uses held-out tuned thresholds."
                 )
 
@@ -208,15 +209,17 @@ def run_full_density_sweep(detector: str = 'grid'):
                 if not Path(ckpt_path).exists():
                     ckpt_path = f'checkpoint/fcos_{size}_28x14_best.pth'
             else:
-                ckpt_path = f'weights/yolov8_{size}_28x14_best.pth'
+                ckpt_path = f'weights/{detector}_{size}_28x14_best.pth'
                 if not Path(ckpt_path).exists():
-                    ckpt_path = f'checkpoint/yolov8_{size}_28x14_best.pth'
+                    ckpt_path = f'checkpoint/{detector}_{size}_28x14_best.pth'
             if not Path(ckpt_path).exists():
                 print(f"Skipping {ckpt_path} (not found)")
                 continue
 
             if detector == 'fcos':
                 model = load_fcos_detector(ckpt_path, device=device, size=size)
+            elif detector == 'auxiliary':
+                model = AuxiliaryPipeline(size=size, ckpt_path=ckpt_path, device=device).model
             else:
                 model = load_model('yolov8', ckpt_path, device=device, size=size, strict=True)
             for p in PLACEMENTS:
@@ -271,7 +274,7 @@ def run_full_density_sweep(detector: str = 'grid'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run the density sweep for grid, FCOS, or YOLOv8 detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8'], default='grid', help='Which detector family to evaluate.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary'], default='grid', help='Which detector family to evaluate.')
     args = parser.parse_args()
     run_full_density_sweep(detector=args.detector)
 

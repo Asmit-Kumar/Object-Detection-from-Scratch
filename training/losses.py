@@ -288,6 +288,7 @@ class LTRBLoss(nn.Module):
             focal_alpha: float = 0.25,
             focal_gamma: float = 2.0,
             grid_sizes: tuple[int, int] = (28, 14),
+            lambda_aux: float = 0.5,
     ):
         super().__init__()
         self.lambda_reg = lambda_reg
@@ -295,11 +296,13 @@ class LTRBLoss(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.grid_sizes = grid_sizes
+        self.lambda_aux = lambda_aux
         self.target_generator = LTRBTargetGenerator(grid_sizes=grid_sizes)
 
     def forward(
             self,
-            preds_by_scale: Mapping[int, Mapping[str, torch.Tensor]],
+            preds_by_scale: Mapping[int, Mapping[str, torch.Tensor]]
+                | Mapping[str, Mapping[int, Mapping[str, torch.Tensor]]],
             targets: LTRBTargets | tuple[list[torch.Tensor], list[torch.Tensor]],
             labels: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -315,6 +318,10 @@ class LTRBLoss(nn.Module):
         Returns:
             (total_loss, loss_dict)
         """
+        auxiliary_preds = None
+        if "main" in preds_by_scale:
+            auxiliary_preds = preds_by_scale["aux"]
+            preds_by_scale = preds_by_scale["main"]
         device = next(iter(preds_by_scale.values()))["cls_logits"].device
 
         if not isinstance(targets, LTRBTargets):
@@ -399,13 +406,22 @@ class LTRBLoss(nn.Module):
             + self.lambda_centerness * cent_loss_norm
         )
 
-        return total_loss, {
+        parts = {
             "loss": total_loss.item(),
             "cls_loss": cls_loss_norm.item(),
             "reg_loss": reg_loss_norm.item(),
             "cent_loss": cent_loss_norm.item(),
             "num_pos": total_num_pos,
         }
+        if auxiliary_preds is not None:
+            auxiliary_loss, auxiliary_parts = self(auxiliary_preds, ltrb_targets)
+            parts["main_loss"] = total_loss.item()
+            parts["aux_loss"] = auxiliary_loss.item()
+            total_loss = total_loss + self.lambda_aux * auxiliary_loss
+            parts["loss"] = total_loss.item()
+            for key in ("cls_loss", "reg_loss", "cent_loss"):
+                parts[key] += self.lambda_aux * auxiliary_parts[key]
+        return total_loss, parts
 
 
 FCOSLoss = LTRBLoss  # former name, kept so existing imports keep working

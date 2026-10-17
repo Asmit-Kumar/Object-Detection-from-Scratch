@@ -35,7 +35,7 @@ from models import load_fcos_detector, load_model
 from models.object_detector_res import ObjectDetectorResNet
 from generator.dataset import EMNIST_CLASS_NAMES
 from inference.pipeline import _decode_fcos_candidates
-from run_single_stage_benchmark import SingleStagePipeline
+from run_single_stage_benchmark import SingleStagePipeline, AuxiliaryPipeline
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -73,47 +73,50 @@ VARIANTS = [
 def generate_visuals(detector: str = 'grid'):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if detector in ('fcos', 'yolov8'):
-        family_name = 'FCOS' if detector == 'fcos' else 'YOLOv8'
+    if detector in ('fcos', 'yolov8', 'auxiliary'):
+        family_name = {'fcos': 'FCOS', 'yolov8': 'YOLOv8', 'auxiliary': 'Auxiliary YOLOv8'}[detector]
+        sizes = ['n', 's'] if detector == 'auxiliary' else SIZES
         print(f"Generating {family_name} visual detection grids on {device}...")
         opt_confs = {'n': 0.50, 's': 0.45, 'm': 0.50} if detector == 'fcos' else {}
         results_p = Path(f'benchmark/{detector}_results.json')
-        if detector == 'yolov8' and not results_p.exists():
+        if detector in ('yolov8', 'auxiliary') and not results_p.exists():
             raise FileNotFoundError(
-                f"{results_p} is missing; run scripts/run_single_stage_benchmark.py --detector yolov8 first."
+                f"{results_p} is missing; run scripts/run_single_stage_benchmark.py --detector {detector} first."
             )
         if results_p.exists():
             try:
                 with open(results_p) as f:
                     data = jsonlib.load(f)
-                for sz in SIZES:
+                for sz in sizes:
                     if sz in data and 'opt_conf' in data[sz]:
                         opt_confs[sz] = data[sz]['opt_conf']
-                if detector == 'yolov8' and any(sz not in data or 'opt_conf' not in data[sz] for sz in SIZES):
-                    raise ValueError(f"{results_p} does not contain tuned thresholds for Nano, Small, and Medium.")
+                if detector in ('yolov8', 'auxiliary') and any(sz not in data or 'opt_conf' not in data[sz] for sz in sizes):
+                    raise ValueError(f"{results_p} does not contain tuned thresholds for sizes {sizes}.")
             except Exception:
-                if detector == 'yolov8':
+                if detector in ('yolov8', 'auxiliary'):
                     raise
 
-        for sz in SIZES:
+        for sz in sizes:
             if detector == 'fcos':
                 ckpt_path = f'weights/fcos_{sz}_28x14_best.pth'
                 if not Path(ckpt_path).exists():
                     ckpt_path = f'checkpoint/fcos_{sz}_28x14_best.pth'
             else:
-                ckpt_path = f'weights/yolov8_{sz}_28x14_best.pth'
+                ckpt_path = f'weights/{detector}_{sz}_28x14_best.pth'
                 if not Path(ckpt_path).exists():
-                    ckpt_path = f'checkpoint/yolov8_{sz}_28x14_best.pth'
+                    ckpt_path = f'checkpoint/{detector}_{sz}_28x14_best.pth'
             if not Path(ckpt_path).exists():
                 print(f"Skipping {ckpt_path} (not found)")
                 continue
 
             conf_thresh = opt_confs[sz]
-            out_dir = Path('result/benchmark/fcos_stage' if detector == 'fcos' else 'result/benchmark/yolov8') / sz
+            out_dir = Path('result/benchmark/fcos_stage' if detector == 'fcos' else f'result/benchmark/{detector}') / sz
             out_dir.mkdir(parents=True, exist_ok=True)
             print(f"\n[{family_name} {sz.upper()}] Loading model (conf={conf_thresh:.2f})...")
             if detector == 'fcos':
                 model = load_fcos_detector(ckpt_path, device=device, size=sz)
+            elif detector == 'auxiliary':
+                model = AuxiliaryPipeline(size=sz, ckpt_path=ckpt_path, device=device).model
             else:
                 model = load_model('yolov8', ckpt_path, device=device, size=sz, strict=True)
             model.eval()
@@ -272,6 +275,6 @@ def generate_visuals(detector: str = 'grid'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate benchmark visuals for grid, FCOS, or YOLOv8 detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8'], default='grid', help='Which detector family to render.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary'], default='grid', help='Which detector family to render.')
     args = parser.parse_args()
     generate_visuals(detector=args.detector)
