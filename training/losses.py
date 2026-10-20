@@ -17,6 +17,7 @@ import time
 from torchvision.ops import sigmoid_focal_loss
 
 from dataio.ltrb_targets import LTRBTargetGenerator, LTRBTargets
+from dataio.task_aligned import TaskAlignedAssigner, flatten_ltrb_predictions
 
 
 # ── IoU Helpers ───────────────────────────────────────────────────────────────
@@ -422,6 +423,58 @@ class LTRBLoss(nn.Module):
             for key in ("cls_loss", "reg_loss", "cent_loss"):
                 parts[key] += self.lambda_aux * auxiliary_parts[key]
         return total_loss, parts
+
+
+class YOLOv10Loss(LTRBLoss):
+    requires_raw_annotations = True
+
+    def __init__(self, lambda_reg=1.0, lambda_aux=0.5, grid_sizes=(28, 14),
+                 topk=10, alpha=0.5, beta=6.0):
+        super().__init__(lambda_reg=lambda_reg, lambda_aux=lambda_aux, grid_sizes=grid_sizes)
+        self.one_to_one = TaskAlignedAssigner(1, alpha, beta)
+        self.one_to_many = TaskAlignedAssigner(topk, alpha, beta)
+
+    def _branch_loss(self, predictions, annotations, assigner):
+        logits, distances, points, boxes = flatten_ltrb_predictions(
+            predictions, self.target_generator.strides, self.grid_sizes,
+        )
+        targets = assigner(logits.detach(), boxes.detach(), points, *annotations)
+        weights = targets.scores.sum(-1)
+        normalizer = weights.sum().clamp_min(1.0)
+        cls = F.binary_cross_entropy_with_logits(logits, targets.scores, reduction="sum") / normalizer
+        positive = targets.matched_gt >= 0
+        reg = (distances * 0).sum()
+        if positive.any():
+            reg = (giou_loss_ltrb(distances[positive], targets.ltrb[positive]) * weights[positive]).sum() / normalizer
+        loss = cls + self.lambda_reg * reg
+        return loss, {"cls_loss": cls.item(), "reg_loss": reg.item(),
+                      "cent_loss": 0.0, "num_pos": positive.sum().item()}
+
+    def forward(self, preds_by_scale: Mapping, targets, labels=None):
+        predictions = preds_by_scale
+        # Dense FCOS targets cannot encode prediction-dependent assignments.
+        if isinstance(labels, (tuple, list)) and len(labels) == 2 and (
+            targets is None or isinstance(targets, LTRBTargets)
+        ):
+            annotations = labels
+        elif labels is None and isinstance(targets, (tuple, list)) and len(targets) == 2:
+            annotations = targets
+        elif targets is not None and labels is not None and not isinstance(targets, LTRBTargets):
+            annotations = (targets, labels)
+        else:
+            raise ValueError("YOLOv10Loss requires raw (boxes_batch, labels_batch) annotations")
+        main = predictions["main"] if "main" in predictions else predictions
+        total, parts = self._branch_loss(main, annotations, self.one_to_one)
+        parts["main_loss"] = total.item()
+        if "aux" in predictions:
+            auxiliary, aux_parts = self._branch_loss(predictions["aux"], annotations, self.one_to_many)
+            total = total + self.lambda_aux * auxiliary
+            parts["aux_loss"] = auxiliary.item()
+            parts["aux_num_pos"] = aux_parts["num_pos"]
+            for name in ("cls_loss", "reg_loss"):
+                parts[name] += self.lambda_aux * aux_parts[name]
+        parts["loss"] = total.item()
+        return total, parts
 
 
 FCOSLoss = LTRBLoss  # former name, kept so existing imports keep working
