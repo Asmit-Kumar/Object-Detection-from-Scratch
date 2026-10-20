@@ -8,6 +8,7 @@ block is read from its source here, never hand-copied. Everything outside the ma
 Sources:
   - benchmark/fcos_results.json, fcos_cls_diagnostics.json, fcos_density_sweep_results.json
   - benchmark/yolov8_results.json, yolov8_density_sweep_results.json
+  - benchmark/yolov10_results.json, yolov10_density_sweep_results.json, yolov10_provenance.json
   - benchmark/multi_anchor_results.json (+ .pre_tune_fix.json for the before/after table),
     grid_density_sweep_results.json                     (Grid K=1 Focal/BCE, Multi-Anchor K=3)
   - benchmark/single_stage_results.json, density_sweep_results.json   (Single-Stage, Two-Stage density)
@@ -39,6 +40,9 @@ YOLOV8_DENSITY = B / 'yolov8_density_sweep_results.json'
 AUXILIARY_RESULTS = B / 'auxiliary_results.json'
 AUXILIARY_DENSITY = B / 'auxiliary_density_sweep_results.json'
 AUXILIARY_REPORT = B / '07_auxiliary_yolov8_resnet.md'
+YOLOV10_RESULTS = B / 'yolov10_results.json'
+YOLOV10_DENSITY = B / 'yolov10_density_sweep_results.json'
+YOLOV10_REPORT = B / '08_yolov10_nms_free.md'
 GRID_RESULTS = B / 'multi_anchor_results.json'
 GRID_RESULTS_BEFORE = B / 'multi_anchor_results.pre_tune_fix.json'
 GRID_DENSITY = B / 'grid_density_sweep_results.json'
@@ -181,6 +185,100 @@ def yolov8_row(size: str, res: dict) -> dict:
                 d.get('threshold_source', CONF_SRC_HELDOUT),
                 d['placements'], 'eval_loop_fps', d['pure_inference']['median_img_s'],
                 extra={'report': YOLOV8_REPORT.name, 'checkpoint': checkpoint})
+
+
+def yolov10_row(size: str, res: dict) -> dict:
+    d = res[size]
+    row = _row('YOLOv10-style NMS-free', size, d['inference_params'], d['opt_conf'],
+               d['threshold_source'], d['placements'], 'eval_loop_fps',
+               d['pure_inference']['median_img_s'], extra={'report': YOLOV10_REPORT.name})
+    row['avg'] = {key: d['summary'][f'avg_{key}'] for key in row['avg']}
+    return row
+
+
+def render_yolov10_report(res: dict) -> dict:
+    sizes = list(res)
+    rows = {sz: yolov10_row(sz, res) for sz in sizes}
+    provenance = load_json(B / 'yolov10_provenance.json')
+    blocks = {'summary': summary_table(list(rows.values()), 'Architecture')}
+    out = [heldout_note('YOLOv10-style'), '',
+           'The unchanged benchmark sweep tests confidence 0.20–0.80 in 0.05 steps. '
+           'Selection maximizes E2E F1; ties choose the lower threshold. Final four-layout evaluation '
+           'uses the selected threshold; the full sweep and final metrics are saved together. '
+           'This differs from notebook detection-only threshold selection.', '',
+           'These thresholds are best only within the tested 0.20–0.80 range. Confidence 0.10 was not '
+           'evaluated in this held-out sweep. The notebook sweep selected 0.10 for class-agnostic detection '
+           'F1 on its own evaluation split, which does not establish the best held-out E2E threshold. '
+           'An expanded lower-threshold audit reporting both detection F1 and E2E F1 remains pending; '
+           'the current threshold selections are provisional.', '',
+           '| Size | Selected confidence | Held-out E2E F1 |', '|:---|:---:|:---:|']
+    for sz in sizes:
+        best = max(res[sz]['threshold_sweep'], key=lambda r: r['e2e_f1'])
+        assert best['conf'] == res[sz]['opt_conf']
+        out.append(f'| {SIZE_NAMES[sz]} | {best["conf"]:.2f} | {best["e2e_f1"]:.6f} |')
+    blocks['tuning'] = '\n'.join(out)
+    out = ['| Size | Training parameters | Main-only parameters | Best checkpoint | SHA-256 |',
+           '|:---|:---:|:---:|:---|:---|']
+    for sz in sizes:
+        d = res[sz]
+        out.append(f'| {SIZE_NAMES[sz]} | {d["training_params"]:,} | {d["inference_params"]:,} | '
+                   f'`{d["checkpoint"]}` | `{d["checkpoint_sha256"]}` |')
+    out += ['', 'All checkpoints load strictly. CUDA checks verified exact predictions before and after '
+            '`to_inference()` removes the auxiliary network; decoding also passed with both NMS functions '
+            'patched to raise if called.', '',
+            '| Size | Completed epochs | Best validation epoch | Best validation E2E F1 | Training time | Log |',
+            '|:---|:---:|:---:|:---:|:---:|:---|']
+    for sz in sizes:
+        d = provenance['models'][sz]
+        out.append(f'| {SIZE_NAMES[sz]} | {d["completed_epochs"]} | {d["best_validation_epoch"]} | '
+                   f'{d["best_validation_metric"]:.4f} | {d["training_time_min"]:.1f} min | `{d["log"]}` |')
+    blocks['params'] = '\n'.join(out)
+    blocks['results'] = '\n\n'.join(layout_table(rows[sz], f'### YOLOv10-style {SIZE_NAMES[sz]}') for sz in sizes)
+    out = ['| Size | Median pure inference | Repeat range | Eval-loop average |', '|:---|:---:|:---:|:---:|']
+    for sz in sizes:
+        rates = res[sz]['pure_inference']['repeat_img_s']
+        out.append(f'| {SIZE_NAMES[sz]} | {rows[sz]["pure_fps"]:,.1f} img/s | '
+                   f'{min(rates):,.1f}–{max(rates):,.1f} | {rows[sz]["loop_fps"]:.1f} img/s |')
+    d = res[sizes[0]]
+    out += ['', f'Measured on {d["gpu"]}, PyTorch {d["torch_version"]}, float32, batch 128. '
+            'Pure inference uses GPU-resident real images, at least 2 seconds of warm-up, and 11 repeats '
+            'of 30 forward passes synchronized around each repeat. It excludes transfers, decoding, '
+            'score filtering/top-k and matching. It therefore does not measure savings from removing NMS.', '',
+            'Eval-loop throughput includes PNG loading, target collation, transfers, NMS-free decoding '
+            'and Hungarian matching. It varies with CPU and I/O overhead and is not a model-only speed measure. '
+            'Historical baseline throughput was measured in different sessions.']
+    blocks['throughput'] = '\n'.join(out)
+    density = load_json(YOLOV10_DENSITY)
+    for sz in sizes:
+        assert density[sz]['conf'] == res[sz]['opt_conf']
+    blocks['density'] = '\n\n'.join(density_table(
+        [(f'YOLOv10-style {SIZE_NAMES[sz]}', density[sz]['layouts'][p]) for sz in sizes], p,
+        f'### {DENSITY_LABELS[p]}\n') for p in PLACEMENTS)
+    baseline = load_json(YOLOV8_RESULTS)
+    auxiliary = load_json(AUXILIARY_RESULTS)
+    out = ['| Size | YOLOv8 E2E F1 | Auxiliary YOLOv8 E2E F1 | YOLOv10-style E2E F1 | Change vs YOLOv8 | Change vs Auxiliary |',
+           '|:---|:---:|:---:|:---:|:---:|:---:|']
+    for sz in sizes:
+        value = res[sz]['summary']['avg_e2e_f1']
+        b = baseline[sz]['summary']['avg_e2e_f1']
+        aux = auxiliary.get(sz, {}).get('summary', {}).get('avg_e2e_f1')
+        aux_value = f'{aux:.4f}' if aux is not None else 'not trained'
+        delta = pp(value - aux) if aux is not None else '—'
+        out.append(f'| {SIZE_NAMES[sz]} | {b:.4f} | {aux_value} | {value:.4f} | {pp(value - b)} | {delta} |')
+    out += ['', 'These compare single trained runs and historical checkpoints. They do not isolate the causal '
+            'effect of assignment, loss, detachment or auxiliary supervision; no repeated-seed uncertainty '
+            'estimate is available. YOLOv8 Medium retains its documented test-sweep threshold override; '
+            'YOLOv10-style thresholds are all selected on held-out data.']
+    blocks['comparison'] = '\n'.join(out)
+    out = []
+    for sz in sizes:
+        base = f'../result/benchmark/yolov10/{sz}'
+        out += [f'### {SIZE_NAMES[sz]}', '', '| Random | Grid | Words | Line |', '|:---:|:---:|:---:|:---:|']
+        for i in (1, 2):
+            out.append('| ' + ' | '.join(f'![]({base}/{p}_{i}.png)' for p in PLACEMENTS) + ' |')
+        out.append('')
+    blocks['visuals'] = '\n'.join(out).rstrip()
+    return blocks
 
 
 def fcos_params() -> dict:
@@ -752,13 +850,16 @@ def render_master(res: dict, params: dict, yolov8_res: dict) -> dict:
             + [yolov8_row(sz, yolov8_res) for sz in SIZES])
     auxiliary = load_json(AUXILIARY_RESULTS) if AUXILIARY_RESULTS.exists() else {}
     rows += [auxiliary_row(sz, auxiliary) for sz in auxiliary]
+    yolov10 = load_json(YOLOV10_RESULTS) if YOLOV10_RESULTS.exists() else {}
+    rows += [yolov10_row(sz, yolov10) for sz in yolov10]
     blocks = {'master_table': summary_table(rows, 'Architecture Paradigm', with_report=True) + '\n\n' + (
         '_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; '
         '**test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned '
         'on held-out data (provenance of the Single-Stage values is not recorded). '
         'Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other '
         'parameter counts come from checkpoint state_dicts. Auxiliary YOLOv8 reports main-only deployment '
-        'parameters; training-only branch counts are in its report._')}
+        'parameters; training-only branch counts are in its report. YOLOv10-style also reports main-only '
+        'parameters and uses score filtering/top-k without NMS._')}
 
     out = ['| Paradigm | Size | Params | Pure Inference (`model(images)`, batch 128) | Eval-Loop Throughput |',
            '|:---|:---:|:---:|:---:|:---:|']
@@ -804,6 +905,12 @@ def render_master(res: dict, params: dict, yolov8_res: dict) -> dict:
         blocks['density'] += '\n\n'.join(density_table(
             [(f'Auxiliary {SIZE_NAMES[sz]}', ad[sz]['layouts'][p]) for sz in auxiliary], p,
             f'### Auxiliary — {DENSITY_LABELS[p]}\n') for p in PLACEMENTS)
+    if yolov10 and YOLOV10_DENSITY.exists():
+        yd10 = load_json(YOLOV10_DENSITY)
+        blocks['density'] += '\n\nYOLOv10-style at held-out tuned thresholds (main-only, NMS-free):\n\n'
+        blocks['density'] += '\n\n'.join(density_table(
+            [(f'YOLOv10-style {SIZE_NAMES[sz]}', yd10[sz]['layouts'][p]) for sz in yolov10], p,
+            f'### YOLOv10-style — {DENSITY_LABELS[p]}\n') for p in PLACEMENTS)
     return blocks
 
 
@@ -825,21 +932,25 @@ def render_file(path: Path, blocks: dict) -> None:
     print(f"Rendered {len(blocks)} generated sections of '{path}'")
 
 
-def main(auxiliary_only=False):
+def main(auxiliary_only=False, yolov10_only=False):
     res = load_json(FCOS_RESULTS)
     params = fcos_params()
     yolov8_res = load_json(YOLOV8_RESULTS)
-    if not auxiliary_only:
+    if not auxiliary_only and not yolov10_only:
         render_file(FCOS_REPORT, render_report_05(res, params))
         render_file(YOLOV8_REPORT, render_yolov8_report(yolov8_res))
         render_file(GRID_REPORT, render_report_03())
         render_file(MULTI_ANCHOR_REPORT, render_report_04())
-    if AUXILIARY_RESULTS.exists():
+    if AUXILIARY_RESULTS.exists() and not yolov10_only:
         render_file(AUXILIARY_REPORT, render_auxiliary_report(load_json(AUXILIARY_RESULTS)))
+    if YOLOV10_RESULTS.exists() and not auxiliary_only:
+        render_file(YOLOV10_REPORT, render_yolov10_report(load_json(YOLOV10_RESULTS)))
     render_file(MASTER, render_master(res, params, yolov8_res))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--auxiliary-only', action='store_true', help='Render only the auxiliary report and master index.')
-    main(auxiliary_only=parser.parse_args().auxiliary_only)
+    parser.add_argument('--yolov10-only', action='store_true', help='Render only the YOLOv10-style report and master index.')
+    args = parser.parse_args()
+    main(auxiliary_only=args.auxiliary_only, yolov10_only=args.yolov10_only)

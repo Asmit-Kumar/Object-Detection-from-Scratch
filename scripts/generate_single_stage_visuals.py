@@ -11,6 +11,7 @@ Use ``--detector fcos`` to render FCOS outputs. Annotated images are saved
 under ``result/benchmark/<variant>/<size>/``.
 Use ``--detector yolov8`` to render YOLOv8 outputs using the tuned thresholds
 saved by ``run_single_stage_benchmark.py``.
+Use ``--detector yolov10`` for main-only one-to-one predictions without NMS.
 """
 import argparse
 import json as jsonlib
@@ -35,7 +36,7 @@ from models import load_fcos_detector, load_model
 from models.object_detector_res import ObjectDetectorResNet
 from generator.dataset import EMNIST_CLASS_NAMES
 from inference.pipeline import _decode_fcos_candidates
-from run_single_stage_benchmark import SingleStagePipeline, AuxiliaryPipeline
+from run_single_stage_benchmark import SingleStagePipeline, AuxiliaryPipeline, YOLOv10Pipeline
 
 BENCHMARK_PATH = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -73,13 +74,14 @@ VARIANTS = [
 def generate_visuals(detector: str = 'grid'):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if detector in ('fcos', 'yolov8', 'auxiliary'):
-        family_name = {'fcos': 'FCOS', 'yolov8': 'YOLOv8', 'auxiliary': 'Auxiliary YOLOv8'}[detector]
+    if detector in ('fcos', 'yolov8', 'auxiliary', 'yolov10'):
+        family_name = {'fcos': 'FCOS', 'yolov8': 'YOLOv8', 'auxiliary': 'Auxiliary YOLOv8',
+                       'yolov10': 'YOLOv10-style NMS-free'}[detector]
         sizes = ['n', 's'] if detector == 'auxiliary' else SIZES
         print(f"Generating {family_name} visual detection grids on {device}...")
         opt_confs = {'n': 0.50, 's': 0.45, 'm': 0.50} if detector == 'fcos' else {}
         results_p = Path(f'benchmark/{detector}_results.json')
-        if detector in ('yolov8', 'auxiliary') and not results_p.exists():
+        if detector in ('yolov8', 'auxiliary', 'yolov10') and not results_p.exists():
             raise FileNotFoundError(
                 f"{results_p} is missing; run scripts/run_single_stage_benchmark.py --detector {detector} first."
             )
@@ -90,10 +92,10 @@ def generate_visuals(detector: str = 'grid'):
                 for sz in sizes:
                     if sz in data and 'opt_conf' in data[sz]:
                         opt_confs[sz] = data[sz]['opt_conf']
-                if detector in ('yolov8', 'auxiliary') and any(sz not in data or 'opt_conf' not in data[sz] for sz in sizes):
+                if detector in ('yolov8', 'auxiliary', 'yolov10') and any(sz not in data or 'opt_conf' not in data[sz] for sz in sizes):
                     raise ValueError(f"{results_p} does not contain tuned thresholds for sizes {sizes}.")
             except Exception:
-                if detector in ('yolov8', 'auxiliary'):
+                if detector in ('yolov8', 'auxiliary', 'yolov10'):
                     raise
 
         for sz in sizes:
@@ -117,6 +119,8 @@ def generate_visuals(detector: str = 'grid'):
                 model = load_fcos_detector(ckpt_path, device=device, size=sz)
             elif detector == 'auxiliary':
                 model = AuxiliaryPipeline(size=sz, ckpt_path=ckpt_path, device=device).model
+            elif detector == 'yolov10':
+                model = YOLOv10Pipeline(size=sz, ckpt_path=ckpt_path, device=device).model
             else:
                 model = load_model('yolov8', ckpt_path, device=device, size=sz, strict=True)
             model.eval()
@@ -149,7 +153,8 @@ def generate_visuals(detector: str = 'grid'):
                         char_label = CLASS_NAMES[cls_idx] if 0 <= cls_idx < len(CLASS_NAMES) else "?"
                         rect = patches.Rectangle((x, y), w, h, linewidth=1.5, edgecolor='#00FFCC', facecolor='none')
                         ax.add_patch(rect)
-                        ax.text(x, max(0, y - 3), f"{char_label} {float(score):.2f}", color='#FFE03A', fontsize=7, fontweight='bold', bbox=dict(boxstyle='round,pad=0.15', fc='black', alpha=0.55, ec='none'))
+                        label_y = max(7 if detector == 'yolov10' else 0, y - 3)
+                        ax.text(x, label_y, f"{char_label} {float(score):.2f}", color='#FFE03A', fontsize=7, fontweight='bold', bbox=dict(boxstyle='round,pad=0.15', fc='black', alpha=0.55, ec='none'))
 
                     ax.set_title(f'{family_name} {sz.upper()} | {placement} | {len(valid_boxes)} detections', fontsize=9, pad=5)
                     ax.axis('off')
@@ -274,7 +279,7 @@ def generate_visuals(detector: str = 'grid'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Generate benchmark visuals for grid, FCOS, or YOLOv8 detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary'], default='grid', help='Which detector family to render.')
+    parser = argparse.ArgumentParser(description='Generate benchmark visuals for grid, FCOS, YOLOv8, auxiliary, or NMS-free YOLOv10-style detectors.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary', 'yolov10'], default='grid', help='Which detector family to render.')
     args = parser.parse_args()
     generate_visuals(detector=args.detector)

@@ -12,6 +12,9 @@ Use ``--detector fcos`` or ``--detector yolov8`` for anchor-free Nano, Small,
 and Medium models. Each mode tunes confidence thresholds (or accepts a fixed
 override) and reports detection, classification, end-to-end, and throughput
 metrics.
+
+Use ``--detector yolov10`` for Nano, Small and Medium one-to-one heads,
+exported without their auxiliary branches and evaluated without NMS.
 """
 import argparse
 import sys
@@ -534,6 +537,22 @@ class AuxiliaryPipeline(FCOSPipeline):
         self.model = trained.to_inference()
 
 
+class YOLOv10Pipeline(FCOSPipeline):
+    """Evaluate the exported one-to-one head with confidence filtering and top-k only."""
+
+    def __init__(self, size='s', ckpt_path=None, device='cuda', conf_threshold=0.50):
+        self.size = size.lower()
+        self.device = str(device)
+        self.conf_threshold = conf_threshold
+        weights = Path(f'weights/yolov10_{self.size}_28x14_best.pth')
+        self.checkpoint_path = str(ckpt_path or (weights if weights.exists() else
+                                  Path(f'checkpoint/yolov10_{self.size}_28x14_best.pth')))
+        trained = load_model('yolov10', self.checkpoint_path, device=device, size=self.size, strict=True)
+        self.training_params = sum(p.numel() for p in trained.parameters())
+        self.model = trained.to_inference()
+        assert self.model.end_to_end and self.model.inference_only
+
+
 def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path: str = None):
     if fixed_conf is not None and not 0.0 <= fixed_conf <= 1.0:
         raise ValueError(f'fixed_conf must be between 0 and 1, got {fixed_conf}')
@@ -541,9 +560,11 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     all_results = {}
 
-    if detector in ('fcos', 'yolov8', 'auxiliary'):
-        family_name = {'fcos': 'FCOS', 'yolov8': 'YOLOv8', 'auxiliary': 'Auxiliary YOLOv8'}[detector]
-        pipeline_cls = {'fcos': FCOSPipeline, 'yolov8': YOLOv8Pipeline, 'auxiliary': AuxiliaryPipeline}[detector]
+    if detector in ('fcos', 'yolov8', 'auxiliary', 'yolov10'):
+        family_name = {'fcos': 'FCOS', 'yolov8': 'YOLOv8', 'auxiliary': 'Auxiliary YOLOv8',
+                       'yolov10': 'YOLOv10-style NMS-free'}[detector]
+        pipeline_cls = {'fcos': FCOSPipeline, 'yolov8': YOLOv8Pipeline, 'auxiliary': AuxiliaryPipeline,
+                        'yolov10': YOLOv10Pipeline}[detector]
         print("=" * 90)
         threshold_mode = 'FIXED THRESHOLD' if fixed_conf is not None else 'AUTO-TUNED THRESHOLDS'
         print(f"  {family_name.upper()} ANCHOR-FREE DETECTOR BENCHMARK ({threshold_mode})")
@@ -577,7 +598,7 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
                 'placements': {},
                 'summary': {},
             }
-            if detector == 'auxiliary':
+            if detector in ('auxiliary', 'yolov10'):
                 all_results[sz].update({
                     'threshold_sweep': getattr(pipe_tune, 'threshold_sweep', []),
                     'selection_metric': 'held-out E2E F1' if fixed_conf is None else None,
@@ -587,8 +608,12 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
                     'inference_params': sum(p.numel() for p in pipe.model.parameters()),
                     'gpu': torch.cuda.get_device_name(0) if device == 'cuda' else None,
                     'torch_version': torch.__version__,
-                    'precision': 'float32', 'nms_iou': 0.45, 'match_iou': 0.50,
+                    'precision': 'float32', 'nms_iou': None if detector == 'yolov10' else 0.45,
+                    'match_iou': 0.50,
                 })
+                if detector == 'yolov10':
+                    all_results[sz].update({'head': 'one-to-one', 'nms_free': True,
+                                           'max_detections': pipe.model.max_detections})
 
             total_det_p = 0.0
             total_det_r = 0.0
@@ -749,8 +774,8 @@ def run_benchmark(detector: str = 'grid', fixed_conf: float = None, output_path:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run the benchmark for grid, FCOS, or YOLOv8 detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary'], default='grid', help='Which detector family to evaluate.')
+    parser = argparse.ArgumentParser(description='Benchmark grid, FCOS, YOLOv8, auxiliary, or NMS-free YOLOv10-style detectors.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary', 'yolov10'], default='grid', help='Which detector family to evaluate.')
     parser.add_argument('--confidence-threshold', type=float, default=None, dest='fixed_conf',
                         help='Use a fixed confidence threshold instead of held-out tuning.')
     parser.add_argument('--output', default=None, dest='output_path',

@@ -49,7 +49,7 @@ def _decode_ltrb_candidates(
         score_threshold: float,
         iou_threshold: float = 0.45,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Decode ltrb-head outputs, gate scores with centerness when present, and apply class-wise NMS.
+    """Decode LTRB outputs with class-wise NMS or NMS-free score selection.
 
     ``detector`` only needs a ``STRIDES`` mapping (grid size -> stride in pixels). Without
     ``centerness_logits`` in the outputs (e.g. the YOLOv8 head) the score is the class probability.
@@ -57,6 +57,8 @@ def _decode_ltrb_candidates(
     Returns one ``(boxes_xywh, scores, classes)`` tuple per batch item. The
     highest-scoring class at each location is retained because the second
     pipeline stage performs the final character classification.
+    End-to-end detectors retain at most ``max_detections`` per image using
+    scores alone; ``iou_threshold`` does not suppress overlapping boxes.
     """
     first_reg = next(iter(outputs.values()))["reg_ltrb"]
     batch_size = first_reg.size(0)
@@ -66,9 +68,8 @@ def _decode_ltrb_candidates(
     all_classes = []
     all_batch_ids = []
 
-    # Decode every image and pyramid level in one tensor pass. NMS is then
-    # performed once for the whole batch, grouped by (image, class), instead
-    # of launching one NMS call per image.
+    # Decode every image and pyramid level together. End-to-end models use
+    # score top-k below; other models use NMS grouped by image and class.
     for grid_size, preds in outputs.items():
         reg_ltrb = preds["reg_ltrb"].float()
         cls_probs = preds["cls_logits"].float().sigmoid()
@@ -110,8 +111,16 @@ def _decode_ltrb_candidates(
     scores = torch.cat(all_scores, dim=0)
     classes = torch.cat(all_classes, dim=0)
     batch_ids = torch.cat(all_batch_ids, dim=0)
-    nms_groups = batch_ids * num_classes + classes
-    keep = torchvision.ops.batched_nms(boxes_xyxy, scores, nms_groups, iou_threshold)
+    if getattr(detector, "end_to_end", False):
+        keep_by_image = []
+        for batch_idx in range(batch_size):
+            image_indices = torch.where(batch_ids == batch_idx)[0]
+            count = min(detector.max_detections, image_indices.numel())
+            keep_by_image.append(image_indices[scores[image_indices].topk(count).indices])
+        keep = torch.cat(keep_by_image)
+    else:
+        nms_groups = batch_ids * num_classes + classes
+        keep = torchvision.ops.batched_nms(boxes_xyxy, scores, nms_groups, iou_threshold)
 
     boxes_xyxy = boxes_xyxy[keep]
     scores = scores[keep]
@@ -219,7 +228,8 @@ class DetectionPipeline:
             from models import load_model
 
             def loader(path, device, size):
-                return load_model(self.ltrb_model, path, device, size=size, strict=False)
+                model = load_model(self.ltrb_model, path, device, size=size, strict=False)
+                return model.to_inference() if getattr(model, "end_to_end", False) else model
         elif self.multi_scale_detector:
             from models import load_multiscale_detector
             loader = load_multiscale_detector
@@ -343,7 +353,7 @@ class DetectionPipeline:
         images_tensor: torch.Tensor,
         conf_threshold: float,
     ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Run detector decoding and NMS for every image in a batch."""
+        """Run detector decoding and model-specific post-processing for the batch."""
         if self.ltrb_detector:
             raw_out = self.detector(images_tensor)
             return _decode_ltrb_candidates(
@@ -387,7 +397,7 @@ class DetectionPipeline:
 
         img_tensor = self._preprocess_image_input(image_input)  # (1, 1, 224, 224)
 
-        # Stage 1: Detector, decoding, centerness gating, and NMS.
+        # Stage 1: Detector forward and model-specific candidate selection.
         boxes, confs, _ = self._detector_candidates(img_tensor, conf_threshold)[0]
         if boxes.numel() == 0:
             return []
@@ -445,7 +455,7 @@ class DetectionPipeline:
         images_tensor = images_tensor.to(self.device)
         B = images_tensor.shape[0]
 
-        # Stage 1: Detector Batch Forward Pass, decoding, centerness gating, and NMS.
+        # Stage 1: Detector batch forward and model-specific candidate selection.
         detector_candidates = self._detector_candidates(images_tensor, conf_threshold)
 
         batch_crops = []

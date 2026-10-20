@@ -71,6 +71,8 @@ def _loss_value(loss_output):
 
 def _prepare_ltrb_targets(targets, labels, criterion, device):
     """Generate deferred ltrb targets directly on the training device."""
+    if getattr(criterion, "requires_raw_annotations", False):
+        return targets
     if targets is not None:
         return targets
     if not isinstance(criterion, LTRBLoss) or not isinstance(labels, (tuple, list)) or len(labels) != 2:
@@ -497,7 +499,12 @@ def train_one_epoch_detection(
 def evaluate_ltrb_detection(
     model, loader, criterion, device, conf_threshold=0.5, iou_threshold=0.5
 ):
-    """Evaluate ltrb-head outputs with class-wise NMS (scores are centerness-gated when the head has one)."""
+    """Evaluate LTRB outputs with the model's decoding policy.
+
+    End-to-end models use confidence filtering and score top-k without NMS.
+    For those models, iou_threshold only controls prediction-to-GT matching.
+    Other LTRB models retain class-wise NMS and optional centerness gating.
+    """
     from inference.pipeline import _decode_ltrb_candidates
 
     model.eval()

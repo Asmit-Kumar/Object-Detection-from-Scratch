@@ -14,6 +14,7 @@ Use ``--detector grid`` to run across spatial grid variants:
 
 Use ``--detector fcos`` to run across FCOS Nano, Small, and Medium models.
 Use ``--detector yolov8`` to run across YOLOv8 Nano, Small, and Medium models.
+Use ``--detector yolov10`` for main-only NMS-free Nano, Small, and Medium models.
 """
 import argparse
 import sys
@@ -33,7 +34,7 @@ from models.object_detector_res import ObjectDetectorResNet
 from dataio.dataset import get_detection_loaders
 from inference.pipeline import _decode_fcos_candidates
 from training.trainer import evaluate_density_sweep
-from run_single_stage_benchmark import SingleStagePipeline, AuxiliaryPipeline
+from run_single_stage_benchmark import SingleStagePipeline, AuxiliaryPipeline, YOLOv10Pipeline
 
 BENCHMARK_ROOT = 'data/OD_benchmark'
 PLACEMENTS = ['random', 'grid', 'words', 'line']
@@ -175,7 +176,7 @@ def run_full_density_sweep(detector: str = 'grid'):
     print("  FULL BENCHMARK DENSITY-STRATIFIED SWEEP (ALL LAYOUTS x DENSITY BUCKETS)")
     print("=" * 90)
 
-    if detector in ('fcos', 'yolov8', 'auxiliary'):
+    if detector in ('fcos', 'yolov8', 'auxiliary', 'yolov10'):
         if detector == 'fcos':
             configs = [
                 {'size': 'n', 'name': 'FCOS Nano (0.52M)', 'conf': 0.50},
@@ -185,8 +186,10 @@ def run_full_density_sweep(detector: str = 'grid'):
             results_path = FCOS_RESULTS
             out_path = Path('benchmark/fcos_density_sweep_results.json')
         else:
+            family_name = {'auxiliary': 'Auxiliary YOLOv8', 'yolov8': 'YOLOv8',
+                           'yolov10': 'YOLOv10-style'}[detector]
             configs = [
-                {'size': sz, 'name': f'{"Auxiliary YOLOv8" if detector == "auxiliary" else "YOLOv8"} {label}', 'conf': 0.50}
+                {'size': sz, 'name': f'{family_name} {label}', 'conf': 0.50}
                 for sz, label in (('n', 'Nano'), ('s', 'Small'), ('m', 'Medium'))
                 if detector != 'auxiliary' or sz != 'm'
             ]
@@ -220,6 +223,8 @@ def run_full_density_sweep(detector: str = 'grid'):
                 model = load_fcos_detector(ckpt_path, device=device, size=size)
             elif detector == 'auxiliary':
                 model = AuxiliaryPipeline(size=size, ckpt_path=ckpt_path, device=device).model
+            elif detector == 'yolov10':
+                model = YOLOv10Pipeline(size=size, ckpt_path=ckpt_path, device=device).model
             else:
                 model = load_model('yolov8', ckpt_path, device=device, size=size, strict=True)
             for p in PLACEMENTS:
@@ -273,8 +278,8 @@ def run_full_density_sweep(detector: str = 'grid'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run the density sweep for grid, FCOS, or YOLOv8 detector variants.')
-    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary'], default='grid', help='Which detector family to evaluate.')
+    parser = argparse.ArgumentParser(description='Run density sweeps for grid, FCOS, YOLOv8, auxiliary, or NMS-free YOLOv10-style detectors.')
+    parser.add_argument('--detector', choices=['grid', 'fcos', 'yolov8', 'auxiliary', 'yolov10'], default='grid', help='Which detector family to evaluate.')
     args = parser.parse_args()
     run_full_density_sweep(detector=args.detector)
 

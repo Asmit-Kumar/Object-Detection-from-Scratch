@@ -42,8 +42,12 @@ This document maintains the master comparison index across 10,000 placement-stra
 | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
 | **Auxiliary YOLOv8** | Nano (`n`) | 0.83M | 0.40 | held-out tune set | 0.9867 | 0.9814 | 92.18% | 0.9071 | 507 img/s | 8,633 img/s | [`benchmark/07_auxiliary_yolov8_resnet.md`](./benchmark/07_auxiliary_yolov8_resnet.md) |
 | **Auxiliary YOLOv8** | Small (`s`) | 2.51M | 0.45 | held-out tune set | 0.9957 | 0.9586 | 92.81% | 0.9065 | 611 img/s | 4,415 img/s | [`benchmark/07_auxiliary_yolov8_resnet.md`](./benchmark/07_auxiliary_yolov8_resnet.md) |
+| ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── | ─── |
+| **YOLOv10-style NMS-free** | Nano (`n`) | 0.83M | 0.50 | held-out tune set | 0.9999 | 0.9624 | 92.80% | 0.9101 | 478 img/s | 10,176 img/s | [`benchmark/08_yolov10_nms_free.md`](./benchmark/08_yolov10_nms_free.md) |
+| **YOLOv10-style NMS-free** | Small (`s`) | 2.51M | 0.45 | held-out tune set | 0.9996 | 0.9808 | 91.35% | 0.9045 | 587 img/s | 4,698 img/s | [`benchmark/08_yolov10_nms_free.md`](./benchmark/08_yolov10_nms_free.md) |
+| **YOLOv10-style NMS-free** | Medium (`m`) | 6.47M | 0.45 | held-out tune set | 0.9997 | 0.9831 | 90.27% | 0.8949 | 459 img/s | 2,345 img/s | [`benchmark/08_yolov10_nms_free.md`](./benchmark/08_yolov10_nms_free.md) |
 
-_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other parameter counts come from checkpoint state_dicts. Auxiliary YOLOv8 reports main-only deployment parameters; training-only branch counts are in its report._
+_`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`, disjoint from the benchmark; **test-sweep override** = selected directly from the benchmark sweep; **fixed** / **hard-coded** = not tuned on held-out data (provenance of the Single-Stage values is not recorded). Averages are unweighted means over the 4 layouts. FCOS params are counted from model instantiation; other parameter counts come from checkpoint state_dicts. Auxiliary YOLOv8 reports main-only deployment parameters; training-only branch counts are in its report. YOLOv10-style also reports main-only parameters and uses score filtering/top-k without NMS._
 <!-- END GENERATED: master_table -->
 
 ---
@@ -84,6 +88,10 @@ _`conf` source: **held-out tune set** = tuned on `data/OD_benchmark/tune/random`
 | ─── | ─── | ─── | ─── | ─── |
 | **Auxiliary YOLOv8** | Nano (`n`) | 0.83M | **8,633 img/s** | 507 img/s |
 | **Auxiliary YOLOv8** | Small (`s`) | 2.51M | **4,415 img/s** | 611 img/s |
+| ─── | ─── | ─── | ─── | ─── |
+| **YOLOv10-style NMS-free** | Nano (`n`) | 0.83M | **10,176 img/s** | 478 img/s |
+| **YOLOv10-style NMS-free** | Small (`s`) | 2.51M | **4,698 img/s** | 587 img/s |
+| **YOLOv10-style NMS-free** | Medium (`m`) | 6.47M | **2,345 img/s** | 459 img/s |
 
 _Eval-loop throughput is wall-clock over the whole evaluation loop (PNG decoding with `num_workers=0`, target encoding in the collate function, host↔device copies, post-processing and scipy Hungarian matching); it is dominated by that overhead and varies run to run, so it is not a model-speed comparison. Pure inference times only `model(images)` on GPU-resident batches of 128 (median of repeated, synchronized runs after a ≥2 s warm-up)._ Two-Stage and Single-Stage checkpoints were not re-timed with the pure-inference protocol.
 <!-- END GENERATED: throughput -->
@@ -147,6 +155,44 @@ Auxiliary YOLOv8 at held-out tuned thresholds (main-only inference):
 | **5 – 8 objects** | 1,231 | **99.1%** | 97.6% |
 | **9 – 12 objects** | 862 | **98.8%** | 97.5% |
 | **13 – 16 objects** | 149 | **98.8%** | 98.0% |
+
+YOLOv10-style at held-out tuned thresholds (main-only, NMS-free):
+
+### YOLOv10-style — 🎲 Random Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | YOLOv10-style Nano | YOLOv10-style Small | YOLOv10-style Medium |
+|:---:|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 236 | 95.3% | 97.5% | **98.0%** |
+| **5 – 8 objects** | 1,244 | 94.8% | 97.5% | **97.8%** |
+| **9 – 12 objects** | 850 | 95.3% | 97.7% | **98.0%** |
+| **13 – 16 objects** | 170 | 95.5% | 97.9% | **98.1%** |
+
+### YOLOv10-style — 📐 Grid Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | YOLOv10-style Nano | YOLOv10-style Small | YOLOv10-style Medium |
+|:---:|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 228 | 94.4% | 97.0% | **97.5%** |
+| **5 – 8 objects** | 1,319 | 95.0% | 97.5% | **97.6%** |
+| **9 – 12 objects** | 807 | 95.2% | 97.2% | **97.8%** |
+| **13 – 16 objects** | 146 | 93.7% | 97.1% | **97.7%** |
+
+### YOLOv10-style — 📝 Words Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | YOLOv10-style Nano | YOLOv10-style Small | YOLOv10-style Medium |
+|:---:|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 253 | 97.7% | 98.8% | **98.9%** |
+| **5 – 8 objects** | 1,235 | 97.5% | 98.6% | **99.0%** |
+| **9 – 12 objects** | 866 | 97.4% | **98.8%** | 98.7% |
+| **13 – 16 objects** | 137 | 97.5% | **98.7%** | 98.6% |
+
+### YOLOv10-style — 📏 Line Layout
+
+| Density Bucket ($n_{gt}$) | Test Images | YOLOv10-style Nano | YOLOv10-style Small | YOLOv10-style Medium |
+|:---:|:---:|:---:|:---:|:---:|
+| **1 – 4 objects** | 244 | 96.7% | **99.1%** | 98.7% |
+| **5 – 8 objects** | 1,231 | 97.2% | 98.6% | **99.0%** |
+| **9 – 12 objects** | 862 | 97.7% | 98.6% | **98.7%** |
+| **13 – 16 objects** | 149 | 97.5% | 98.6% | **98.7%** |
 <!-- END GENERATED: density -->
 
 > **Crucial Architectural Breakthrough**:
@@ -169,15 +215,19 @@ Auxiliary YOLOv8 at held-out tuned thresholds (main-only inference):
 **The Root Cause**: Fixed single-scale $14 \times 14$ grid cells (stride 16) suffer from severe spatial receptive field collisions when characters appear side-by-side or stacked closely in lines and word blocks.
 
 ### 4. Complete Elimination of Collisions via FCOS Multi-Scale FPN & Centerness
-The comparison table shows that FCOS leads average detection precision and recall, while YOLOv8 Nano has the highest average end-to-end F1 (0.9087). Thus the anchor-free families lead different aggregate metrics even though both avoid the single-scale grid collision failure mode.
+Among the FCOS and YOLOv8 baselines, FCOS leads average detection precision and recall, while YOLOv8 Nano leads end-to-end F1 (0.9087). The new YOLOv10-style Nano result is 0.9101 E2E F1; its NMS-free protocol and limitations are documented below.
 
 ### 5. YOLOv8 Anchor-Free DFL Head
 **The Solution**: The YOLOv8-inspired detector uses a C2f/SPPF/PAN body with separate class logits and distributional LTRB regression at the same two scales (28 × 28 and 14 × 14), with no anchor tensor and no objectness channel.
 **The Outcome**: The trained models retain high recall across all four layouts (Nano 94.21%, Small 96.14%, Medium 95.94% average), and density recall stays in the 92–99% range rather than collapsing on structured scenes. This is below FCOS on structured recall but substantially above the single-scale grid baselines.
 **The Solution**: FCOS completely abandons preset anchor boxes. It distributes detections across a multi-scale FPN (P3 at $28 \times 28$, stride 8, and P4 at $14 \times 14$, stride 16).
-**The Outcome**: Closely-spaced characters are resolved on the fine $28 \times 28$ P3 level while larger structures map to P4. Combined with centerness gating $\sqrt{\sigma(\text{cls}) \times \sigma(\text{cent})}$, FCOS achieves the highest 4-layout average detection precision and recall in the master table. YOLOv8 Nano records the highest average end-to-end F1 (0.9087), so the two anchor-free designs lead different aggregate metrics while both remove the grid collision failure mode.
+**The Outcome**: Closely-spaced characters are resolved on the fine $28 \times 28$ P3 level while larger structures map to P4. Combined with centerness gating $\sqrt{\sigma(\text{cls}) \times \sigma(\text{cent})}$, FCOS leads average detection precision and recall among the FCOS and YOLOv8 baselines. YOLOv8 Nano leads that earlier comparison in E2E F1 (0.9087); the new YOLOv10-style results are reported separately below.
 
 ---
+
+## YOLOv10-Style NMS-Free Benchmark
+
+The completed Nano, Small and Medium runs were benchmarked on 2026-10-20 with held-out E2E confidence tuning and main-only inference, without NMS. Average E2E F1 was **0.9101 / 0.9045 / 0.8949** for Nano / Small / Medium. Nano led these runs in E2E F1 and pure inference throughput; larger sizes recovered more objects but had lower conditional classification accuracy. The 0.14 percentage point E2E gain over historical YOLOv8 Nano is too small to establish a reliable accuracy improvement from one run. The threshold selections are provisional: the 0.20–0.80 held-out E2E sweep excluded 0.10, which the notebook selected for detection-only F1 on its own split. An expanded lower-threshold comparison of detection F1 and E2E F1 remains pending. See the [YOLOv10-style report](./benchmark/08_yolov10_nms_free.md) for per-layout, density, checkpoint and timing details.
 
 ## 📁 Individual Architecture Benchmark Reports
 
@@ -190,3 +240,4 @@ The auxiliary-supervision experiment did not demonstrate a meaningful end-to-end
 - **[`benchmark/05_fcos_anchor_free_resnet.md`](./benchmark/05_fcos_anchor_free_resnet.md)** — **Stage 8 FCOS Anchor-Free ResNet Detector**
 - **[`benchmark/06_yolov8_anchor_free_resnet.md`](./benchmark/06_yolov8_anchor_free_resnet.md)** — **YOLOv8-Inspired Anchor-Free Detector**
 - **[`benchmark/07_auxiliary_yolov8_resnet.md`](./benchmark/07_auxiliary_yolov8_resnet.md)** — **Auxiliary YOLOv8 Nano and Small, Main-Only Inference**
+- **[`benchmark/08_yolov10_nms_free.md`](./benchmark/08_yolov10_nms_free.md)** — **YOLOv10-Style Detection, NMS-Free 1:1 Inference**
