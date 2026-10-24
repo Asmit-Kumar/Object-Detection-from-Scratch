@@ -117,6 +117,12 @@ The synthetic dataset is generated from scratch using EMNIST characters composit
 
 **Generated dataset**: 255,000 training / 45,000 test images. The benchmark uses a separate placement-stratified set of 10,000 images plus a 500-image random-layout tuning split for confidence selection.
 
+### Companion semantic segmentation project
+
+[Semantic Segmentation from Scratch](https://github.com/Asmit-Kumar/semantic-segmentation-from-scratch) reuses these generated EMNIST scene images and their 47 character classes for pixel-level segmentation with a U-Net. It preserves the detection images and bounding-box annotations, deriving separate approximate masks with background ID 0 and character IDs 1–47 (detection label + 1).
+
+For segmentation, follow the [dataset setup and mask construction guide](https://github.com/Asmit-Kumar/semantic-segmentation-from-scratch/blob/main/README.md#emnist-dataset-location) and the [EMNIST segmentation benchmark](https://github.com/Asmit-Kumar/semantic-segmentation-from-scratch/blob/main/benchmark/02_emnist.md). The source scenes are shared, while benchmark subsets and evaluation protocols are selected independently; detection F1 and segmentation mIoU are not directly comparable.
+
 | Layout Strategy | Sample Scene 1 | Sample Scene 2 | Description |
 |:---|:---:|:---:|:---|
 | **🎲 Random** | ![](result/dataset/random_1.png) | ![](result/dataset/random_2.png) | Unconstrained random spatial locations across the 224×224 canvas. |
